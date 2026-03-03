@@ -1,0 +1,7 @@
+/amld
+/data/
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+.env
