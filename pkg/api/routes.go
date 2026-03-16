@@ -5,6 +5,7 @@ package api
 import (
 	"encoding/json"
 	"net/http"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -12,14 +13,16 @@ import (
 
 	"github.com/luxfi/aml/pkg/cases"
 	"github.com/luxfi/aml/pkg/engine"
+	"github.com/luxfi/aml/pkg/sanctions"
 	"github.com/luxfi/aml/pkg/types"
 )
 
 // Handler wires AML engine + case store + sanctions to HTTP routes.
 type Handler struct {
-	Engine    *engine.Engine
-	Cases     *cases.Store
-	Alerts    *AlertStore
+	Engine     *engine.Engine
+	Cases      *cases.Store
+	Alerts     *AlertStore
+	Sanctions  *SanctionsStore
 }
 
 // AlertStore is a minimal in-memory alert store for the API layer.
@@ -42,6 +45,60 @@ func (s *AlertStore) ByTx(txID string) []types.Alert {
 	return s.alerts[txID]
 }
 
+// SanctionsStore is a minimal in-memory sanctions entry store.
+type SanctionsStore struct {
+	mu      sync.RWMutex
+	entries []types.SanctionsEntry
+}
+
+// NewSanctionsStore creates an empty sanctions store.
+func NewSanctionsStore() *SanctionsStore {
+	return &SanctionsStore{}
+}
+
+// Load replaces all entries.
+func (s *SanctionsStore) Load(entries []types.SanctionsEntry) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.entries = entries
+}
+
+// Search finds entries matching the given name above the threshold.
+func (s *SanctionsStore) Search(name string, threshold float64) []sanctionSearchResult {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	var results []sanctionSearchResult
+	for _, e := range s.entries {
+		score := sanctions.TokenMatch(name, e.Name)
+		if score >= threshold {
+			results = append(results, sanctionSearchResult{
+				Entry: e,
+				Score: score,
+			})
+			continue
+		}
+		// Check aliases.
+		for _, alias := range e.Aliases {
+			aliasScore := sanctions.TokenMatch(name, alias)
+			if aliasScore >= threshold && aliasScore > score {
+				score = aliasScore
+				results = append(results, sanctionSearchResult{
+					Entry: e,
+					Score: score,
+				})
+				break
+			}
+		}
+	}
+	return results
+}
+
+type sanctionSearchResult struct {
+	Entry types.SanctionsEntry
+	Score float64
+}
+
 // Register adds AML routes to a ServeEvent router.
 // Called from within an OnServe hook.
 func (h *Handler) Register(se *core.ServeEvent) {
@@ -51,6 +108,7 @@ func (h *Handler) Register(se *core.ServeEvent) {
 	se.Router.POST("/v1/aml/cases/{id}/events", h.addCaseEvent())
 	se.Router.GET("/v1/aml/rules", h.listRules())
 	se.Router.POST("/v1/aml/rules/test", h.testRule())
+	se.Router.POST("/v1/aml/sanctions/search", h.searchSanctions())
 	se.Router.GET("/v1/aml/health", h.health())
 }
 
@@ -160,6 +218,53 @@ func (h *Handler) addCaseEvent() func(e *core.RequestEvent) error {
 func (h *Handler) listRules() func(e *core.RequestEvent) error {
 	return func(e *core.RequestEvent) error {
 		return e.JSON(http.StatusOK, h.Engine.Rules())
+	}
+}
+
+func (h *Handler) searchSanctions() func(e *core.RequestEvent) error {
+	return func(e *core.RequestEvent) error {
+		var req struct {
+			Name string `json:"name"`
+			DOB  string `json:"dob"`
+		}
+		if err := json.NewDecoder(e.Request.Body).Decode(&req); err != nil {
+			return e.JSON(http.StatusBadRequest, map[string]string{"error": "invalid request body"})
+		}
+		if req.Name == "" {
+			return e.JSON(http.StatusBadRequest, map[string]string{"error": "name is required"})
+		}
+
+		if h.Sanctions == nil {
+			return e.JSON(http.StatusOK, []interface{}{})
+		}
+
+		results := h.Sanctions.Search(req.Name, sanctions.MatchThreshold)
+
+		type entry struct {
+			ID          string   `json:"id"`
+			ListID      string   `json:"list_id"`
+			Name        string   `json:"name"`
+			Aliases     []string `json:"aliases,omitempty"`
+			DOB         string   `json:"dob,omitempty"`
+			Nationality string   `json:"nationality,omitempty"`
+			Type        string   `json:"type"`
+			Score       float64  `json:"score"`
+		}
+
+		out := make([]entry, 0, len(results))
+		for _, r := range results {
+			out = append(out, entry{
+				ID:          r.Entry.ID,
+				ListID:      r.Entry.ListID,
+				Name:        r.Entry.Name,
+				Aliases:     r.Entry.Aliases,
+				DOB:         r.Entry.DOB,
+				Nationality: r.Entry.Nationality,
+				Type:        r.Entry.Type,
+				Score:       r.Score,
+			})
+		}
+		return e.JSON(http.StatusOK, out)
 	}
 }
 

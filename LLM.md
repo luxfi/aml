@@ -30,8 +30,23 @@ make run                    # Build + run dev
 ## Module Layout
 
 ```
-cmd/amld/main.go          -- Single binary: serve, version
+cmd/amld/main.go          -- Single binary: serve, version, embedded admin UI
 migrations/0001_core.sql   -- 9 SQLite collections
+ui/                        -- Embedded admin dashboard (Vite + React + @hanzo/gui)
+  embed.go                 -- go:embed all:dist -> DistDirFS()
+  package.json             -- @luxfi/aml-ui (private, pnpm)
+  vite.config.ts           -- base: /_/aml/, proxy /v1/aml to :8090
+  src/
+    main.tsx               -- React 19 entry
+    App.tsx                -- Hash router (wouter), sidebar nav, 5 routes
+    api.ts                 -- Typed fetch wrappers for /v1/aml/* endpoints
+    pages/
+      Dashboard.tsx        -- Stats cards, recent cases, health check
+      Cases.tsx            -- DataTable with status filter tabs, expandable rows
+      Rules.tsx            -- DataTable with DSL display, test rule modal
+      Alerts.tsx           -- DataTable with severity filter chips, score breakdown
+      Sanctions.tsx        -- Name search form, results table with scores
+  dist/                    -- Built output (gitignored, ~220KB)
 pkg/
   types/types.go           -- Canonical domain types (Transaction, Entity, Rule, Alert, Case)
   engine/
@@ -47,7 +62,7 @@ pkg/
     case.go                -- Case store (create, update status, assign, resolve, events)
     errors.go              -- Sentinel errors
   webhook/webhook.go       -- Signed delivery (HMAC-SHA256) with retry + dead-letter
-  api/routes.go            -- /v1/aml/* HTTP routes on Base
+  api/routes.go            -- /v1/aml/* HTTP routes + SanctionsStore on Base
 ```
 
 ## API Endpoints
@@ -60,9 +75,24 @@ pkg/
 | POST | /v1/aml/cases/{id}/events | Add case event (note, status change) |
 | GET | /v1/aml/rules | List all rules |
 | POST | /v1/aml/rules/test | Dry-run a DSL expression |
+| POST | /v1/aml/sanctions/search | Search sanctions lists by name |
 | GET | /v1/aml/health | Health check |
 
 All endpoints require `X-Org-Id` header.
+
+## Embedded Admin UI
+
+Served at `/_/aml/` via `go:embed`. Hash router (`/#/cases`, `/#/rules`, etc.) for SPA routing without server rewrites.
+
+```bash
+cd ui && pnpm install && pnpm build   # produces dist/ (~220KB)
+cd .. && go build ./cmd/amld/         # binary includes UI
+./amld serve --dev                    # UI at http://localhost:8090/_/aml/
+```
+
+Dev mode: `cd ui && pnpm dev` (port 3000, proxies API to :8090).
+
+Tech: React 19, wouter (hash router), @hanzo/gui, Vite 6. Dark theme.
 
 ## Transaction Ingest Flow
 

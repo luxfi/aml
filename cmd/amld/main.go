@@ -12,6 +12,7 @@ import (
 	"os"
 
 	"github.com/hanzoai/base"
+	"github.com/hanzoai/base/apis"
 	"github.com/hanzoai/base/core"
 	"github.com/hanzoai/base/tools/hook"
 	"github.com/spf13/cobra"
@@ -20,6 +21,7 @@ import (
 	"github.com/luxfi/aml/pkg/cases"
 	"github.com/luxfi/aml/pkg/engine"
 	"github.com/luxfi/aml/pkg/rules"
+	uiaml "github.com/luxfi/aml/ui"
 )
 
 var version = "(dev)"
@@ -45,16 +47,22 @@ func main() {
 	eng := engine.New(starterRules)
 	caseStore := cases.NewStore()
 	alertStore := api.NewAlertStore()
+	sanctionsStore := api.NewSanctionsStore()
 
 	handler := &api.Handler{
-		Engine: eng,
-		Cases:  caseStore,
-		Alerts: alertStore,
+		Engine:    eng,
+		Cases:     caseStore,
+		Alerts:    alertStore,
+		Sanctions: sanctionsStore,
 	}
 
 	app.OnServe().Bind(&hook.Handler[*core.ServeEvent]{
 		Func: func(se *core.ServeEvent) error {
 			handler.Register(se)
+
+			// Mount embedded admin UI at /_/aml/
+			se.Router.GET("/_/aml/{path...}", apis.Static(uiaml.DistDirFS(), true))
+
 			return se.Next()
 		},
 	})
