@@ -5,7 +5,7 @@ go 1.26.1
 require (
 	github.com/expr-lang/expr v1.17.6
 	github.com/google/uuid v1.6.0
-	github.com/hanzoai/base v0.39.1
+	github.com/hanzoai/base v0.40.4
 	github.com/spf13/cobra v1.10.2
 )
 
@@ -89,9 +89,4 @@ require (
 	modernc.org/mathutil v1.7.1 // indirect
 	modernc.org/memory v1.11.0 // indirect
 	modernc.org/sqlite v1.48.1 // indirect
-)
-
-replace (
-	github.com/hanzoai/base => ../../hanzo/base
-	github.com/luxfi/compliance => ../compliance
 )
