@@ -9,8 +9,7 @@ import (
 )
 
 // BenchmarkEvaluate measures single-transaction evaluation throughput.
-// Ported from the C# load test pattern (concurrent POST → measure TPS).
-// In Go we use b.N and run in-process — no HTTP overhead.
+// Measures single-transaction evaluation throughput.
 func BenchmarkEvaluate(b *testing.B) {
 	eng := New(rules.StarterRules("bench"))
 
