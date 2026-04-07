@@ -4,8 +4,7 @@
 
 Go module: `github.com/luxfi/aml`
 
-Pure Go AML engine replacing the C# Jube fork at `~/work/liquidity/aml/`.
-Single binary `amld` on Hanzo Base (embedded SQLite) + expr-lang rules DSL.
+Real-time AML/CFT transaction monitoring engine. Pure Go, single binary, embedded SQLite via Hanzo Base. Configurable rules DSL (expr-lang), sanctions screening (OFAC/UN/EU/HMT), case management, scored alerting.
 
 ## Tech Stack
 
@@ -80,34 +79,6 @@ POST /v1/aml/transactions
   -> Return {action, score, alert_ids, case_id?}
 ```
 
-## Jube C# to Go Mapping
-
-| C# (Jube) | Go (luxfi/aml) | Notes |
-|-----------|---------------|-------|
-| Engine.cs | pkg/engine/engine.go | Core orchestration |
-| EntityAnalysisModelInvoke | pkg/engine/evaluator.go | Rule evaluation (expr-lang replaces C# scripted rules) |
-| Accord.NET neural network | pkg/engine/scoring.go ScorerPlugin | Deferred — WoE baseline in v1 |
-| BackgroundTasks/AmqpTaskStarter | N/A | Removed — no AMQP/RabbitMQ |
-| BackgroundTasks/SanctionsTaskStarter | pkg/sanctions/ingest.go | OFAC/UN/EU/HMT XML fetch |
-| BackgroundTasks/CaseAutomationStarter | pkg/cases/case.go | In-process case lifecycle |
-| BackgroundTasks/CaseCreationTaskStarter | pkg/engine/engine.go auto-create | Inline on block/report |
-| BackgroundTasks/ManageCountersStarter | N/A | Aggregates via Base indexed queries |
-| BackgroundTasks/NotificationsViaAmqpStarter | pkg/webhook/webhook.go | HTTP webhooks replace AMQP |
-| BackgroundTasks/TaggingStarter | N/A | Removed — tags are fields on entities |
-| BackgroundTasks/AsyncHttpContextCorrelation | N/A | Removed — Base handles concurrency |
-| Exhaustive/Training.cs | Deferred | ML training out of scope for v1 |
-| Sanctions/LevenshteinDistance.cs | pkg/sanctions/match.go | Jaro-Winkler (better for names) replaces Levenshtein |
-| Cache/CacheService (Redis) | In-process cache (sync.Map) | No Redis — Base SQLite queries + short-TTL process cache |
-| DynamicEnvironment | Environment variables | Standard Go env config |
-| Poco.cs (154 classes) | pkg/types/types.go (~15 types) | Lean model — no cache/archive/session POCOs |
-| PostgreSQL | SQLite (Hanzo Base) | Embedded, replicated via hanzoai/replicate |
-| Redis | N/A | Removed |
-| RabbitMQ | N/A | Removed — webhooks + Base realtime |
-| Aml.Migrations | migrations/0001_core.sql | 9 tables vs 154 Jube tables |
-| Entity Framework / LinqToDB | Hanzo Base collections | Auto CRUD + realtime |
-| log4net | Hanzo Base built-in logging | Structured JSON |
-| JWT auth (custom) | X-Org-Id from IAM gateway | Gateway validates JWT, sets identity headers |
-
 ## Starter Rules (20)
 
 | # | Rule | DSL Pattern | Action |
@@ -133,21 +104,20 @@ POST /v1/aml/transactions
 | 19 | Sanctions Counterparty | sanctions_hit(counterparty) | block |
 | 20 | Travel Rule | notional > travel_rule_threshold | report |
 
-## Jube Client Compatibility
+## Compliance Client Compatibility
 
-The existing `luxfi/compliance/pkg/jube/` client stays unchanged.
-Its API surface (ScreenTransaction, CheckSanctions, CreateCase, GetCases) maps to:
+`luxfi/compliance` AML client connects via HTTP:
 
-| Jube Client Method | luxfi/aml Endpoint |
+| Client Method | Endpoint |
 |---|---|
 | ScreenTransaction | POST /v1/aml/transactions |
 | CheckSanctions | POST /v1/aml/sanctions/search |
 | CreateCase | POST /v1/aml/cases/{id}/events |
 | GetCases | GET /v1/aml/cases |
 
-Webhook event names are preserved: `aml.flagged`, `aml.cleared`, `kyc.approved`, `trade.executed`.
+Webhook events: `aml.flagged`, `aml.cleared`, `kyc.approved`, `trade.executed`.
 
-## Deferred Work
+## Deferred
 
 - ML scoring via Hanzo Zen gateway (ScorerPlugin interface ready)
 - Hanzo Tasks durable workflows (sanctions-refresh, case-automation, backtest)
@@ -161,14 +131,14 @@ Webhook event names are preserved: `aml.flagged`, `aml.cleared`, `kyc.approved`,
 
 - Single binary: `amld serve --http=0.0.0.0:8090`
 - Docker: `ghcr.io/luxfi/aml:{env}`
-- K8s: StatefulSet, replicas=1 (SQLite single-writer), PVC for /data
+- K8s: Deployment, replicas=1 (SQLite single-writer), PVC for /data
 - Replication: hanzoai/replicate sidecar for age-encrypted S3 WAL streaming
 
 ## Test Coverage
 
 56 tests across 5 packages. All pass with `-race`.
 
-- engine: 20 tests (evaluator, scoring, engine integration)
+- engine: 20 tests (evaluator, scoring, integration)
 - rules: 20 tests (all 20 starter rules compile + individual eval)
 - cases: 10 tests (CRUD, status, events, assignment, resolution)
 - sanctions: 12 tests (Jaro-Winkler, normalize, token match)
