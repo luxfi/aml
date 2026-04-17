@@ -60,7 +60,7 @@ func TestNormalize(t *testing.T) {
 		{"O'Brien", "obrien"},
 		{"Al-Rashid", "alrashid"},
 		{"  spaces  ", "spaces"},
-		{"Números123", "números123"},
+		{"Números123", "numeros123"},
 	}
 	for _, tt := range tests {
 		got := normalize(tt.in)
@@ -111,5 +111,58 @@ func TestJaroWinklerKnownValue(t *testing.T) {
 	score := JaroWinkler("martha", "marhta")
 	if score < 0.96 {
 		t.Errorf("MARTHA/MARHTA: got %f, want >= 0.96", score)
+	}
+}
+
+// TestMatchCyrillicHomoglyph (RED-10) verifies that Cyrillic homoglyphs
+// are transliterated before matching, catching evasion attempts.
+func TestMatchCyrillicHomoglyph(t *testing.T) {
+	// "Ким Йонг Ун" (Cyrillic) vs "Kim Jong Un" (Latin)
+	score := TokenMatch("Ким Йонг Ун", "Kim Jong Un")
+	if score < 0.7 {
+		t.Errorf("RED-10 Cyrillic homoglyph: score=%f, want >= 0.7", score)
+	}
+}
+
+// TestMatchReversedName (RED-10) verifies that reversed name order still matches.
+func TestMatchReversedName(t *testing.T) {
+	score := TokenMatch("Jong Un Kim", "Kim Jong Un")
+	if score < 0.8 {
+		t.Errorf("RED-10 reversed name: score=%f, want >= 0.8", score)
+	}
+}
+
+// TestMatchTransliteration (RED-10) verifies transliteration of Cyrillic names.
+func TestMatchTransliteration(t *testing.T) {
+	// Common Cyrillic→Latin transliteration test.
+	score := TokenMatch("Путин Владимир", "Putin Vladimir")
+	if score < 0.5 {
+		t.Errorf("RED-10 transliteration: score=%f, want >= 0.5", score)
+	}
+}
+
+// TestNormalizeNFKD (RED-10) verifies NFKD normalization handles fullwidth chars.
+func TestNormalizeNFKD(t *testing.T) {
+	// Fullwidth "Ｊｏｈｎ" should normalize to "john".
+	got := normalize("Ｊｏｈｎ")
+	if got != "john" {
+		t.Errorf("normalize fullwidth = %q, want %q", got, "john")
+	}
+}
+
+func TestSoundex(t *testing.T) {
+	tests := []struct {
+		in, want string
+	}{
+		{"Robert", "R163"},
+		{"Rupert", "R163"},
+		{"Smith", "S530"},
+		{"Smyth", "S530"},
+	}
+	for _, tt := range tests {
+		got := soundex(tt.in)
+		if got != tt.want {
+			t.Errorf("soundex(%q) = %q, want %q", tt.in, got, tt.want)
+		}
 	}
 }
