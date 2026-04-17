@@ -25,23 +25,55 @@ type Handler struct {
 	Sanctions  *SanctionsStore
 }
 
-// AlertStore is a thread-safe in-memory alert store for the API layer.
-// RED-02: Added sync.RWMutex — concurrent transaction ingestion was a data race.
+// DefaultMaxAlerts is the default maximum number of transaction IDs in the alert store.
+const DefaultMaxAlerts = 100_000
+
+// AlertStore is a thread-safe in-memory alert store with LRU eviction.
+// RED-02: sync.RWMutex for data-race safety.
+// RED-08: LRU eviction prevents unbounded memory growth.
 type AlertStore struct {
-	mu     sync.RWMutex
-	alerts map[string][]types.Alert // keyed by tx_id
+	mu       sync.RWMutex
+	alerts   map[string][]types.Alert // keyed by tx_id
+	order    []string                 // insertion order for LRU eviction
+	maxItems int
 }
 
-// NewAlertStore creates an empty alert store.
+// NewAlertStore creates an alert store with the default max capacity.
 func NewAlertStore() *AlertStore {
-	return &AlertStore{alerts: make(map[string][]types.Alert)}
+	return NewAlertStoreWithMax(DefaultMaxAlerts)
 }
 
-// Add stores alerts for a transaction.
+// NewAlertStoreWithMax creates an alert store with the specified max capacity.
+func NewAlertStoreWithMax(maxItems int) *AlertStore {
+	if maxItems <= 0 {
+		maxItems = DefaultMaxAlerts
+	}
+	return &AlertStore{
+		alerts:   make(map[string][]types.Alert),
+		maxItems: maxItems,
+	}
+}
+
+// Add stores alerts for a transaction. Evicts oldest 10% when capacity is exceeded.
 func (s *AlertStore) Add(txID string, alerts []types.Alert) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
+	if _, exists := s.alerts[txID]; !exists {
+		s.order = append(s.order, txID)
+	}
 	s.alerts[txID] = append(s.alerts[txID], alerts...)
+
+	if len(s.order) > s.maxItems {
+		evictCount := s.maxItems / 10
+		if evictCount < 1 {
+			evictCount = 1
+		}
+		for i := 0; i < evictCount && i < len(s.order); i++ {
+			delete(s.alerts, s.order[i])
+		}
+		s.order = s.order[evictCount:]
+	}
 }
 
 // ByTx returns alerts for a transaction.
@@ -49,6 +81,13 @@ func (s *AlertStore) ByTx(txID string) []types.Alert {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.alerts[txID]
+}
+
+// Len returns the number of transaction IDs in the store.
+func (s *AlertStore) Len() int {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return len(s.alerts)
 }
 
 // SanctionsStore is a minimal in-memory sanctions entry store.
@@ -274,6 +313,9 @@ func (h *Handler) searchSanctions() func(e *core.RequestEvent) error {
 	}
 }
 
+// maxDSLLength is the maximum allowed DSL expression length (RED-15).
+const maxDSLLength = 2048
+
 func (h *Handler) testRule() func(e *core.RequestEvent) error {
 	return func(e *core.RequestEvent) error {
 		var req struct {
@@ -283,6 +325,13 @@ func (h *Handler) testRule() func(e *core.RequestEvent) error {
 		}
 		if err := json.NewDecoder(e.Request.Body).Decode(&req); err != nil {
 			return e.JSON(http.StatusBadRequest, map[string]string{"error": "invalid request body"})
+		}
+
+		// RED-15: Reject oversized DSL to prevent DoS via computation bombs.
+		if len(req.DSL) > maxDSLLength {
+			return e.JSON(http.StatusBadRequest, map[string]string{
+				"error": "DSL expression exceeds maximum length of 2048 bytes",
+			})
 		}
 
 		testRule := types.Rule{

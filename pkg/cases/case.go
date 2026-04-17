@@ -11,21 +11,76 @@ import (
 	"github.com/luxfi/aml/pkg/types"
 )
 
-// Store is an in-memory case store. Production uses Base collections;
-// this provides the domain logic without a DB dependency.
+// DefaultClosedCaseRetention is how long closed cases stay in memory.
+const DefaultClosedCaseRetention = 90 * 24 * time.Hour // 90 days
+
+// DefaultMaxCases is the maximum open+recent cases held in memory.
+const DefaultMaxCases = 100_000
+
+// Store is an in-memory case store with eviction of old closed cases.
+// RED-08: Prevents unbounded memory growth by evicting closed cases
+// older than the retention period, and hard-capping total count.
 type Store struct {
-	mu     sync.RWMutex
-	cases  map[string]*types.Case
-	events map[string][]types.CaseEvent
-	seq    atomic.Int64
+	mu        sync.RWMutex
+	cases     map[string]*types.Case
+	events    map[string][]types.CaseEvent
+	seq       atomic.Int64
+	maxCases  int
+	retention time.Duration
 }
 
-// NewStore creates an empty case store.
+// NewStore creates an empty case store with default limits.
 func NewStore() *Store {
 	return &Store{
-		cases:  make(map[string]*types.Case),
-		events: make(map[string][]types.CaseEvent),
+		cases:     make(map[string]*types.Case),
+		events:    make(map[string][]types.CaseEvent),
+		maxCases:  DefaultMaxCases,
+		retention: DefaultClosedCaseRetention,
 	}
+}
+
+// NewStoreWithLimits creates a case store with explicit limits.
+func NewStoreWithLimits(maxCases int, retention time.Duration) *Store {
+	if maxCases <= 0 {
+		maxCases = DefaultMaxCases
+	}
+	if retention <= 0 {
+		retention = DefaultClosedCaseRetention
+	}
+	return &Store{
+		cases:     make(map[string]*types.Case),
+		events:    make(map[string][]types.CaseEvent),
+		maxCases:  maxCases,
+		retention: retention,
+	}
+}
+
+// EvictExpired removes closed cases older than the retention period.
+// Called internally after Create; can also be called externally by a cron.
+func (s *Store) EvictExpired() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.evictExpiredLocked()
+}
+
+func (s *Store) evictExpiredLocked() int {
+	cutoff := time.Now().UTC().Add(-s.retention)
+	evicted := 0
+	for id, c := range s.cases {
+		if c.Status == types.CaseClosed && c.ClosedAt != nil && c.ClosedAt.Before(cutoff) {
+			delete(s.cases, id)
+			delete(s.events, id)
+			evicted++
+		}
+	}
+	return evicted
+}
+
+// Len returns the number of cases in the store.
+func (s *Store) Len() int {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return len(s.cases)
 }
 
 // Create opens a new case from a set of alerts.
@@ -46,6 +101,10 @@ func (s *Store) Create(orgID string, severity string, alertIDs []string, entityI
 
 	s.mu.Lock()
 	s.cases[c.ID] = c
+	// RED-08: Evict expired closed cases when approaching capacity.
+	if len(s.cases) > s.maxCases {
+		s.evictExpiredLocked()
+	}
 	s.mu.Unlock()
 
 	return c
