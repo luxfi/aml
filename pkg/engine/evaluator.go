@@ -14,22 +14,44 @@ import (
 // ExprFunc is the function signature required by expr-lang.
 type ExprFunc = func(params ...any) (any, error)
 
+// DefaultMaxCacheSize is the default max number of compiled programs in the cache.
+const DefaultMaxCacheSize = 10_000
+
 // Evaluator compiles and evaluates expr-lang rule DSL against transaction contexts.
 // Compiled programs are cached per rule ID + DSL hash for reuse.
+// RED-15: Cache has a max size with LRU eviction to prevent memory exhaustion.
 type Evaluator struct {
-	mu    sync.RWMutex
-	cache map[string]*vm.Program // key = rule.ID + ":" + rule.DSL
-	funcs map[string]ExprFunc
+	mu           sync.RWMutex
+	cache        map[string]*vm.Program // key = rule.ID + ":" + rule.DSL
+	cacheOrder   []string               // insertion order for LRU eviction
+	maxCacheSize int
+	funcs        map[string]ExprFunc
 }
 
 // NewEvaluator creates an Evaluator with the default helper functions.
 func NewEvaluator() *Evaluator {
+	return NewEvaluatorWithMaxCache(DefaultMaxCacheSize)
+}
+
+// NewEvaluatorWithMaxCache creates an Evaluator with a custom cache limit.
+func NewEvaluatorWithMaxCache(maxCache int) *Evaluator {
+	if maxCache <= 0 {
+		maxCache = DefaultMaxCacheSize
+	}
 	e := &Evaluator{
-		cache: make(map[string]*vm.Program),
-		funcs: make(map[string]ExprFunc),
+		cache:        make(map[string]*vm.Program),
+		maxCacheSize: maxCache,
+		funcs:        make(map[string]ExprFunc),
 	}
 	e.registerDefaults()
 	return e
+}
+
+// CacheLen returns the number of compiled programs in the cache.
+func (e *Evaluator) CacheLen() int {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	return len(e.cache)
 }
 
 // RegisterFunc adds a named function available in the expr-lang environment.
@@ -64,6 +86,51 @@ func (e *Evaluator) registerDefaults() {
 	e.funcs["travel_rule_complete"] = func(params ...any) (any, error) { return true, nil }
 	e.funcs["chain_risk_score"] = func(params ...any) (any, error) { return 0.0, nil }
 	e.funcs["chain_is_sanctioned"] = func(params ...any) (any, error) { return false, nil }
+
+	// RED-13: notional_usd converts tx.Notional to USD using approximate FX rates.
+	// This ensures CTR rules fire correctly for non-USD currencies.
+	e.funcs["notional_usd"] = func(params ...any) (any, error) {
+		if len(params) < 1 {
+			return 0.0, fmt.Errorf("notional_usd requires a transaction")
+		}
+		// expr-lang passes the struct directly.
+		switch v := params[0].(type) {
+		case types.Transaction:
+			return notionalUSD(v.Notional, v.Currency), nil
+		case *types.Transaction:
+			return notionalUSD(v.Notional, v.Currency), nil
+		case map[string]interface{}:
+			notional, _ := v["Notional"].(float64)
+			currency, _ := v["Currency"].(string)
+			return notionalUSD(notional, currency), nil
+		default:
+			return 0.0, fmt.Errorf("notional_usd: unexpected type %T", params[0])
+		}
+	}
+}
+
+// RED-13: fxRates maps currency codes to their approximate USD exchange rate.
+// Updated by the sanctions refresh cron in production; these are conservative defaults.
+var fxRates = map[string]float64{
+	"USD": 1.0, "EUR": 1.08, "GBP": 1.27, "CHF": 1.12,
+	"JPY": 0.0067, "INR": 0.012, "BRL": 0.20, "AUD": 0.66,
+	"CAD": 0.74, "SGD": 0.75, "AED": 0.27, "KRW": 0.00075,
+	"CNY": 0.14, "MXN": 0.058, "ZAR": 0.055, "TRY": 0.031,
+	"RUB": 0.011, "HKD": 0.13, "NZD": 0.61, "SEK": 0.096,
+	"NOK": 0.094, "DKK": 0.14, "PLN": 0.25, "THB": 0.028,
+}
+
+// notionalUSD converts a notional amount to USD using approximate FX rates.
+// Unknown currencies return the raw notional value (conservative — assumes USD).
+func notionalUSD(notional float64, currency string) float64 {
+	if currency == "" || currency == "USD" {
+		return notional
+	}
+	rate, ok := fxRates[strings.ToUpper(currency)]
+	if !ok {
+		return notional // unknown currency → assume raw = conservative
+	}
+	return notional * rate
 }
 
 // cacheKey returns the cache key for a compiled rule program.
@@ -98,7 +165,23 @@ func (e *Evaluator) Compile(r types.Rule) (*vm.Program, error) {
 	}
 
 	e.mu.Lock()
+	// RED-15: Evict oldest entries when cache exceeds max size.
+	if len(e.cache) >= e.maxCacheSize {
+		evictCount := e.maxCacheSize / 10
+		if evictCount < 1 {
+			evictCount = 1
+		}
+		for i := 0; i < evictCount && i < len(e.cacheOrder); i++ {
+			delete(e.cache, e.cacheOrder[i])
+		}
+		if evictCount <= len(e.cacheOrder) {
+			e.cacheOrder = e.cacheOrder[evictCount:]
+		} else {
+			e.cacheOrder = nil
+		}
+	}
 	e.cache[key] = prog
+	e.cacheOrder = append(e.cacheOrder, key)
 	e.mu.Unlock()
 
 	return prog, nil
