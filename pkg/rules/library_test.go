@@ -113,18 +113,52 @@ func TestRuleCTRFires(t *testing.T) {
 	}
 }
 
-func TestRuleCTRNoFireEUR(t *testing.T) {
+// TestCTRFiresForEUR (RED-13) verifies that CTR fires for non-USD currencies
+// when the USD equivalent exceeds $10,000. EUR 9999 * 1.08 = $10,798.
+func TestCTRFiresForEUR(t *testing.T) {
 	eval := engine.NewEvaluator()
 	r := findRule("rule-ctr-threshold")
 	ctx := types.EvalContext{
-		Tx: types.Transaction{Notional: 15000, Currency: "EUR"},
+		Tx: types.Transaction{Notional: 9999, Currency: "EUR"},
+	}
+	match, err := eval.Eval(r, ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !match {
+		t.Error("RED-13: CTR should fire for EUR 9999 ($10,799 at 1.08)")
+	}
+}
+
+// TestCTRNoFireJPYSmall (RED-13) verifies CTR does NOT fire for small JPY amounts.
+func TestCTRNoFireJPYSmall(t *testing.T) {
+	eval := engine.NewEvaluator()
+	r := findRule("rule-ctr-threshold")
+	ctx := types.EvalContext{
+		Tx: types.Transaction{Notional: 10001, Currency: "JPY"},
 	}
 	match, err := eval.Eval(r, ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if match {
-		t.Error("CTR should not fire for EUR")
+		t.Error("RED-13: CTR should NOT fire for JPY 10001 ($67 at 0.0067)")
+	}
+}
+
+// TestCTRFiresJPYLarge (RED-13) verifies CTR fires for large JPY amounts.
+func TestCTRFiresJPYLarge(t *testing.T) {
+	eval := engine.NewEvaluator()
+	r := findRule("rule-ctr-threshold")
+	ctx := types.EvalContext{
+		Tx: types.Transaction{Notional: 1500000, Currency: "JPY"},
+	}
+	match, err := eval.Eval(r, ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !match {
+		t.Error("RED-13: CTR should fire for JPY 1500000 ($10,050 at 0.0067)")
 	}
 }
 
