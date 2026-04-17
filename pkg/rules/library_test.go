@@ -9,8 +9,8 @@ import (
 
 func TestStarterRulesCount(t *testing.T) {
 	rules := StarterRules("test")
-	if len(rules) != 20 {
-		t.Errorf("expected 20 starter rules, got %d", len(rules))
+	if len(rules) != 23 {
+		t.Errorf("expected 23 starter rules, got %d", len(rules))
 	}
 }
 

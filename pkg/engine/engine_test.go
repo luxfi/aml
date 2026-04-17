@@ -137,8 +137,8 @@ func TestEngineSetRules(t *testing.T) {
 	}
 
 	eng.SetRules(rules.StarterRules("test"))
-	if len(eng.Rules()) != 20 {
-		t.Errorf("expected 20 rules, got %d", len(eng.Rules()))
+	if len(eng.Rules()) != 23 {
+		t.Errorf("expected 23 rules, got %d", len(eng.Rules()))
 	}
 }
 
