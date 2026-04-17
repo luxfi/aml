@@ -1,6 +1,7 @@
 package sanctions
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/xml"
@@ -35,8 +36,14 @@ func (ing *Ingester) FetchOFAC(ctx context.Context, url string) ([]types.Sanctio
 		return nil, "", fmt.Errorf("fetch OFAC: %w", err)
 	}
 
+	// RED-05: Use streaming decoder with entity expansion disabled to prevent
+	// billion-laughs XML bomb attacks. Strict mode + empty entity map means
+	// any entity reference in the XML causes a parse error instead of OOM.
 	var sdnList sdnListXML
-	if err := xml.Unmarshal(body, &sdnList); err != nil {
+	d := xml.NewDecoder(bytes.NewReader(body))
+	d.Strict = true
+	d.Entity = map[string]string{} // disable entity expansion
+	if err := d.Decode(&sdnList); err != nil {
 		return nil, "", fmt.Errorf("parse OFAC XML: %w", err)
 	}
 
