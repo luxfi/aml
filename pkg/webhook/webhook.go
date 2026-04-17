@@ -11,7 +11,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
+	"net/url"
+	"strings"
 	"time"
 
 	"github.com/luxfi/aml/pkg/types"
@@ -80,6 +83,81 @@ func Sign(body []byte, secret string) string {
 func Verify(body []byte, secret, signature string) bool {
 	expected := Sign(body, secret)
 	return hmac.Equal([]byte(expected), []byte(signature))
+}
+
+// privateNetworks lists CIDR ranges that must be rejected for webhook URLs.
+// RED-18: Prevents SSRF by blocking delivery to internal/private networks.
+var privateNetworks = []string{
+	"10.0.0.0/8",
+	"172.16.0.0/12",
+	"192.168.0.0/16",
+	"127.0.0.0/8",
+	"169.254.0.0/16", // link-local + cloud metadata
+	"::1/128",
+	"fc00::/7",  // unique local
+	"fe80::/10", // link-local IPv6
+}
+
+// internalHostSuffixes are DNS suffixes that resolve to internal services.
+var internalHostSuffixes = []string{
+	".svc.cluster.local",
+	".internal",
+	".local",
+}
+
+// ValidateURL checks that a webhook URL is safe to deliver to.
+// Rejects private IPs, localhost, cloud metadata, and K8s internal hostnames.
+func ValidateURL(rawURL string) error {
+	parsed, err := url.Parse(rawURL)
+	if err != nil {
+		return fmt.Errorf("invalid URL: %w", err)
+	}
+
+	if parsed.Scheme != "https" {
+		return fmt.Errorf("webhook URL must use HTTPS")
+	}
+
+	hostname := parsed.Hostname()
+
+	// Check internal hostname suffixes.
+	lower := strings.ToLower(hostname)
+	for _, suffix := range internalHostSuffixes {
+		if strings.HasSuffix(lower, suffix) {
+			return fmt.Errorf("webhook URL hostname %q is internal", hostname)
+		}
+	}
+
+	// Block well-known metadata hostnames.
+	if lower == "metadata.google.internal" || lower == "metadata" {
+		return fmt.Errorf("webhook URL hostname %q is a cloud metadata endpoint", hostname)
+	}
+
+	// Resolve hostname and check all IPs against private ranges.
+	ips, err := net.LookupHost(hostname)
+	if err != nil {
+		// If resolution fails, check if hostname is already an IP.
+		ip := net.ParseIP(hostname)
+		if ip != nil {
+			ips = []string{hostname}
+		} else {
+			return fmt.Errorf("cannot resolve hostname %q: %w", hostname, err)
+		}
+	}
+
+	for _, ipStr := range ips {
+		ip := net.ParseIP(ipStr)
+		if ip == nil {
+			continue
+		}
+		for _, cidr := range privateNetworks {
+			_, network, _ := net.ParseCIDR(cidr)
+			if network != nil && network.Contains(ip) {
+				return fmt.Errorf("webhook URL resolves to private IP %s", ipStr)
+			}
+		}
+	}
+
+	return nil
 }
 
 // DeliverWithRetry attempts delivery with exponential backoff.

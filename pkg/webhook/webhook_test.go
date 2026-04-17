@@ -78,6 +78,39 @@ func TestDeliver(t *testing.T) {
 	}
 }
 
+// TestWebhookURLValidation (RED-18) verifies SSRF protection on webhook URLs.
+func TestWebhookURLValidation(t *testing.T) {
+	tests := []struct {
+		name    string
+		url     string
+		wantErr bool
+	}{
+		{"private_10", "https://10.0.0.1/hook", true},
+		{"private_172", "https://172.16.0.1/hook", true},
+		{"private_192", "https://192.168.1.1/hook", true},
+		{"localhost_ip", "https://127.0.0.1/hook", true},
+		{"localhost_ipv6", "https://[::1]/hook", true},
+		{"metadata_gcp", "https://metadata.google.internal/computeMetadata/v1/", true},
+		{"link_local", "https://169.254.169.254/latest/meta-data/", true},
+		{"k8s_internal", "https://my-svc.default.svc.cluster.local/hook", true},
+		{"dot_internal", "https://something.internal/hook", true},
+		{"http_scheme", "http://example.com/hook", true},
+		{"public_ok", "https://example.com/hook", false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := ValidateURL(tt.url)
+			if tt.wantErr && err == nil {
+				t.Errorf("RED-18: ValidateURL(%q) should reject but returned nil", tt.url)
+			}
+			if !tt.wantErr && err != nil {
+				t.Errorf("RED-18: ValidateURL(%q) should accept but got: %v", tt.url, err)
+			}
+		})
+	}
+}
+
 func TestDeliverFailure(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusInternalServerError)
