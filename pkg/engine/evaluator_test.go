@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"fmt"
 	"testing"
 
 	"github.com/luxfi/aml/pkg/types"
@@ -224,9 +225,32 @@ func TestEvalCaching(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	eval.mu.RLock()
-	if len(eval.cache) != 1 {
-		t.Errorf("cache should have 1 entry, got %d", len(eval.cache))
+	if eval.CacheLen() != 1 {
+		t.Errorf("cache should have 1 entry, got %d", eval.CacheLen())
 	}
-	eval.mu.RUnlock()
+}
+
+// TestEvaluatorCacheEviction (RED-15) verifies that the evaluator cache evicts
+// entries when it exceeds maxCacheSize.
+func TestEvaluatorCacheEviction(t *testing.T) {
+	eval := NewEvaluatorWithMaxCache(100)
+
+	// Compile 200 unique rules.
+	for i := 0; i < 200; i++ {
+		rule := types.Rule{
+			ID:      fmt.Sprintf("r%d", i),
+			Name:    fmt.Sprintf("r%d", i),
+			DSL:     fmt.Sprintf("tx.Notional > %d", i),
+			Enabled: true,
+		}
+		_, err := eval.Compile(rule)
+		if err != nil {
+			t.Fatalf("compile r%d: %v", i, err)
+		}
+	}
+
+	size := eval.CacheLen()
+	if size > 100 {
+		t.Errorf("RED-15: cache size = %d, want <= 100 after eviction", size)
+	}
 }
