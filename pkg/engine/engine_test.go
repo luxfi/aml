@@ -136,9 +136,39 @@ func TestEngineSetRules(t *testing.T) {
 		t.Fatal("expected 0 rules")
 	}
 
-	eng.SetRules(rules.StarterRules("test"))
+	if err := eng.SetRules(rules.StarterRules("test")); err != nil {
+		t.Fatalf("SetRules failed: %v", err)
+	}
 	if len(eng.Rules()) != 23 {
 		t.Errorf("expected 23 rules, got %d", len(eng.Rules()))
+	}
+}
+
+// TestSetRulesRejectsNegativeWeight (RED-19) verifies that SetRules rejects
+// rules with negative weights, preventing score suppression attacks.
+func TestSetRulesRejectsNegativeWeight(t *testing.T) {
+	eng := New(nil)
+	err := eng.SetRules([]types.Rule{
+		{ID: "good", Weight: 0.3, Enabled: true},
+		{ID: "evil", Weight: -1.0, Enabled: true},
+	})
+	if err == nil {
+		t.Fatal("RED-19: SetRules should reject negative weight, got nil error")
+	}
+	// Verify the rules were NOT set.
+	if len(eng.Rules()) != 0 {
+		t.Errorf("rules should remain empty after rejected SetRules, got %d", len(eng.Rules()))
+	}
+}
+
+// TestSetRulesAcceptsZeroWeight verifies that weight=0 is allowed (disabled rule).
+func TestSetRulesAcceptsZeroWeight(t *testing.T) {
+	eng := New(nil)
+	err := eng.SetRules([]types.Rule{
+		{ID: "zero", Weight: 0.0, Enabled: true},
+	})
+	if err != nil {
+		t.Fatalf("SetRules should accept weight=0, got: %v", err)
 	}
 }
 

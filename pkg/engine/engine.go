@@ -4,6 +4,7 @@
 package engine
 
 import (
+	"fmt"
 	"sync"
 	"time"
 
@@ -26,11 +27,18 @@ func New(rules []types.Rule) *Engine {
 	}
 }
 
-// SetRules replaces the rule set atomically.
-func (e *Engine) SetRules(rules []types.Rule) {
+// SetRules replaces the rule set atomically. Returns an error if any rule
+// has a negative weight (RED-19: prevents score suppression attacks).
+func (e *Engine) SetRules(rules []types.Rule) error {
+	for _, r := range rules {
+		if r.Weight < 0 {
+			return fmt.Errorf("rule %q has negative weight %f: negative weights are not allowed", r.ID, r.Weight)
+		}
+	}
 	e.mu.Lock()
 	e.rules = rules
 	e.mu.Unlock()
+	return nil
 }
 
 // Rules returns a copy of the current rule set.
