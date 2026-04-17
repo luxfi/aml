@@ -2,6 +2,7 @@ package cases
 
 import (
 	"testing"
+	"time"
 
 	"github.com/luxfi/aml/pkg/types"
 )
@@ -171,5 +172,60 @@ func TestSequenceIncrement(t *testing.T) {
 
 	if c1.Number != 1 || c2.Number != 2 || c3.Number != 3 {
 		t.Errorf("sequence: %d, %d, %d — want 1, 2, 3", c1.Number, c2.Number, c3.Number)
+	}
+}
+
+// TestCaseStoreEviction (RED-08) verifies that closed cases older than the
+// retention period are evicted when the store exceeds capacity.
+func TestCaseStoreEviction(t *testing.T) {
+	retention := 1 * time.Millisecond // very short for test
+	s := NewStoreWithLimits(10, retention)
+
+	// Create and immediately close 15 cases.
+	for i := 0; i < 15; i++ {
+		c := s.Create("org1", types.SeverityLow, nil, nil)
+		s.Resolve(c.ID, types.ResolutionCleared, "system")
+	}
+
+	// Wait for closed cases to become stale.
+	time.Sleep(5 * time.Millisecond)
+
+	// Create one more to trigger eviction.
+	s.Create("org1", types.SeverityHigh, nil, nil)
+
+	if s.Len() > 10 {
+		t.Errorf("store size after eviction = %d, want <= 10", s.Len())
+	}
+}
+
+// TestCaseStoreEvictExpiredDirect (RED-08) tests the EvictExpired method directly.
+func TestCaseStoreEvictExpiredDirect(t *testing.T) {
+	retention := 1 * time.Millisecond
+	s := NewStoreWithLimits(1000, retention)
+
+	// Create 5 cases, close 3 of them.
+	var openIDs []string
+	for i := 0; i < 5; i++ {
+		c := s.Create("org1", types.SeverityLow, nil, nil)
+		if i < 3 {
+			s.Resolve(c.ID, types.ResolutionCleared, "system")
+		} else {
+			openIDs = append(openIDs, c.ID)
+		}
+	}
+
+	time.Sleep(5 * time.Millisecond)
+	evicted := s.EvictExpired()
+
+	if evicted != 3 {
+		t.Errorf("evicted = %d, want 3", evicted)
+	}
+	if s.Len() != 2 {
+		t.Errorf("store size = %d, want 2 (open cases)", s.Len())
+	}
+	for _, id := range openIDs {
+		if s.Get(id) == nil {
+			t.Errorf("open case %s should not be evicted", id)
+		}
 	}
 }
