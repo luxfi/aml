@@ -240,9 +240,10 @@ type Webhook struct {
 
 // RuleHit is the result of evaluating a single rule against a transaction.
 type RuleHit struct {
-	Rule  Rule
-	Match bool
-	Score float64
+	Rule    Rule
+	Match   bool
+	Score   float64
+	EvalErr string // non-empty if the rule evaluation failed (fail-closed)
 }
 
 // EvalContext is the evaluation context passed to expr-lang rules.

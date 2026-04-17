@@ -25,8 +25,10 @@ type Handler struct {
 	Sanctions  *SanctionsStore
 }
 
-// AlertStore is a minimal in-memory alert store for the API layer.
+// AlertStore is a thread-safe in-memory alert store for the API layer.
+// RED-02: Added sync.RWMutex — concurrent transaction ingestion was a data race.
 type AlertStore struct {
+	mu     sync.RWMutex
 	alerts map[string][]types.Alert // keyed by tx_id
 }
 
@@ -37,11 +39,15 @@ func NewAlertStore() *AlertStore {
 
 // Add stores alerts for a transaction.
 func (s *AlertStore) Add(txID string, alerts []types.Alert) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	s.alerts[txID] = append(s.alerts[txID], alerts...)
 }
 
 // ByTx returns alerts for a transaction.
 func (s *AlertStore) ByTx(txID string) []types.Alert {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	return s.alerts[txID]
 }
 

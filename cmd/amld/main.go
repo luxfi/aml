@@ -21,6 +21,7 @@ import (
 	"github.com/luxfi/aml/pkg/cases"
 	"github.com/luxfi/aml/pkg/engine"
 	"github.com/luxfi/aml/pkg/rules"
+	"github.com/luxfi/aml/pkg/sanctions"
 	uiaml "github.com/luxfi/aml/ui"
 )
 
@@ -58,6 +59,14 @@ func main() {
 
 	app.OnServe().Bind(&hook.Handler[*core.ServeEvent]{
 		Func: func(se *core.ServeEvent) error {
+			// Wire TransactionStore (Base-backed) into engine helpers.
+			txStore := engine.NewBaseStore(app)
+			engine.RegisterStoreHelpers(eng, txStore)
+
+			// Wire SanctionsStore (Base-backed) and register refresh cron.
+			baseSanctionsStore := sanctions.NewBaseSanctionsStore(app)
+			sanctions.RefreshCron(app, baseSanctionsStore)
+
 			handler.Register(se)
 
 			// Mount embedded admin UI at /_/aml/

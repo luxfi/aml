@@ -61,6 +61,9 @@ func (e *Evaluator) registerDefaults() {
 	e.funcs["smurfing_detected"] = func(params ...any) (any, error) { return false, nil }
 	e.funcs["wash_trade_detected"] = func(params ...any) (any, error) { return false, nil }
 	e.funcs["travel_rule_threshold"] = func(params ...any) (any, error) { return 3000.0, nil }
+	e.funcs["travel_rule_complete"] = func(params ...any) (any, error) { return true, nil }
+	e.funcs["chain_risk_score"] = func(params ...any) (any, error) { return 0.0, nil }
+	e.funcs["chain_is_sanctioned"] = func(params ...any) (any, error) { return false, nil }
 }
 
 // cacheKey returns the cache key for a compiled rule program.
@@ -147,7 +150,14 @@ func (e *Evaluator) EvalAll(rules []types.Rule, ctx types.EvalContext) []types.R
 
 		match, err := e.Eval(r, ctx)
 		if err != nil {
-			// Log and skip — fail open on evaluation errors for non-critical.
+			// RED-03: Fail closed on eval errors. A broken rule should trigger
+			// review, not silently allow the transaction through. The error is
+			// captured in the hit so analysts can see WHY the rule flagged.
+			hits = append(hits, types.RuleHit{
+				Rule:     r,
+				Match:    true,
+				EvalErr:  err.Error(),
+			})
 			continue
 		}
 
