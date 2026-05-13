@@ -1,6 +1,6 @@
 module github.com/luxfi/aml
 
-go 1.26.1
+go 1.26.3
 
 require (
 	github.com/expr-lang/expr v1.17.6
@@ -42,20 +42,16 @@ require (
 	github.com/klauspost/compress v1.18.4 // indirect
 	github.com/luxfi/age v1.4.0 // indirect
 	github.com/luxfi/cache v1.2.1 // indirect
-	github.com/luxfi/crypto v1.17.45 // indirect
 	github.com/luxfi/fhe v1.7.9 // indirect
-	github.com/luxfi/ids v1.2.9 // indirect
 	github.com/luxfi/lattice/v7 v7.0.0 // indirect
-	github.com/luxfi/math v1.2.3 // indirect
+	github.com/luxfi/math v1.4.0 // indirect
 	github.com/luxfi/math/big v0.1.0 // indirect
 	github.com/luxfi/mdns v0.1.0 // indirect
 	github.com/luxfi/metric v1.5.0 // indirect
-	github.com/luxfi/mock v0.1.1 // indirect
 	github.com/luxfi/zap v0.2.0 // indirect
 	github.com/mattn/go-colorable v0.1.14 // indirect
 	github.com/mattn/go-isatty v0.0.20 // indirect
 	github.com/miekg/dns v1.1.72 // indirect
-	github.com/mr-tron/base58 v1.2.0 // indirect
 	github.com/nats-io/nkeys v0.4.12 // indirect
 	github.com/nats-io/nuid v1.0.1 // indirect
 	github.com/ncruces/go-strftime v1.0.0 // indirect
@@ -69,9 +65,8 @@ require (
 	github.com/stretchr/testify v1.11.1 // indirect
 	go.temporal.io/api v1.62.6 // indirect
 	go.temporal.io/sdk v1.41.1 // indirect
-	go.uber.org/mock v0.6.0 // indirect
 	golang.org/x/crypto v0.49.0 // indirect
-	golang.org/x/exp v0.0.0-20260212183809-81e46e3db34a // indirect
+	golang.org/x/exp v0.0.0-20260312153236-7ab1446f8b90 // indirect
 	golang.org/x/image v0.38.0 // indirect
 	golang.org/x/mod v0.34.0 // indirect
 	golang.org/x/net v0.52.0 // indirect
