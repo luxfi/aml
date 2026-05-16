@@ -8,7 +8,7 @@ COPY ui/ .
 RUN pnpm build
 
 # Stage 2: Build Go binary with embedded UI
-FROM golang:1.26-alpine AS build
+FROM golang:1.26.3-alpine AS build
 RUN apk add --no-cache gcc musl-dev git
 
 ENV GOPRIVATE=github.com/luxfi/*,github.com/hanzoai/*
