@@ -1,9 +1,9 @@
 # Stage 1: Build UI (Vite + React + @hanzo/gui)
 FROM node:22-alpine AS ui
-RUN corepack enable && corepack prepare pnpm@latest --activate
+RUN corepack enable && corepack prepare pnpm@8.15.9 --activate
 WORKDIR /ui
 COPY ui/package.json ui/pnpm-lock.yaml* ./
-RUN pnpm install --frozen-lockfile 2>/dev/null || pnpm install
+RUN pnpm install --frozen-lockfile 2>/dev/null || pnpm install --no-frozen-lockfile
 COPY ui/ .
 RUN pnpm build
 
