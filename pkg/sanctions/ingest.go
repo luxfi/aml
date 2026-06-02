@@ -127,13 +127,13 @@ type sdnListXML struct {
 }
 
 type sdnEntryXML struct {
-	UID           int             `xml:"uid"`
-	FirstName     string          `xml:"firstName"`
-	LastName      string          `xml:"lastName"`
-	SDNType       string          `xml:"sdnType"`
-	Aliases       []sdnAliasXML   `xml:"akaList>aka"`
-	DateOfBirth   []sdnDOBXML     `xml:"dateOfBirthList>dateOfBirthItem"`
-	Nationalities []sdnNatXML     `xml:"nationalityList>nationality"`
+	UID           int           `xml:"uid"`
+	FirstName     string        `xml:"firstName"`
+	LastName      string        `xml:"lastName"`
+	SDNType       string        `xml:"sdnType"`
+	Aliases       []sdnAliasXML `xml:"akaList>aka"`
+	DateOfBirth   []sdnDOBXML   `xml:"dateOfBirthList>dateOfBirthItem"`
+	Nationalities []sdnNatXML   `xml:"nationalityList>nationality"`
 }
 
 type sdnAliasXML struct {

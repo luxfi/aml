@@ -36,12 +36,12 @@ func NewClient(baseURL, apiKey string) *Client {
 
 // AddressRisk is the risk assessment for a blockchain address.
 type AddressRisk struct {
-	Address    string          `json:"address"`
-	Chain      string          `json:"chain"`
-	RiskScore  float64         `json:"risk_score"`   // 0.0 (clean) to 1.0 (high risk)
-	Category   string          `json:"category"`     // exchange, mixer, darknet, sanctions, unknown
-	Cluster    string          `json:"cluster_name,omitempty"`
-	Exposure   []ExposureEntry `json:"exposure,omitempty"`
+	Address   string          `json:"address"`
+	Chain     string          `json:"chain"`
+	RiskScore float64         `json:"risk_score"` // 0.0 (clean) to 1.0 (high risk)
+	Category  string          `json:"category"`   // exchange, mixer, darknet, sanctions, unknown
+	Cluster   string          `json:"cluster_name,omitempty"`
+	Exposure  []ExposureEntry `json:"exposure,omitempty"`
 }
 
 // ExposureEntry describes exposure to a particular category.
@@ -54,12 +54,12 @@ type ExposureEntry struct {
 
 // TxRisk is the risk assessment for a blockchain transaction.
 type TxRisk struct {
-	TxHash        string          `json:"tx_hash"`
-	Chain         string          `json:"chain"`
-	RiskScore     float64         `json:"risk_score"`
-	DirectExposure []ExposureEntry `json:"direct_exposure,omitempty"`
+	TxHash           string          `json:"tx_hash"`
+	Chain            string          `json:"chain"`
+	RiskScore        float64         `json:"risk_score"`
+	DirectExposure   []ExposureEntry `json:"direct_exposure,omitempty"`
 	IndirectExposure []ExposureEntry `json:"indirect_exposure,omitempty"`
-	Alerts        []string        `json:"alerts,omitempty"`
+	Alerts           []string        `json:"alerts,omitempty"`
 }
 
 // ScreenAddress checks a blockchain address against Chainalysis risk data.

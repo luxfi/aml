@@ -82,11 +82,11 @@ const (
 
 // Webhook event types.
 const (
-	WebhookAMLFlagged   = "aml.flagged"
-	WebhookAMLCleared   = "aml.cleared"
-	WebhookCaseOpened   = "case.opened"
-	WebhookCaseClosed   = "case.closed"
-	WebhookKYCApproved  = "kyc.approved"
+	WebhookAMLFlagged    = "aml.flagged"
+	WebhookAMLCleared    = "aml.cleared"
+	WebhookCaseOpened    = "case.opened"
+	WebhookCaseClosed    = "case.closed"
+	WebhookKYCApproved   = "kyc.approved"
 	WebhookTradeExecuted = "trade.executed"
 )
 
@@ -115,56 +115,56 @@ type Transaction struct {
 
 // Entity is a normalized actor (user, account, counterparty).
 type Entity struct {
-	ID             string    `json:"id"`
-	OrgID          string    `json:"org_id"`
-	EntityType     string    `json:"entity_type"`
-	ExternalID     string    `json:"external_id,omitempty"`
-	Name           string    `json:"name"`
-	Jurisdiction   string    `json:"jurisdiction,omitempty"`
-	KYCLevel       int       `json:"kyc_level"`
-	PEP            bool      `json:"pep"`
-	SanctionsFlag  bool      `json:"sanctions_flag"`
-	RiskScore      float64   `json:"risk_score"`
-	FirstSeen      time.Time `json:"first_seen"`
-	LastSeen       time.Time `json:"last_seen"`
-	CreatedAt      time.Time `json:"created_at"`
-	UpdatedAt      time.Time `json:"updated_at"`
+	ID            string    `json:"id"`
+	OrgID         string    `json:"org_id"`
+	EntityType    string    `json:"entity_type"`
+	ExternalID    string    `json:"external_id,omitempty"`
+	Name          string    `json:"name"`
+	Jurisdiction  string    `json:"jurisdiction,omitempty"`
+	KYCLevel      int       `json:"kyc_level"`
+	PEP           bool      `json:"pep"`
+	SanctionsFlag bool      `json:"sanctions_flag"`
+	RiskScore     float64   `json:"risk_score"`
+	FirstSeen     time.Time `json:"first_seen"`
+	LastSeen      time.Time `json:"last_seen"`
+	CreatedAt     time.Time `json:"created_at"`
+	UpdatedAt     time.Time `json:"updated_at"`
 }
 
 // Rule is an AML evaluation rule using expr-lang DSL.
 type Rule struct {
-	ID                 string   `json:"id"`
-	OrgID              string   `json:"org_id"`
-	Name               string   `json:"name"`
-	Description        string   `json:"description"`
-	DSL                string   `json:"dsl"`
-	Severity           string   `json:"severity"`
-	Weight             float64  `json:"weight"`
-	Action             string   `json:"action"`
-	Enabled            bool     `json:"enabled"`
-	JurisdictionFilter []string `json:"jurisdiction_filter,omitempty"`
-	AssetClassFilter   []string `json:"asset_class_filter,omitempty"`
-	Priority           int      `json:"priority"`
+	ID                 string    `json:"id"`
+	OrgID              string    `json:"org_id"`
+	Name               string    `json:"name"`
+	Description        string    `json:"description"`
+	DSL                string    `json:"dsl"`
+	Severity           string    `json:"severity"`
+	Weight             float64   `json:"weight"`
+	Action             string    `json:"action"`
+	Enabled            bool      `json:"enabled"`
+	JurisdictionFilter []string  `json:"jurisdiction_filter,omitempty"`
+	AssetClassFilter   []string  `json:"asset_class_filter,omitempty"`
+	Priority           int       `json:"priority"`
 	CreatedAt          time.Time `json:"created_at"`
 	UpdatedAt          time.Time `json:"updated_at"`
 }
 
 // Alert is a rule hit — one per transaction per rule.
 type Alert struct {
-	ID             string                 `json:"id"`
-	OrgID          string                 `json:"org_id"`
-	TxID           string                 `json:"tx_id"`
-	RuleID         string                 `json:"rule_id"`
-	RuleName       string                 `json:"rule_name"`
-	Severity       string                 `json:"severity"`
-	Score          float64                `json:"score"`
-	ScoreBreakdown map[string]float64     `json:"score_breakdown,omitempty"`
-	ActionTaken    string                 `json:"action_taken"`
-	ReviewedBy     string                 `json:"reviewed_by,omitempty"`
-	ReviewedAt     *time.Time             `json:"reviewed_at,omitempty"`
-	Decision       string                 `json:"decision,omitempty"`
-	CreatedAt      time.Time              `json:"created_at"`
-	UpdatedAt      time.Time              `json:"updated_at"`
+	ID             string             `json:"id"`
+	OrgID          string             `json:"org_id"`
+	TxID           string             `json:"tx_id"`
+	RuleID         string             `json:"rule_id"`
+	RuleName       string             `json:"rule_name"`
+	Severity       string             `json:"severity"`
+	Score          float64            `json:"score"`
+	ScoreBreakdown map[string]float64 `json:"score_breakdown,omitempty"`
+	ActionTaken    string             `json:"action_taken"`
+	ReviewedBy     string             `json:"reviewed_by,omitempty"`
+	ReviewedAt     *time.Time         `json:"reviewed_at,omitempty"`
+	Decision       string             `json:"decision,omitempty"`
+	CreatedAt      time.Time          `json:"created_at"`
+	UpdatedAt      time.Time          `json:"updated_at"`
 }
 
 // Case is a human review case.
@@ -226,16 +226,16 @@ type SanctionsEntry struct {
 
 // Webhook is a subscriber configuration.
 type Webhook struct {
-	ID             string    `json:"id"`
-	OrgID          string    `json:"org_id"`
-	URL            string    `json:"url"`
-	Secret         string    `json:"secret"`
-	Events         []string  `json:"events"`
-	Enabled        bool      `json:"enabled"`
+	ID             string     `json:"id"`
+	OrgID          string     `json:"org_id"`
+	URL            string     `json:"url"`
+	Secret         string     `json:"secret"`
+	Events         []string   `json:"events"`
+	Enabled        bool       `json:"enabled"`
 	LastDeliveryAt *time.Time `json:"last_delivery_at,omitempty"`
-	FailureCount   int       `json:"failure_count"`
-	CreatedAt      time.Time `json:"created_at"`
-	UpdatedAt      time.Time `json:"updated_at"`
+	FailureCount   int        `json:"failure_count"`
+	CreatedAt      time.Time  `json:"created_at"`
+	UpdatedAt      time.Time  `json:"updated_at"`
 }
 
 // RuleHit is the result of evaluating a single rule against a transaction.
