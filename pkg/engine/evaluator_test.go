@@ -54,9 +54,9 @@ func TestEvalNotMatched(t *testing.T) {
 func TestEvalCompoundCondition(t *testing.T) {
 	eval := NewEvaluator()
 	rule := types.Rule{
-		ID:   "structuring",
-		Name: "structuring",
-		DSL:  `tx.Notional >= 9000 && tx.Notional < 10000`,
+		ID:      "structuring",
+		Name:    "structuring",
+		DSL:     `tx.Notional >= 9000 && tx.Notional < 10000`,
 		Enabled: true,
 	}
 
@@ -88,9 +88,9 @@ func TestEvalCompoundCondition(t *testing.T) {
 func TestEvalEntityField(t *testing.T) {
 	eval := NewEvaluator()
 	rule := types.Rule{
-		ID:   "pep",
-		Name: "pep",
-		DSL:  `entity.PEP == true && tx.Notional > 10000`,
+		ID:      "pep",
+		Name:    "pep",
+		DSL:     `entity.PEP == true && tx.Notional > 10000`,
 		Enabled: true,
 	}
 
@@ -120,9 +120,9 @@ func TestEvalEntityField(t *testing.T) {
 func TestEvalStringComparison(t *testing.T) {
 	eval := NewEvaluator()
 	rule := types.Rule{
-		ID:   "ctr",
-		Name: "ctr",
-		DSL:  `tx.Notional > 10000 && tx.Currency == "USD"`,
+		ID:      "ctr",
+		Name:    "ctr",
+		DSL:     `tx.Notional > 10000 && tx.Currency == "USD"`,
 		Enabled: true,
 	}
 
@@ -150,9 +150,9 @@ func TestEvalStringComparison(t *testing.T) {
 func TestEvalInvalidDSL(t *testing.T) {
 	eval := NewEvaluator()
 	rule := types.Rule{
-		ID:   "bad",
-		Name: "bad",
-		DSL:  `this is not valid syntax !!!`,
+		ID:      "bad",
+		Name:    "bad",
+		DSL:     `this is not valid syntax !!!`,
 		Enabled: true,
 	}
 	_, err := eval.Eval(rule, types.EvalContext{})
@@ -207,9 +207,9 @@ func TestMatchesFilter(t *testing.T) {
 func TestEvalCaching(t *testing.T) {
 	eval := NewEvaluator()
 	rule := types.Rule{
-		ID:   "cached",
-		Name: "cached",
-		DSL:  `tx.Notional > 0`,
+		ID:      "cached",
+		Name:    "cached",
+		DSL:     `tx.Notional > 0`,
 		Enabled: true,
 	}
 

@@ -14,18 +14,18 @@ import (
 
 // FilingType constants for FinCEN SAR.
 const (
-	FilingInitial     = "initial"
-	FilingContinuing  = "continuing"
-	FilingCorrection  = "correction"
+	FilingInitial    = "initial"
+	FilingContinuing = "continuing"
+	FilingCorrection = "correction"
 )
 
 // SARDraft is a structured SAR (Suspicious Activity Report) draft.
 // An analyst reviews and submits this — it is never auto-filed.
 type SARDraft struct {
 	// Filing metadata
-	FilingType    string    `json:"filing_type"`
-	FiledBy       string    `json:"filed_by,omitempty"`
-	GeneratedAt   time.Time `json:"generated_at"`
+	FilingType  string    `json:"filing_type"`
+	FiledBy     string    `json:"filed_by,omitempty"`
+	GeneratedAt time.Time `json:"generated_at"`
 
 	// Subject information (from entity)
 	SubjectName       string `json:"subject_name"`
@@ -38,19 +38,19 @@ type SARDraft struct {
 	SubjectOccupation string `json:"subject_occupation,omitempty"`
 
 	// Suspicious activity details
-	ActivityType       []string  `json:"activity_type"`
-	InstrumentType     string    `json:"instrument_type,omitempty"`
-	Amount             float64   `json:"amount"`
-	Currency           string    `json:"currency"`
-	DateRangeStart     time.Time `json:"date_range_start"`
-	DateRangeEnd       time.Time `json:"date_range_end"`
-	TransactionCount   int       `json:"transaction_count"`
+	ActivityType     []string  `json:"activity_type"`
+	InstrumentType   string    `json:"instrument_type,omitempty"`
+	Amount           float64   `json:"amount"`
+	Currency         string    `json:"currency"`
+	DateRangeStart   time.Time `json:"date_range_start"`
+	DateRangeEnd     time.Time `json:"date_range_end"`
+	TransactionCount int       `json:"transaction_count"`
 
 	// Narrative (the core of the SAR — must be human-reviewed)
 	Narrative string `json:"narrative"`
 
 	// Case reference
-	CaseID   string `json:"case_id"`
+	CaseID   string   `json:"case_id"`
 	AlertIDs []string `json:"alert_ids"`
 }
 

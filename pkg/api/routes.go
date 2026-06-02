@@ -19,10 +19,10 @@ import (
 
 // Handler wires AML engine + case store + sanctions to HTTP routes.
 type Handler struct {
-	Engine     *engine.Engine
-	Cases      *cases.Store
-	Alerts     *AlertStore
-	Sanctions  *SanctionsStore
+	Engine    *engine.Engine
+	Cases     *cases.Store
+	Alerts    *AlertStore
+	Sanctions *SanctionsStore
 }
 
 // DefaultMaxAlerts is the default maximum number of transaction IDs in the alert store.
@@ -190,9 +190,9 @@ func (h *Handler) ingestTransaction() func(e *core.RequestEvent) error {
 
 		// Resolve entity — for now use a minimal entity from the tx.
 		entity := types.Entity{
-			ID:     tx.UserID,
-			OrgID:  orgID,
-			Name:   tx.UserID,
+			ID:         tx.UserID,
+			OrgID:      orgID,
+			Name:       tx.UserID,
 			EntityType: types.EntityUser,
 		}
 
@@ -319,9 +319,9 @@ const maxDSLLength = 2048
 func (h *Handler) testRule() func(e *core.RequestEvent) error {
 	return func(e *core.RequestEvent) error {
 		var req struct {
-			DSL    string           `json:"dsl"`
+			DSL    string            `json:"dsl"`
 			Tx     types.Transaction `json:"tx"`
-			Entity types.Entity     `json:"entity"`
+			Entity types.Entity      `json:"entity"`
 		}
 		if err := json.NewDecoder(e.Request.Body).Decode(&req); err != nil {
 			return e.JSON(http.StatusBadRequest, map[string]string{"error": "invalid request body"})

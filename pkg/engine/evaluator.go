@@ -237,9 +237,9 @@ func (e *Evaluator) EvalAll(rules []types.Rule, ctx types.EvalContext) []types.R
 			// review, not silently allow the transaction through. The error is
 			// captured in the hit so analysts can see WHY the rule flagged.
 			hits = append(hits, types.RuleHit{
-				Rule:     r,
-				Match:    true,
-				EvalErr:  err.Error(),
+				Rule:    r,
+				Match:   true,
+				EvalErr: err.Error(),
 			})
 			continue
 		}
