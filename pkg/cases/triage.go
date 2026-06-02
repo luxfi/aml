@@ -21,9 +21,9 @@ func DefaultTriageConfig() TriageConfig {
 		AutoAssignEnabled: true,
 		EscalationSLA: map[string]time.Duration{
 			types.SeverityCritical: 1 * time.Hour,
-			types.SeverityHigh:    4 * time.Hour,
-			types.SeverityMedium:  24 * time.Hour,
-			types.SeverityLow:     72 * time.Hour,
+			types.SeverityHigh:     4 * time.Hour,
+			types.SeverityMedium:   24 * time.Hour,
+			types.SeverityLow:      72 * time.Hour,
 		},
 		AutoCloseAfter: 30 * 24 * time.Hour, // 30 days
 		AssignmentMode: "round_robin",

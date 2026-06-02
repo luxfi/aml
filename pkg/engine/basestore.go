@@ -29,9 +29,9 @@ func (s *BaseStore) CountByUser(ctx context.Context, userID string, since time.T
 	records, err := s.app.FindRecordsByFilter(
 		txCollection,
 		fmt.Sprintf("user_id = '%s' && created >= '%s'", userID, since.UTC().Format(time.RFC3339)),
-		"",  // sort
-		0,   // limit (0 = all)
-		0,   // offset
+		"", // sort
+		0,  // limit (0 = all)
+		0,  // offset
 	)
 	if err != nil {
 		return 0, fmt.Errorf("count by user: %w", err)

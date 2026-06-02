@@ -31,20 +31,20 @@ type AlertSink interface {
 
 // ScreenResult captures the outcome of a single entity re-screen.
 type ScreenResult struct {
-	EntityID string
-	Matched  bool
-	Score    float64
-	ListID   string
+	EntityID  string
+	Matched   bool
+	Score     float64
+	ListID    string
 	EntryName string
 }
 
 // ContinuousKYCConfig controls re-screening behavior.
 type ContinuousKYCConfig struct {
-	OrgID              string
-	HighRiskThreshold  float64       // entities above this risk_score get hourly rescreen
-	MatchThreshold     float64       // Jaro-Winkler threshold for sanctions match
-	BatchSize          int           // max entities per batch
-	Timeout            time.Duration // per-entity timeout
+	OrgID             string
+	HighRiskThreshold float64       // entities above this risk_score get hourly rescreen
+	MatchThreshold    float64       // Jaro-Winkler threshold for sanctions match
+	BatchSize         int           // max entities per batch
+	Timeout           time.Duration // per-entity timeout
 }
 
 // DefaultConfig returns conservative defaults.
