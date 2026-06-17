@@ -1,4 +1,4 @@
-# LLM.md - luxfi/aml
+# luxfi/aml
 
 ## Overview
 
