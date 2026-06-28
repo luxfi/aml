@@ -11,9 +11,9 @@ RUN pnpm build
 FROM golang:1.26.4-alpine AS build
 RUN apk add --no-cache gcc musl-dev git
 
-ENV GOPRIVATE=github.com/luxfi/*,github.com/hanzoai/*
-ENV GONOSUMDB=github.com/luxfi/*,github.com/hanzoai/*
-ENV GOPROXY=direct
+# No GOPRIVATE — luxfi/hanzoai Go modules are PUBLIC, so go resolves them via the
+# default public proxy + sumdb (immutable hashes a force-moved tag can't break).
+# GOPRIVATE / GOPROXY=direct would route them `direct` (git) and re-poison go.sum.
 
 ARG GITHUB_TOKEN
 RUN if [ -n "$GITHUB_TOKEN" ]; then \
