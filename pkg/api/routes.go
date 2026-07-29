@@ -185,6 +185,7 @@ func (h *Handler) Register(se *core.ServeEvent) {
 	se.Router.POST("/v1/aml/relationships/search", h.searchRelationships())
 	se.Router.POST("/v1/aml/sanctions/search", h.searchSanctions())
 	se.Router.GET("/v1/aml/sanctions/sources", h.screeningSources())
+	se.Router.GET("/v1/aml/catalog", h.catalog())
 	se.Router.GET("/v1/aml/health", h.health())
 }
 
