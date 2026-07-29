@@ -16,7 +16,6 @@ const Collection = "aml_transactions"
 // have to agree, and a silent disagreement produces an empty window rather than
 // an error — which reads as a customer with no history.
 const (
-	fieldOrg          = "org_id"
 	fieldUser         = "user_id"
 	fieldAccount      = "account_id"
 	fieldCounterparty = "counterparty"
@@ -48,12 +47,11 @@ func NewBase(app core.App) *Base { return &Base{app: app} }
 
 // Window returns the subject's events over the lookback, most recent first.
 //
-// The filter is parameterised. Interpolating an identifier into the filter string
-// lets a value chosen by the caller change the shape of the query: an identifier
-// containing the filter language's own syntax can widen the window to another
-// tenant's transactions or narrow it to none, and narrowing it to none is the
-// dangerous direction, because a velocity rule over an empty window reports no
-// velocity.
+// The subject's identifier is bound as a parameter. Written into the filter as text
+// it could change the shape of the query: an identifier containing the filter
+// language's own syntax can widen the window to another tenant's transactions or
+// narrow it to none, and narrowing it to none is the dangerous direction, because a
+// velocity rule over an empty window reports no velocity.
 //
 // The window is bounded by the transaction's own timestamp, not by when the record
 // was written. Those differ whenever events are replayed or backfilled, and
@@ -66,20 +64,12 @@ func (b *Base) Window(ctx context.Context, subj Subject, lookback time.Duration)
 	field := subjectField[subj.Kind]
 
 	since := time.Now().UTC().Add(-lookback)
-	filter := fmt.Sprintf("%s = {:org} && %s = {:id} && %s >= {:since}", fieldOrg, field, fieldAt)
+	filter := fmt.Sprintf("%s = {:id} && %s >= {:since}", field, fieldAt)
 
-	records, err := b.app.FindRecordsByFilter(
-		Collection,
-		filter,
-		"-"+fieldAt,
-		0,
-		0,
-		dbx.Params{
-			"org":   subj.OrgID,
-			"id":    subj.ID,
-			"since": since.Format(time.RFC3339),
-		},
-	)
+	records, err := events.Find(b.app, subj.OrgID, filter, "-"+fieldAt, 0, dbx.Params{
+		"id":    subj.ID,
+		"since": since,
+	})
 	if err != nil {
 		return nil, fmt.Errorf("history: window for %s %q: %w", subj.Kind, subj.ID, err)
 	}
@@ -111,16 +101,10 @@ func (b *Base) Window(ctx context.Context, subj Subject, lookback time.Duration)
 // aggregate that crossed a reporting threshold yesterday could fall below it
 // today and a filed report would no longer be reproducible from the data.
 func (b *Base) Append(ctx context.Context, orgID string, e Event) error {
-	collection, err := b.app.FindCollectionByNameOrId(Collection)
+	r, err := events.New(b.app, orgID)
 	if err != nil {
-		return fmt.Errorf("history: collection %s: %w", Collection, err)
+		return fmt.Errorf("history: %w", err)
 	}
-	if orgID == "" {
-		return fmt.Errorf("history: refusing to store an event with no organisation")
-	}
-
-	r := core.NewRecord(collection)
-	r.Set(fieldOrg, orgID)
 	r.Set(fieldTxID, e.ID)
 	r.Set(fieldAt, e.At.UTC())
 	r.Set(fieldUSD, e.USD)
