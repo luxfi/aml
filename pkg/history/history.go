@@ -10,6 +10,7 @@ package history
 
 import (
 	"context"
+	"fmt"
 	"time"
 )
 
@@ -47,13 +48,17 @@ type Subject struct {
 // today over a window of historical events must not silently move when a rate
 // moves.
 type Event struct {
-	ID           string
-	At           time.Time
-	USD          float64
-	Currency     string
-	Direction    string
-	Counterparty string
+	ID        string
+	At        time.Time
+	USD       float64
+	Currency  string
+	Direction string
+	// One field per subject kind, so any kind can be both aggregated over and
+	// counted as a dimension of another. Counting distinct users per device is what
+	// surfaces several nominally-unrelated customers acting as one.
+	User         string
 	Account      string
+	Counterparty string
 	Device       string
 	Address      string
 	Jurisdiction string
@@ -69,4 +74,15 @@ type Event struct {
 // can least afford.
 type Store interface {
 	Window(ctx context.Context, subj Subject, lookback time.Duration) ([]Event, error)
+}
+
+// unknownKind and incomplete are the two ways a subject can fail to name anyone.
+// Both are errors rather than empty windows: a rule evaluated over an empty window
+// reports no activity, which is indistinguishable from a customer who did nothing.
+func unknownKind(kind string) error {
+	return fmt.Errorf("history: unknown subject kind %q", kind)
+}
+
+func incomplete(s Subject) error {
+	return fmt.Errorf("history: subject %q is incomplete (organisation %q, identifier %q)", s.Kind, s.OrgID, s.ID)
 }

@@ -6,6 +6,7 @@ require (
 	github.com/expr-lang/expr v1.17.6
 	github.com/google/uuid v1.6.0
 	github.com/hanzoai/base v1.5.8
+	github.com/hanzoai/dbx v1.16.0
 	github.com/spf13/cobra v1.10.2
 	golang.org/x/text v0.38.0
 )
@@ -38,7 +39,6 @@ require (
 	github.com/gtank/merlin v0.1.1 // indirect
 	github.com/gtank/ristretto255 v0.2.0 // indirect
 	github.com/hanzoai/csqlite v0.1.0 // indirect
-	github.com/hanzoai/dbx v1.16.0 // indirect
 	github.com/hanzoai/orm v0.6.10 // indirect
 	github.com/hanzoai/pubsub-go v1.0.0 // indirect
 	github.com/hanzoai/sqlcipher v0.1.0 // indirect

@@ -111,13 +111,20 @@ func (e *Evaluator) Admit(r types.Rule) (*vm.Program, error) {
 	return prog, nil
 }
 
-// Eval runs one rule against a transaction.
+// Eval runs one rule against a transaction. It is the path used to try a
+// candidate rule before saving it; evaluating a whole set goes through EvalAll,
+// which shares one scope so a window is fetched once.
 func (e *Evaluator) Eval(ctx context.Context, r types.Rule, tx types.Transaction, ent types.Entity) (bool, error) {
+	return e.eval(newScope(ctx, e.p, tx, ent), r)
+}
+
+// eval runs one rule against an existing scope.
+func (e *Evaluator) eval(s *scope, r types.Rule) (bool, error) {
 	prog, err := e.Admit(r)
 	if err != nil {
 		return false, err
 	}
-	out, err := expr.Run(prog, newScope(ctx, e.p, tx, ent))
+	out, err := expr.Run(prog, s)
 	if err != nil {
 		return false, fmt.Errorf("rule %q: %w", r.ID, err)
 	}
@@ -133,6 +140,11 @@ func (e *Evaluator) Eval(ctx context.Context, r types.Rule, tx types.Transaction
 // transaction it happened on is precisely the one nobody has assessed. Passing
 // it through as clean would turn an outage into an approval.
 func (e *Evaluator) EvalAll(ctx context.Context, rules []types.Rule, tx types.Transaction, ent types.Entity) []types.RuleHit {
+	// One scope for the whole rule set, so the window a dozen rules ask about is
+	// fetched once. A scope per rule turns a rule set into a query per rule per
+	// transaction, which is the cost that makes institutions disable rules.
+	s := newScope(ctx, e.p, tx, ent)
+
 	var hits []types.RuleHit
 	for _, r := range rules {
 		if !r.Enabled {
@@ -144,7 +156,7 @@ func (e *Evaluator) EvalAll(ctx context.Context, rules []types.Rule, tx types.Tr
 		if !scoped(r.AssetClassFilter, tx.AssetClass) {
 			continue
 		}
-		match, err := e.Eval(ctx, r, tx, ent)
+		match, err := e.eval(s, r)
 		if err != nil {
 			hits = append(hits, types.RuleHit{Rule: r, Match: true, EvalErr: err.Error()})
 			continue
