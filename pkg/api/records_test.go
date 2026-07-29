@@ -162,9 +162,13 @@ func TestHealthReportsUnfitWithoutKeyMaterial(t *testing.T) {
 func TestIngestRetainsATransactionThatCanBeReconstructed(t *testing.T) {
 	h := plane(t)
 
+	// The customer's name is supplied by the caller, not derived from the
+	// identifier: a customer id is an opaque handle, and screening one as a name
+	// produces false positives with no possible true positive.
 	rec := ingest(t, h, map[string]any{
 		"id": "tx-1", "user_id": "ivan-petrov-42", "account_id": "GB33BUKB20201555555555",
 		"counterparty": "acme-ltd", "notional": 25000, "currency": "USD", "symbol": "BTC",
+		"entity": map[string]any{"id": "ivan-petrov-42", "name": "Ivan Petrov"},
 	})
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status %d, want 200: %s", rec.Code, rec.Body.String())

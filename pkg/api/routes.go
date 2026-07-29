@@ -302,6 +302,10 @@ func (h *Handler) ingestTransaction() func(e *core.RequestEvent) error {
 		var in struct {
 			types.Transaction
 			Relationship string `json:"relationship"`
+			// Entity is the customer this transaction belongs to. It is supplied by
+			// the caller because only the caller knows it: a name cannot be derived
+			// from an identifier, and customer screening has no input without one.
+			Entity types.Entity `json:"entity"`
 		}
 		if err := json.NewDecoder(e.Request.Body).Decode(&in); err != nil {
 			return fail(e, http.StatusBadRequest, "invalid request body")
@@ -347,12 +351,26 @@ func (h *Handler) ingestTransaction() func(e *core.RequestEvent) error {
 			}
 		}
 
-		// Resolve entity — for now use a minimal entity from the tx.
-		entity := types.Entity{
-			ID:         tx.UserID,
-			OrgID:      orgID,
-			Name:       tx.UserID,
-			EntityType: types.EntityUser,
+		// The customer this transaction belongs to.
+		//
+		// Name is deliberately NOT defaulted from the identifier. A customer id is an
+		// opaque handle, and screening one as though it were a person's name cannot
+		// produce a true positive while readily producing false ones: "cust-1"
+		// scored 0.902 against "BRANCH 1 OF THE SHIRAZ REVOLUTIONARY COU" — over the
+		// reporting threshold — and blocked an ordinary payment.
+		//
+		// With no name supplied the customer-screening rule's guard (Entity.Name !=
+		// "") holds and the rule does not fire. That is the honest outcome: a
+		// customer whose name this service has never been given has not been
+		// screened, and the way to screen them is to send the name, not to invent one
+		// from a database key. GET /v1/aml/catalog carries the gap.
+		entity := in.Entity
+		entity.OrgID = orgID
+		if entity.ID == "" {
+			entity.ID = tx.UserID
+		}
+		if entity.EntityType == "" {
+			entity.EntityType = types.EntityUser
 		}
 
 		vault, err := h.vault(orgID)
