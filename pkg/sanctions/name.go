@@ -1,7 +1,6 @@
 package sanctions
 
 import (
-	"math"
 	"strings"
 	"unicode"
 
@@ -143,12 +142,22 @@ func similar(a, b string) float64 {
 
 // Similarity compares two whole names, in either word order.
 //
-// Every token of the shorter name must find a partner in the longer one, and the
-// score is the mean of those best partnerships. Comparing in both orders is what
-// makes a list's "Kim Jong Un" match a customer record's "Un, Kim Jong" without
-// the caller having to know which convention either side used.
+// A name is a conjunction, not an average. Every identifying part of the shorter
+// name must match the longer one, and the returned score is the mean of those
+// partnerships — but the mean is reported, not tested. What decides a match is the
+// weakest part, because that is what distinguishes a variant spelling of one
+// person from a coincidence between two.
+//
+// Comparing in both orders is what makes a list's "Kim Jong Un" match a customer
+// record's "Un, Kim Jong" without the caller having to know which convention
+// either side used.
 func Similarity(a, b string) float64 {
-	ta, tb := strings.Fields(fold(a)), strings.Fields(fold(b))
+	fa, fb := fold(a), fold(b)
+	if fa == fb && fa != "" {
+		return 1
+	}
+
+	ta, tb := strings.Fields(fa), strings.Fields(fb)
 	if len(ta) == 0 || len(tb) == 0 {
 		return 0
 	}
@@ -159,41 +168,130 @@ func Similarity(a, b string) float64 {
 	if len(ta) > len(tb) {
 		ta, tb = tb, ta
 	}
-	var total float64
+
+	// Only identifying tokens decide the match. An initial, a particle and a bare
+	// number match almost anything, so they can neither establish an identity nor
+	// disqualify one — they are read past. "J Smith" is judged on Smith, "al-Assad"
+	// on Assad, "Unit 42" on Unit.
+	var mean float64
+	weakest := 1.0
+	identifying := 0
 	for _, x := range ta {
 		best := 0.0
 		for _, y := range tb {
-			best = math.Max(best, similar(x, y))
+			if s := similar(x, y); s > best {
+				best = s
+			}
 		}
-		total += best
+		if !identifies(x) {
+			continue
+		}
+		identifying++
+		mean += best
+		if best < weakest {
+			weakest = best
+		}
 	}
-	score := total / float64(len(ta))
 
-	// A single name compared against a name of several parts must match almost
-	// exactly.
+	// Nothing identifying was offered, so nobody was identified. A query of
+	// initials and digits — a customer key such as "a-1" — matched "A ONE TRADING
+	// COMPANY 1" at 1.0 before this, because each of its trivial tokens found an
+	// exact partner and the mean of two exact partnerships is exact.
 	//
-	// Comparing the shorter name against the longer is what lets a customer who
-	// omitted a patronymic still match, but read in the other direction it lets one
-	// short fragment stand in for a whole person: screening 31,338 real designations
-	// produced exactly two false positives, both of this shape — a one-word entry
-	// scoring 0.86 and 0.88 against an unrelated three-part name because it happened
-	// to share a prefix with the middle name. The fragment matched a name and left
-	// the rest of the person unaccounted for.
-	//
-	// The threshold cannot be raised generally to exclude them: a genuine
-	// transliteration of a single name, Osama against Usama, scores 0.87, below both
-	// false positives. What separates the cases is not the score but the asymmetry.
-	// One name against one name is all the evidence there is and is judged on the
-	// ordinary threshold; one name against three is a fragment, and a fragment
-	// identifies somebody only when it is exact.
-	if len(ta) == 1 && len(tb) > 1 && score < fragmentThreshold {
+	// Returning zero rather than falling through matters: the division below would
+	// be 0/0, and a NaN score compares false against every threshold, so it would
+	// read as "no match" while being unorderable and unable to marshal.
+	if identifying == 0 {
 		return 0
 	}
-	return score
+	mean /= float64(identifying)
+
+	// Every identifying part must match. A mean lets one strong partnership carry a
+	// weak one, which is how a customer key came to be reported as a designated
+	// party: "cust-1" against "CONSTELLO NO. 1 CORPORATION" scored 0.862 on the
+	// strength of 1 matching 1, while the only part that could identify anybody,
+	// "cust" against "constello", scored 0.72.
+	//
+	// The same shape occurs between two real people. "Smith Petrov" against
+	// "Smirnov Petrov" averages 0.89 on an exact surname while the given names
+	// score 0.77 — one number no threshold on the mean can separate from a genuine
+	// variant, and the weakest part can.
+	if weakest < partFloor {
+		return 0
+	}
+
+	// One identifying part against a name of several is a fragment: it named
+	// somebody and left the rest of the person unaccounted for. A fragment
+	// identifies only when it is near-exact, which is why Unit against
+	// "UNIT 42 OF THE ISLAMIC REVOLUTIONARY GUARD" matches and cust does not.
+	if identifying == 1 && len(tb) > 1 && mean < fragmentThreshold {
+		return 0
+	}
+	return mean
 }
 
-// fragmentThreshold is how well a single-token name must match a name of several
-// parts before it counts as the same person.
+// identifies reports whether a token can establish who somebody is.
+//
+// Initials, name particles and bare numbers cannot. They are short, they recur
+// across unrelated names, and they match on the little they contain: every
+// one-character token matches some one-character token exactly. Requiring at least
+// three runes and at least one letter admits the shortest real name parts — bin,
+// van, del, Wei, Ali — while excluding the tokens a database key decomposes into.
+//
+// A legal-form suffix cannot either. It names the form a company takes, not which
+// company it is, and every company has one — so matching it is agreement about
+// company-ness. "acme-ltd" was reported against an unrelated "…Co., Ltd" at 0.967
+// on the strength of Ltd matching Ltd.
+func identifies(token string) bool {
+	if legalForm[token] {
+		return false
+	}
+	letters := 0
+	runes := 0
+	for _, r := range token {
+		runes++
+		if unicode.IsLetter(r) {
+			letters++
+		}
+	}
+	return runes >= 3 && letters > 0
+}
+
+// legalForm holds the corporate legal-form suffixes, folded. The set is closed on
+// purpose: it is the forms a company registration takes, not a list of words that
+// happen to be common, so it cannot grow into a general stopword list that starts
+// discarding parts of real names.
+var legalForm = map[string]bool{
+	"ltd": true, "limited": true, "llc": true, "inc": true, "incorporated": true,
+	"corp": true, "corporation": true, "plc": true, "gmbh": true, "mbh": true,
+	"ag": true, "sa": true, "sas": true, "sarl": true, "srl": true, "spa": true,
+	"bv": true, "nv": true, "oy": true, "ab": true, "as": true, "aps": true,
+	"kk": true, "pte": true, "pty": true, "jsc": true, "ojsc": true, "zao": true,
+	"ooo": true, "oao": true, "pao": true, "fze": true, "fzc": true, "fzco": true,
+	"llp": true, "lp": true, "gie": true, "kft": true, "sro": true, "dooel": true,
+}
+
+// partFloor is how well the weakest identifying part of a name must match.
+//
+// It is measured, not chosen. Across the transliteration pairs the published lists
+// actually contain, genuine variants of one name bottom out at 0.840 — Yusuf
+// against Yousef, with Mohammed/Muhammad at 0.850, Osama/Usama and Ivan/Ivon at
+// 0.867 — while unrelated parts top out at 0.773, Smith against Smirnov, with
+// cust/constello at 0.725 and user/unit at 0.550. This sits between the two
+// populations rather than inside either.
+//
+// It is deliberately below Threshold, the bar the whole name must clear. Requiring
+// every part to individually meet the whole-name bar reads well and is wrong:
+// Yusuf against Yousef is 0.840 and would be refused, so a real customer named
+// Yousef would stop matching a designated Yusuf.
+//
+// Known limit: a name part of one or two characters carries too little to be
+// judged this way — Lee against Li scores 0.650 — which is why parts that short
+// are read past as incidental instead.
+const partFloor = 0.80
+
+// fragmentThreshold is how well a single identifying token must match a name of
+// several parts before it counts as the same person.
 const fragmentThreshold = 0.95
 
 // byteRunes exists only so the mutation harness can substitute bytewise indexing
