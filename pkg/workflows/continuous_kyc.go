@@ -52,7 +52,7 @@ func DefaultConfig(orgID string) ContinuousKYCConfig {
 	return ContinuousKYCConfig{
 		OrgID:             orgID,
 		HighRiskThreshold: 0.7,
-		MatchThreshold:    sanctions.MatchThreshold,
+		MatchThreshold:    sanctions.Threshold,
 		BatchSize:         500,
 		Timeout:           5 * time.Second,
 	}
@@ -65,7 +65,7 @@ func ContinuousKYCScreen(
 	cfg ContinuousKYCConfig,
 	source EntitySource,
 	sink AlertSink,
-	entries []types.SanctionsEntry,
+	entries []sanctions.Entry,
 	logger *slog.Logger,
 ) (screened int, matches int, cases int) {
 	entities, err := source.ActiveEntities(ctx, cfg.OrgID)
@@ -141,7 +141,7 @@ func HighRiskRescreen(
 	cfg ContinuousKYCConfig,
 	source EntitySource,
 	sink AlertSink,
-	entries []types.SanctionsEntry,
+	entries []sanctions.Entry,
 	logger *slog.Logger,
 ) (screened int, matches int, cases int) {
 	entities, err := source.HighRiskEntities(ctx, cfg.OrgID, cfg.HighRiskThreshold)
@@ -210,49 +210,29 @@ func HighRiskRescreen(
 	return screened, matches, cases
 }
 
-// screenEntity checks one entity against all sanctions entries.
-func screenEntity(entity types.Entity, entries []types.SanctionsEntry, threshold float64) (bool, ScreenResult) {
-	for _, entry := range entries {
-		// Full name match.
-		score := sanctions.JaroWinkler(entity.Name, entry.Name)
-		if score >= threshold {
-			return true, ScreenResult{
-				EntityID:  entity.ID,
-				Matched:   true,
-				Score:     score,
-				ListID:    entry.ListID,
-				EntryName: entry.Name,
-			}
-		}
-
-		// Token match for partial name coverage.
-		tokenScore := sanctions.TokenMatch(entity.Name, entry.Name)
-		if tokenScore >= threshold {
-			return true, ScreenResult{
-				EntityID:  entity.ID,
-				Matched:   true,
-				Score:     tokenScore,
-				ListID:    entry.ListID,
-				EntryName: entry.Name,
-			}
-		}
-
-		// Also check aliases.
-		for _, alias := range entry.Aliases {
-			aliasScore := sanctions.JaroWinkler(entity.Name, alias)
-			if aliasScore >= threshold {
-				return true, ScreenResult{
-					EntityID:  entity.ID,
-					Matched:   true,
-					Score:     aliasScore,
-					ListID:    entry.ListID,
-					EntryName: alias,
-				}
-			}
-		}
+// screenEntity screens one customer against the loaded lists.
+//
+// It delegates to the one matcher rather than comparing names itself. A second
+// implementation of name matching is a second set of thresholds, a second answer
+// to the same question, and — because this one had no weak-alias handling and no
+// date-of-birth tie-break — a different and worse answer than the endpoint gives
+// for the same customer.
+func screenEntity(entity types.Entity, entries []sanctions.Entry, threshold float64) (bool, ScreenResult) {
+	matches := sanctions.Screen(sanctions.Query{
+		Name:        entity.Name,
+		Nationality: entity.Jurisdiction,
+	}, entries, threshold)
+	if len(matches) == 0 {
+		return false, ScreenResult{EntityID: entity.ID}
 	}
-
-	return false, ScreenResult{EntityID: entity.ID}
+	best := matches[0]
+	return true, ScreenResult{
+		EntityID:  entity.ID,
+		Matched:   true,
+		Score:     best.Score,
+		ListID:    best.Entry.List,
+		EntryName: best.Name.Full,
+	}
 }
 
 // --- In-memory stubs for testing ---

@@ -1,8 +1,10 @@
 package engine
 
 import (
+	"context"
 	"math"
 	"testing"
+	"time"
 
 	"github.com/luxfi/aml/pkg/types"
 )
@@ -34,21 +36,21 @@ func evidence(weight float64, action string) types.RuleHit {
 
 func flagRule() types.Rule {
 	return types.Rule{
-		ID: "r-flag", Name: "flag", DSL: `tx.Notional > 100`,
+		ID: "r-flag", Name: "flag", DSL: `Tx.Notional > 100.0`,
 		Severity: types.SeverityMedium, Weight: 0.3, Action: types.ActionFlag, Enabled: true,
 	}
 }
 
-var tx = types.Transaction{ID: "t1", OrgID: "acme", UserID: "u1", Notional: 500}
+var sample = types.Transaction{ID: "t1", OrgID: "acme", UserID: "u1", Notional: 500}
 
 // A fault in the statistical plane must not take the rule plane with it. Every
 // rule has already been evaluated by the time the Scorer runs, and losing that
 // verdict to a panic would turn a degraded control into no control.
 func TestPanickingScorerDoesNotLoseTheRulesVerdict(t *testing.T) {
-	e := New([]types.Rule{flagRule()})
+	e := withRules(t, flagRule())
 	e.SetScorer(scorer{panic: true})
 
-	alerts, score, action := e.Evaluate(tx, types.Entity{})
+	alerts, score, action := e.Evaluate(context.Background(), sample, types.Entity{})
 	if action != types.ActionFlag {
 		t.Fatalf("action = %q, want the rule's %q", action, types.ActionFlag)
 	}
@@ -68,8 +70,8 @@ func TestPanickingScorerDoesNotLoseTheRulesVerdict(t *testing.T) {
 // negative weights; a computed weight is held to the same rule, and so are the
 // values only a computation can produce.
 func TestScorerCannotWeakenAVerdict(t *testing.T) {
-	base := New([]types.Rule{flagRule()})
-	_, want, wantAction := base.Evaluate(tx, types.Entity{})
+	base := withRules(t, flagRule())
+	_, want, wantAction := base.Evaluate(context.Background(), sample, types.Entity{})
 
 	for name, weight := range map[string]float64{
 		"negative":  -5,
@@ -77,9 +79,9 @@ func TestScorerCannotWeakenAVerdict(t *testing.T) {
 		"+infinity": math.Inf(1),
 		"-infinity": math.Inf(-1),
 	} {
-		e := New([]types.Rule{flagRule()})
+		e := withRules(t, flagRule())
 		e.SetScorer(scorer{hit: evidence(weight, types.ActionReview), ok: true})
-		alerts, got, action := e.Evaluate(tx, types.Entity{})
+		alerts, got, action := e.Evaluate(context.Background(), sample, types.Entity{})
 
 		if got < want {
 			t.Errorf("%s weight lowered the score from %v to %v", name, want, got)
@@ -105,9 +107,9 @@ func TestScorerCannotWeakenAVerdict(t *testing.T) {
 // that is wrong as well as one that is honest.
 func TestScorerActionIsCappedAtTheCeiling(t *testing.T) {
 	for _, asked := range []string{types.ActionBlock, types.ActionReport} {
-		e := New(nil)
+		e := withRules(t)
 		e.SetScorer(scorer{hit: evidence(0.9, asked), ok: true})
-		alerts, _, action := e.Evaluate(tx, types.Entity{})
+		alerts, _, action := e.Evaluate(context.Background(), sample, types.Entity{})
 		if action != types.ActionCeiling {
 			t.Errorf("scorer asked for %q and got %q, ceiling is %q", asked, action, types.ActionCeiling)
 		}
@@ -117,9 +119,9 @@ func TestScorerActionIsCappedAtTheCeiling(t *testing.T) {
 	}
 	// At or below the ceiling it gets what it asked for.
 	for _, asked := range []string{types.ActionFlag, types.ActionReview} {
-		e := New(nil)
+		e := withRules(t)
 		e.SetScorer(scorer{hit: evidence(0.9, asked), ok: true})
-		if _, _, action := e.Evaluate(tx, types.Entity{}); action != asked {
+		if _, _, action := e.Evaluate(context.Background(), sample, types.Entity{}); action != asked {
 			t.Errorf("scorer asked for %q and got %q", asked, action)
 		}
 	}
@@ -129,12 +131,12 @@ func TestScorerActionIsCappedAtTheCeiling(t *testing.T) {
 // point of having it — and may never lower one they did.
 func TestScorerOnlyAdds(t *testing.T) {
 	rules := []types.Rule{flagRule()}
-	plain := New(rules)
-	_, want, wantAction := plain.Evaluate(tx, types.Entity{})
+	plain := withRules(t, rules...)
+	_, want, wantAction := plain.Evaluate(context.Background(), sample, types.Entity{})
 
-	e := New(rules)
+	e := withRules(t, rules...)
 	e.SetScorer(scorer{hit: evidence(0.2, types.ActionReview), ok: true})
-	alerts, got, action := e.Evaluate(tx, types.Entity{})
+	alerts, got, action := e.Evaluate(context.Background(), sample, types.Entity{})
 	if got <= want {
 		t.Fatalf("evidence did not add: %v -> %v", want, got)
 	}
@@ -146,9 +148,9 @@ func TestScorerOnlyAdds(t *testing.T) {
 	}
 
 	// With no rules at all the model can still raise a transaction.
-	only := New(nil)
+	only := withRules(t)
 	only.SetScorer(scorer{hit: evidence(0.2, types.ActionReview), ok: true})
-	if _, score, action := only.Evaluate(tx, types.Entity{}); score <= 0 || action != types.ActionReview {
+	if _, score, action := only.Evaluate(context.Background(), sample, types.Entity{}); score <= 0 || action != types.ActionReview {
 		t.Fatalf("model alone produced score %v action %q", score, action)
 	}
 }
@@ -156,9 +158,9 @@ func TestScorerOnlyAdds(t *testing.T) {
 // Declining to score contributes nothing at all — not an alert with no weight,
 // which downstream would read as a verdict of normal.
 func TestScorerDecliningContributesNothing(t *testing.T) {
-	e := New(nil)
+	e := withRules(t)
 	e.SetScorer(scorer{hit: evidence(0.9, types.ActionReview), ok: false})
-	alerts, score, action := e.Evaluate(tx, types.Entity{})
+	alerts, score, action := e.Evaluate(context.Background(), sample, types.Entity{})
 	if len(alerts) != 0 || score != 0 || action != types.ActionAllow {
 		t.Fatalf("a declining scorer produced %d alerts, score %v, action %q", len(alerts), score, action)
 	}
@@ -178,10 +180,10 @@ func TestCausesReachTheAlert(t *testing.T) {
 		Unit:     "share of transactions falling just below the reporting threshold",
 		Observed: 11, Baseline: 11, Without: 0.31, Share: 0.62,
 	}}
-	e := New(nil)
+	e := withRules(t)
 	e.SetScorer(scorer{hit: hit, ok: true})
 
-	alerts, _, _ := e.Evaluate(tx, types.Entity{})
+	alerts, _, _ := e.Evaluate(context.Background(), sample, types.Entity{})
 	if len(alerts) != 1 {
 		t.Fatalf("%d alerts", len(alerts))
 	}
@@ -193,8 +195,8 @@ func TestCausesReachTheAlert(t *testing.T) {
 		t.Fatalf("attribution arrived incomplete: %+v", got[0])
 	}
 	// A rule alert explains itself and must not acquire causes it never had.
-	rules := New([]types.Rule{flagRule()})
-	ruleAlerts, _, _ := rules.Evaluate(tx, types.Entity{})
+	rules := withRules(t, flagRule())
+	ruleAlerts, _, _ := rules.Evaluate(context.Background(), sample, types.Entity{})
 	if len(ruleAlerts[0].Causes) != 0 {
 		t.Fatal("a rule alert carries model attribution")
 	}
@@ -222,16 +224,28 @@ func TestScoreClampHandlesNotANumber(t *testing.T) {
 // No Scorer at all must leave the engine exactly as it was.
 func TestNoScorerChangesNothing(t *testing.T) {
 	rules := []types.Rule{flagRule()}
-	a := New(rules)
-	wantAlerts, want, wantAction := a.Evaluate(tx, types.Entity{})
+	a := withRules(t, rules...)
+	wantAlerts, want, wantAction := a.Evaluate(context.Background(), sample, types.Entity{})
 
-	b := New(rules)
+	b := withRules(t, rules...)
 	b.SetScorer(nil)
-	gotAlerts, got, gotAction := b.Evaluate(tx, types.Entity{})
+	gotAlerts, got, gotAction := b.Evaluate(context.Background(), sample, types.Entity{})
 	if got != want || gotAction != wantAction || len(gotAlerts) != len(wantAlerts) {
 		t.Fatalf("installing a nil scorer changed the verdict: %v/%q vs %v/%q", got, gotAction, want, wantAction)
 	}
 	if b.ScorerFaults() != 0 {
 		t.Fatal("a nil scorer produced faults")
 	}
+}
+
+// withRules builds an engine over providers a scorer test does not need, and
+// installs the rules through SetRules so the test goes through the same admission
+// the daemon does.
+func withRules(t *testing.T, rules ...types.Rule) *Engine {
+	t.Helper()
+	e := New(Providers{Zone: time.UTC})
+	if err := e.SetRules(rules); err != nil {
+		t.Fatalf("SetRules: %v", err)
+	}
+	return e
 }

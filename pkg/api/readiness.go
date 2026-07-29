@@ -11,6 +11,10 @@ import (
 	"github.com/hanzoai/base/core"
 )
 
+// screenStale mirrors the daemon's list-staleness budget. The lists refresh daily,
+// so two days means two consecutive failures have gone unnoticed.
+const screenStale = 48 * time.Hour
+
 // screeningSources answers, per list, whether this instance is fit to screen
 // against it and when it last loaded.
 //
@@ -27,13 +31,14 @@ func (h *Handler) screeningSources() func(e *core.RequestEvent) error {
 		if _, err := h.tenant(e); err != nil {
 			return refuse(e, err)
 		}
-		if h.Screening == nil {
+		if h.Readiness == nil {
 			return fail(e, http.StatusServiceUnavailable, "screening readiness is not wired")
 		}
 
 		now := time.Now().UTC()
-		sources := h.Screening.Sources()
-		ready, stale := h.Screening.Ready(now)
+		lists := h.Readiness.Lists()
+		unfit := h.Readiness.Unfit(now, screenStale)
+		ready := len(unfit) == 0
 
 		type source struct {
 			Source      string  `json:"source"`
@@ -46,14 +51,14 @@ func (h *Handler) screeningSources() func(e *core.RequestEvent) error {
 			AttemptedAt *string `json:"attempted_at"`
 		}
 
-		out := make([]source, 0, len(sources))
+		out := make([]source, 0, len(lists))
 		total := 0
-		for _, s := range sources {
+		for _, s := range lists {
 			row := source{
-				Source:  s.Name,
-				Entries: s.Entries,
-				Fresh:   s.Fresh(now),
-				SHA256:  s.SHA256,
+				Source:  s.Source,
+				Entries: s.Designations,
+				Fresh:   s.Fit(now, screenStale),
+				SHA256:  s.Digest,
 				Error:   s.Err,
 			}
 			if !s.LoadedAt.IsZero() {
@@ -65,7 +70,7 @@ func (h *Handler) screeningSources() func(e *core.RequestEvent) error {
 				t := s.AttemptedAt.Format(time.RFC3339)
 				row.AttemptedAt = &t
 			}
-			total += s.Entries
+			total += s.Designations
 			out = append(out, row)
 		}
 
@@ -75,7 +80,7 @@ func (h *Handler) screeningSources() func(e *core.RequestEvent) error {
 		}
 		return e.JSON(code, map[string]any{
 			"ready":         ready,
-			"unfit":         stale,
+			"unfit":         unfit,
 			"total_entries": total,
 			"sources":       out,
 		})

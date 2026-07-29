@@ -35,6 +35,7 @@
 package replay
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"strings"
@@ -62,7 +63,7 @@ const listed = 1000
 // it, which is the whole point: the candidate is scored by the code that scores
 // production.
 type Evaluator interface {
-	EvalAll(rules []types.Rule, ctx types.EvalContext) []types.RuleHit
+	EvalAll(ctx context.Context, rules []types.Rule, tx types.Transaction, ent types.Entity) []types.RuleHit
 }
 
 // Disposition is what a human concluded about an event that alerted. It is what
@@ -173,7 +174,7 @@ type Report struct {
 // Both rules are evaluated as activated whatever their enabled flag says: the
 // question is what happens on activation, and the flag governs the live path
 // rather than the question. Nothing is written anywhere.
-func Run(e Evaluator, h History, candidate types.Rule, incumbent *types.Rule) (Report, error) {
+func Run(ctx context.Context, e Evaluator, h History, candidate types.Rule, incumbent *types.Rule) (Report, error) {
 	if e == nil {
 		return Report{}, ErrNoEvaluator
 	}
@@ -202,7 +203,7 @@ func Run(e Evaluator, h History, candidate types.Rule, incumbent *types.Rule) (R
 		report.Events++
 		observe(&report, ev)
 
-		hit, err := fires(e, cand, ev)
+		hit, err := fires(ctx, e, cand, ev)
 		if err != nil {
 			return err
 		}
@@ -213,7 +214,7 @@ func Run(e Evaluator, h History, candidate types.Rule, incumbent *types.Rule) (R
 			return nil
 		}
 
-		was, err := fires(e, *prev, ev)
+		was, err := fires(ctx, e, *prev, ev)
 		if err != nil {
 			return err
 		}
@@ -249,8 +250,8 @@ func Run(e Evaluator, h History, candidate types.Rule, incumbent *types.Rule) (R
 
 // fires reports whether a rule would alert on an event, through the engine's own
 // evaluation. An evaluation error is the caller's answer, not a zero.
-func fires(e Evaluator, r types.Rule, ev Event) (bool, error) {
-	hits := e.EvalAll([]types.Rule{r}, types.EvalContext{Tx: ev.Tx, Entity: ev.Entity})
+func fires(ctx context.Context, e Evaluator, r types.Rule, ev Event) (bool, error) {
+	hits := e.EvalAll(ctx, []types.Rule{r}, ev.Tx, ev.Entity)
 	for _, h := range hits {
 		if h.EvalErr != "" {
 			return false, fmt.Errorf("%w: %s on transaction %s: %s", ErrEval, name(r), ev.Tx.ID, h.EvalErr)

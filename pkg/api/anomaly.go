@@ -8,7 +8,6 @@ import (
 	"github.com/hanzoai/base/core"
 
 	"github.com/luxfi/aml/pkg/anomaly"
-	"github.com/luxfi/aml/pkg/engine"
 	"github.com/luxfi/aml/pkg/types"
 )
 
@@ -85,7 +84,14 @@ func (h *Handler) anomalyTest() func(e *core.RequestEvent) error {
 		// out of the answer one probe at a time.
 		tx := in.Tx
 		tx.OrgID = orgID
-		tx.USD = engine.USD(tx.Notional, tx.Currency)
+		if h.Rate == nil {
+			return fail(e, http.StatusServiceUnavailable, "no conversion is configured, so no threshold can be applied")
+		}
+		usd, err := h.Rate.USD(e.Request.Context(), tx.Notional, tx.Currency)
+		if err != nil {
+			return fail(e, http.StatusBadRequest, "currency cannot be converted, so no threshold can be applied to it")
+		}
+		tx.USD = usd
 		if tx.Timestamp.IsZero() {
 			tx.Timestamp = time.Now().UTC()
 		}
