@@ -61,15 +61,12 @@ func (s *scope) subject(kind string) (history.Subject, error) {
 		id = s.Tx.DeviceFingerprint
 	case history.SubjectAddress:
 		id = s.Tx.IPAddress
-	default:
-		return history.Subject{}, fmt.Errorf("unknown subject %q: want one of %s, %s, %s, %s, %s",
-			kind, history.SubjectUser, history.SubjectAccount, history.SubjectCounterparty,
-			history.SubjectDevice, history.SubjectAddress)
 	}
-	if id == "" {
-		return history.Subject{}, fmt.Errorf("subject %q is empty on transaction %s", kind, s.Tx.ID)
+	subj := history.Subject{OrgID: s.Tx.OrgID, Kind: kind, ID: id}
+	if err := subj.Valid(); err != nil {
+		return history.Subject{}, fmt.Errorf("%w (transaction %s)", err, s.Tx.ID)
 	}
-	return history.Subject{OrgID: s.Tx.OrgID, Kind: kind, ID: id}, nil
+	return subj, nil
 }
 
 // window fetches and memoises the subject's events over the lookback.

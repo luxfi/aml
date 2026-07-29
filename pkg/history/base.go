@@ -60,16 +60,10 @@ func NewBase(app core.App) *Base { return &Base{app: app} }
 // aggregating a reporting period by insertion time attributes activity to the day
 // the importer ran.
 func (b *Base) Window(ctx context.Context, subj Subject, lookback time.Duration) ([]Event, error) {
-	field, ok := subjectField[subj.Kind]
-	if !ok {
-		return nil, fmt.Errorf("history: unknown subject kind %q", subj.Kind)
+	if err := subj.Valid(); err != nil {
+		return nil, err
 	}
-	if subj.OrgID == "" {
-		return nil, fmt.Errorf("history: subject has no organisation, which would query across tenants")
-	}
-	if subj.ID == "" {
-		return nil, fmt.Errorf("history: subject %q has no identifier", subj.Kind)
-	}
+	field := subjectField[subj.Kind]
 
 	since := time.Now().UTC().Add(-lookback)
 	filter := fmt.Sprintf("%s = {:org} && %s = {:id} && %s >= {:since}", fieldOrg, field, fieldAt)

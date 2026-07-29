@@ -37,13 +37,10 @@ func (m *Memory) Append(orgID string, e Event) {
 
 // Window returns the subject's events over the lookback, most recent first.
 func (m *Memory) Window(_ context.Context, subj Subject, lookback time.Duration) ([]Event, error) {
-	field, ok := identify(subj.Kind)
-	if !ok {
-		return nil, unknownKind(subj.Kind)
+	if err := subj.Valid(); err != nil {
+		return nil, err
 	}
-	if subj.OrgID == "" || subj.ID == "" {
-		return nil, incomplete(subj)
-	}
+	field, _ := identify(subj.Kind)
 
 	since := m.reference().Add(-lookback)
 

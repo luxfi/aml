@@ -73,10 +73,6 @@ func (e *Evaluator) Admit(r types.Rule) (*vm.Program, error) {
 		return prog, nil
 	}
 
-	if strings.TrimSpace(r.DSL) == "" {
-		return nil, fmt.Errorf("rule %q: expression is empty", r.ID)
-	}
-
 	tree, err := parser.Parse(r.DSL)
 	if err != nil {
 		return nil, fmt.Errorf("rule %q: %w", r.ID, err)

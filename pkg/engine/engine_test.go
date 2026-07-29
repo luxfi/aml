@@ -467,3 +467,113 @@ func (c *counting) Window(ctx context.Context, s history.Subject, d time.Duratio
 	c.calls++
 	return c.Store.Window(ctx, s, d)
 }
+
+func TestFailingRuleIsEscalatedNotDowngraded(t *testing.T) {
+	// A rule that reached no verdict must go to review whatever it would otherwise
+	// have done. A failing flag-only rule must escalate, because nobody looks at a
+	// flag; and a failing block rule must not block, because an evidence outage
+	// would then decline every payment.
+	for _, configured := range []string{types.ActionFlag, types.ActionBlock, types.ActionReport, types.ActionAllow} {
+		e := New(Providers{
+			History: failing{},
+			Rate:    reference.Rates{AsOf: ref},
+			Now:     func() time.Time { return ref },
+		})
+		r := rule("velocity", `Sum("user", "24h") > 1000.0`)
+		r.Action = configured
+		if err := e.SetRules([]types.Rule{r}); err != nil {
+			t.Fatal(err)
+		}
+		alerts, _, action := e.Evaluate(context.Background(), tx(500), types.Entity{ID: "u1"})
+		if len(alerts) != 1 {
+			t.Fatalf("%s: want one alert, got %d", configured, len(alerts))
+		}
+		if alerts[0].ActionTaken != types.ActionReview {
+			t.Errorf("a rule configured to %s that failed must record review, got %q", configured, alerts[0].ActionTaken)
+		}
+		if action != types.ActionReview {
+			t.Errorf("a rule configured to %s that failed must resolve to review, got %q", configured, action)
+		}
+	}
+}
+
+func TestUnknownScreeningClassIsRejected(t *testing.T) {
+	e := New(providers(history.NewMemory(func() time.Time { return ref })))
+	if err := e.SetRules([]types.Rule{rule("r", `Screened(Entity.Name, "watchlist")`)}); err != nil {
+		t.Fatal(err)
+	}
+	alerts, _, action := e.Evaluate(context.Background(), tx(100), types.Entity{ID: "u1", Name: "Ivan Petrov"})
+	if len(alerts) != 1 || alerts[0].EvalErr == "" || action != types.ActionReview {
+		t.Fatalf("an unrecognised screening class must be recorded as a failure, got %d alerts action %q", len(alerts), action)
+	}
+}
+
+func TestMalformedWindowUnitsRejected(t *testing.T) {
+	for _, w := range []string{"xh", "7", "24x", "-3d", "0d", "", "h"} {
+		e := New(providers(history.NewMemory(func() time.Time { return ref })))
+		if err := e.SetRules([]types.Rule{rule("r", `Count("user", "`+w+`") > 0`)}); err != nil {
+			t.Fatalf("%q: %v", w, err)
+		}
+		alerts, _, action := e.Evaluate(context.Background(), tx(100), types.Entity{ID: "u1"})
+		if len(alerts) != 1 || alerts[0].EvalErr == "" || action != types.ActionReview {
+			t.Errorf("window %q must be rejected at evaluation, got %d alerts action %q", w, len(alerts), action)
+		}
+	}
+}
+
+func TestUnloadedJurisdictionListingFailsLoudly(t *testing.T) {
+	// The whole point of the reference provider. An empty listing answering
+	// "not listed" for every country reads as a world with no high-risk
+	// jurisdictions in it, and no operator would ever notice.
+	e := New(Providers{
+		History:   history.NewMemory(func() time.Time { return ref }),
+		Reference: reference.Jurisdictions{},
+		Rate:      reference.Rates{AsOf: ref},
+		Now:       func() time.Time { return ref },
+	})
+	if err := e.SetRules([]types.Rule{rule("r", `Tier(Entity.Jurisdiction) == "action"`)}); err != nil {
+		t.Fatal(err)
+	}
+	alerts, _, action := e.Evaluate(context.Background(), tx(100), types.Entity{ID: "u1", Jurisdiction: "KP"})
+	if len(alerts) != 1 || alerts[0].EvalErr == "" || action != types.ActionReview {
+		t.Fatalf("an unloaded jurisdiction listing must fail loudly, got %d alerts action %q", len(alerts), action)
+	}
+
+	// A listing with entries but no date is equally unusable: its currency cannot
+	// be assessed, and a listing from two years ago is not the current one.
+	e2 := New(Providers{
+		History:   history.NewMemory(func() time.Time { return ref }),
+		Reference: reference.Jurisdictions{Action: []string{"KP"}},
+		Rate:      reference.Rates{AsOf: ref},
+		Now:       func() time.Time { return ref },
+	})
+	if err := e2.SetRules([]types.Rule{rule("r", `Tier(Entity.Jurisdiction) == "action"`)}); err != nil {
+		t.Fatal(err)
+	}
+	alerts, _, _ = e2.Evaluate(context.Background(), tx(100), types.Entity{ID: "u1", Jurisdiction: "KP"})
+	if len(alerts) != 1 || alerts[0].EvalErr == "" {
+		t.Fatal("an undated jurisdiction listing must fail loudly")
+	}
+}
+
+func TestSubjectValidationIsSharedByStoreAndScope(t *testing.T) {
+	// The scope builds Subjects and the stores consume them; both defer to the same
+	// validation, so there is one definition of what naming nobody means.
+	store := history.NewMemory(func() time.Time { return ref })
+	for _, s := range []history.Subject{
+		{OrgID: "org", Kind: "customer", ID: "u1"},
+		{OrgID: "", Kind: history.SubjectUser, ID: "u1"},
+		{OrgID: "org", Kind: history.SubjectUser, ID: ""},
+	} {
+		if _, err := store.Window(context.Background(), s, time.Hour); err == nil {
+			t.Errorf("subject %+v must be rejected by the store", s)
+		}
+		if err := s.Valid(); err == nil {
+			t.Errorf("subject %+v must be reported invalid", s)
+		}
+	}
+	ok := history.Subject{OrgID: "org", Kind: history.SubjectUser, ID: "u1"}
+	if err := ok.Valid(); err != nil {
+		t.Errorf("a complete subject must be valid: %v", err)
+	}
+}
