@@ -103,10 +103,14 @@ func TestPseudonymDomainSeparated(t *testing.T) {
 		if !strings.HasPrefix(p, string(d)+":") {
 			t.Errorf("%s token %q does not name its domain", d, p)
 		}
-		if prev, dup := seen[p]; dup {
-			t.Errorf("domains %s and %s collide on %q", prev, d, p)
+		// Compare the mac and not the whole token. The domain prefix is a label:
+		// it would make two tokens look different even if one key had minted both,
+		// so testing the token would test the label and not the key schedule.
+		mac := strings.TrimPrefix(p, string(d)+":")
+		if prev, dup := seen[mac]; dup {
+			t.Errorf("domains %s and %s share a key: both mint %q", prev, d, mac)
 		}
-		seen[p] = d
+		seen[mac] = d
 	}
 }
 

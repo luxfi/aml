@@ -51,8 +51,14 @@ type Feature struct {
 // about — how unusual a given deviation is among the institution's customers —
 // so intra-customer deviation and peer-group comparison come out of one
 // mechanism rather than two.
-func Inventory() [Dims]Feature {
-	return [Dims]Feature{{
+func Inventory() [Dims]Feature { return inventory }
+
+// inventory is the one copy. Inventory returns it by value so a caller cannot
+// reach in and change what the model reads; this package reads the variable
+// directly, because returning an array of nine descriptors by value on a path that
+// runs per transaction copies about a kilobyte for nothing.
+var inventory = [Dims]Feature{
+	{
 		Name:      "amount",
 		Window:    "30d",
 		Typology:  "unusually large transaction",
@@ -133,7 +139,7 @@ func Inventory() [Dims]Feature {
 		Severity:  types.SeverityLow,
 		Unit:      "prior transactions by this account in the window",
 		Neutral:   0,
-	}}
+	},
 }
 
 // Aggregation axes. A deviation is meaningless without saying whose: the axis is
@@ -204,7 +210,7 @@ type Point struct {
 // assumption.
 func project(usd float64, acct, pair, device []velocity.Observation) Point {
 	var p Point
-	inv := Inventory()
+	inv := inventory
 
 	day := pick(acct, "24h")
 	hour := pick(acct, "1h")
