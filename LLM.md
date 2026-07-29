@@ -61,7 +61,16 @@ pkg/
   engine/
     engine.go              -- Core engine: evaluate tx -> alerts + score + action
     evaluator.go           -- expr-lang compiler + evaluator with helper functions
-    scoring.go             -- Weight-of-evidence scoring + ScorerPlugin interface
+    scoring.go             -- Weight-of-evidence scoring + the Scorer seam
+  velocity/velocity.go     -- Constant-time sliding aggregates per (key, window):
+                              bucketed ring, fixed memory per key, Deviation
+  anomaly/
+    forest.go              -- Half-space trees: data-independent geometry, mass
+                              counters, exponential reference fold, mass invariant
+    feature.go             -- The typology->feature inventory (9 dimensions, each
+                              citing the instrument behind it) + projection
+    anomaly.go             -- Per-tenant model, Appetite, attribution by
+                              counterfactual, State, Snapshot/Restore
   rules/library.go         -- 20 starter AML rules (CTR, structuring, velocity, sanctions, etc.)
   sanctions/
     match.go               -- Jaro-Winkler + token-based fuzzy name matching
@@ -82,7 +91,67 @@ pkg/
   webhook/webhook.go       -- Signed delivery (HMAC-SHA256) with retry + dead-letter
   api/routes.go            -- /v1/aml/* HTTP routes + SanctionsStore on Base
   api/records.go           -- The one place retention, token and replay are joined
+  api/anomaly.go           -- Model state for governance + candidate scoring
 ```
+
+## Behavioural detection
+
+Rules catch typologies someone has already named. `anomaly` answers the other
+question — is this where this customer's behaviour normally lives — which is the
+statutory test, since consistency is assessed against knowledge of *this*
+customer and no fixed threshold can express that.
+
+**Detector: half-space trees** (Tan, Ting & Liu, IJCAI 2011). Trees are built
+before any data arrives — a random dimension split at the midpoint of the node's
+range — so there is no training pass, no sample retained, and no retraining job:
+the model is a set of mass counters over a fixed geometry. Scoring walks a fixed
+depth. Rejected: isolation forest (batch, so a retraining job per tenant, and
+attribution needs a bolt-on), and robust random cut forest (stores the points, and
+its attribution is to *other points* rather than to features — the wrong shape for
+the question a supervisor asks).
+
+Two deliberate departures from the paper, both recorded at the code:
+
+1. **Votes are averaged, not summed.** `mass * 2^depth` is heavy-tailed, so one
+   tree finding the point in a dense region returns a value many times the uniform
+   one and swamps every tree that found emptiness. Ranking survives that; a
+   calibrated score does not, and an appetite expressed as a quantile needs a
+   calibrated score. Each tree is clamped to [0,1] against its own root mass
+   before averaging, which also makes the score self-calibrating during warm-up.
+2. **The reference folds exponentially** (`Blend`, default 0.25) rather than being
+   replaced. `Blend: 1` is the published algorithm. Below 1, making the reference
+   look like your own behaviour needs sustained volume against the whole tenant
+   rather than one window's worth.
+
+**Why attributability decided it.** HIP-518 §6 admits ML detection only behind a
+typology→feature mapping, a stated miss-rate appetite, and per-alert feature
+attribution. The third eliminates a neural scorer: its contribution to a score is
+not attributable to an input, so it needs a second model fitted to guess at its
+own reasons. A tree is interrogated directly — move one coordinate to its neutral
+value, rescore, and the drop *is* that feature's contribution, exactly, on the
+model that raised the alert. `Cause.Without` carries that counterfactual.
+
+**The appetite is the governed knob.** `Appetite.Review` is the share of the
+stream the model may send for examination; the threshold is the quantile of
+observed scores that admits it, recomputed each window, taking the upper bucket
+edge so the realised share stays at or below the stated one. The miss rate cannot
+be computed without labels, so `Appetite.Sample` retains a share of *non*-alerted
+transactions for review below the line — selected by hash of the transaction id,
+so the sample is reproducible and cannot be steered. `GET /v1/aml/anomaly` reports
+stated against realised.
+
+**What it cannot do.** Evidence is capped at `types.ActionCeiling` (review): the
+model summons a person, it does not act. Weight is non-negative and NaN/Inf are
+rejected, so it can only add to a score the rules built, never subtract. A panic
+in the Scorer is contained and counted — the rule plane's verdict stands. Where it
+cannot score (warming, unusable coordinates, no subject) the transaction is
+evaluated on rules alone and the refusal is counted per reason, because silence
+must never read as a clean result.
+
+Models are per tenant, including the tree geometry, seeded from
+`mix(cfg.Seed, orgID)`. 336 KB per tenant measured, bounded by `MaxOrgs`
+(default 256 → 84 MB). `AML_ANOMALY=live` leaves shadow; until then the model
+scores, learns and reports what it *would* have alerted on, changing nothing.
 
 ## API Endpoints
 
@@ -94,6 +163,8 @@ pkg/
 | POST | /v1/aml/cases/{id}/events | Add case event (note, status change) |
 | GET | /v1/aml/rules | List all rules |
 | POST | /v1/aml/rules/test | Replay a candidate rule over history (dry run) |
+| GET | /v1/aml/anomaly | Model state: appetite, inventory, threshold, stated vs realised rate, refusals, blind features, below-the-line sample |
+| POST | /v1/aml/anomaly/test | Score a candidate against the tenant's model, learning nothing |
 | POST | /v1/aml/cases/{id}/resolve | Close a case against a retained assessment |
 | POST | /v1/aml/relationships | Open a business relationship |
 | POST | /v1/aml/relationships/{id}/close | End one, starting the retention clocks |
@@ -229,7 +300,6 @@ Webhook events: `aml.flagged`, `aml.cleared`, `kyc.approved`, `trade.executed`.
 
 ## Deferred
 
-- ML scoring via Hanzo Zen gateway (ScorerPlugin interface ready)
 - Hanzo Tasks durable workflows (sanctions-refresh, case-automation, backtest)
 - Base realtime subscription for live transaction monitoring
 - Full OFAC/UN/EU/HMT list refresh automation

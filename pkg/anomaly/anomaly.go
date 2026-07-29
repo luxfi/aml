@@ -153,7 +153,7 @@ type Config struct {
 	Action   string   `json:"action"`
 	Shadow   bool     `json:"shadow"`
 	// MaxOrgs bounds how many tenants' models are held at once. Each costs
-	// Trees * (2^(Depth+1)-1) * 25 bytes — about 320 KB at the defaults — and
+	// Trees * (2^(Depth+1)-1) nodes — a measured 336 KB at the defaults — and
 	// models are created on a tenant's first transaction, so idle tenants cost
 	// nothing. On overflow the least recently used is dropped, which returns
 	// that tenant to warming: the model then declines to score rather than
