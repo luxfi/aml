@@ -200,4 +200,27 @@ func TestAMomentComparesAsAMoment(t *testing.T) {
 		}
 		t.Fatalf("the window matched %v, want [recent]", labels)
 	}
+
+	// The moment a stored record already carries is the one a walk pages by, so it
+	// is the comparison that has to be exact rather than approximately right. A
+	// layout that differs only after the seconds compares as greater than the value
+	// it means, and the record that the cursor just passed comes back again.
+	last, err := thing.Find(built, "acme", "", "-at", 1, nil)
+	if err != nil {
+		t.Fatalf("Find: %v", err)
+	}
+	if len(last) != 1 || last[0].GetString("label") != "later" {
+		t.Fatalf("the newest record is %v, want later", last)
+	}
+	at := last[0].GetDateTime("at").Time()
+	if past, err := thing.Find(built, "acme", "at > {:at}", "at", 0, dbx.Params{"at": at}); err != nil {
+		t.Fatalf("Find: %v", err)
+	} else if len(past) != 0 {
+		t.Errorf("%d records are after the newest one", len(past))
+	}
+	if including, err := thing.Find(built, "acme", "at >= {:at}", "at", 0, dbx.Params{"at": at}); err != nil {
+		t.Fatalf("Find: %v", err)
+	} else if len(including) != 1 {
+		t.Errorf("the newest record is not at its own moment: %d records", len(including))
+	}
 }
