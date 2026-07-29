@@ -12,10 +12,10 @@ import (
 	"time"
 )
 
-// memory is an in-process store. It exists so the obligations can be exercised at
+// memory is an in-process shelf. It exists so the obligations can be exercised at
 // the level a reviewer cares about — retain this, close that, does the clock
-// cascade — without a database, and it applies exactly the rules the durable store
-// applies, because a test against a store with weaker rules than production proves
+// cascade — without a database, and it applies exactly the rules the durable shelf
+// applies, because a test against a shelf with weaker rules than production proves
 // nothing about production.
 //
 // It does not survive a restart, which is why it is not what an instance serves
@@ -26,14 +26,14 @@ type memory struct {
 	// re-entrant lock, and the alternative — a second set of methods that do not
 	// lock — is two ways to do one thing.
 	mu *sync.Mutex
-	// shelf is named rather than embedded because the store answers questions
-	// called inside and party, and so do two of the indexes.
-	shelf *shelf
+	// held is named rather than embedded because the shelf answers questions called
+	// inside and party, and so do two of the indexes.
+	held *held
 }
 
-// shelf is the state a memory store keeps, held by pointer so that the store
-// handed to a transaction is the same records under a lock already taken.
-type shelf struct {
+// held is what a memory shelf holds, by pointer so that the shelf handed to a
+// transaction is the same records under a lock already taken.
+type held struct {
 	records map[string]*Record
 	// party maps org and party to the records naming that party, which is what
 	// makes the Art. 78 lookback an index read rather than a scan.
@@ -49,7 +49,7 @@ type shelf struct {
 func newMemory() *memory {
 	return &memory{
 		mu: new(sync.Mutex),
-		shelf: &shelf{
+		held: &held{
 			records:  make(map[string]*Record),
 			party:    make(map[string][]string),
 			inside:   make(map[string][]string),
@@ -70,13 +70,13 @@ func (m *memory) unlock() {
 	}
 }
 
-// tx runs fn with the lock held, against a store that shares these records. There
+// tx runs fn with the lock held, against a shelf that shares these records. There
 // is nothing to roll back: the ledger reports a failed sequence as failed and the
-// next run repeats it, which is the same contract the durable store keeps.
-func (m *memory) tx(fn func(store) error) error {
+// next run repeats it, which is the same contract the durable shelf keeps.
+func (m *memory) tx(fn func(shelf) error) error {
 	m.lock()
 	defer m.unlock()
-	return fn(&memory{shelf: m.shelf})
+	return fn(&memory{held: m.held})
 }
 
 func key(org, value string) string { return org + "\x00" + value }
@@ -88,7 +88,7 @@ func (m *memory) read(org, id string) (Record, error) {
 }
 
 func (m *memory) get(org, id string) (Record, error) {
-	r, ok := m.shelf.records[id]
+	r, ok := m.held.records[id]
 	if !ok || r.Org != org {
 		return Record{}, fmt.Errorf("%w: %s", ErrNotFound, id)
 	}
@@ -98,7 +98,7 @@ func (m *memory) get(org, id string) (Record, error) {
 func (m *memory) retained(org, identity string) (Record, error) {
 	m.lock()
 	defer m.unlock()
-	id, ok := m.shelf.identity[key(org, identity)]
+	id, ok := m.held.identity[key(org, identity)]
 	if !ok {
 		return Record{}, fmt.Errorf("%w: identity %s", ErrNotFound, identity)
 	}
@@ -108,19 +108,19 @@ func (m *memory) retained(org, identity string) (Record, error) {
 func (m *memory) insert(r Record) error {
 	m.lock()
 	defer m.unlock()
-	if _, taken := m.shelf.identity[key(r.Org, r.identity)]; taken {
+	if _, taken := m.held.identity[key(r.Org, r.identity)]; taken {
 		return fmt.Errorf("%w: %s", ErrConflict, r.identity)
 	}
 	stored := r.clone()
-	m.shelf.records[r.ID] = &stored
-	m.shelf.identity[key(r.Org, r.identity)] = r.ID
+	m.held.records[r.ID] = &stored
+	m.held.identity[key(r.Org, r.identity)] = r.ID
 	for _, p := range r.Parties {
 		k := key(r.Org, p)
-		m.shelf.party[k] = append(m.shelf.party[k], r.ID)
+		m.held.party[k] = append(m.held.party[k], r.ID)
 	}
 	if r.Relationship != "" {
 		k := key(r.Org, r.Relationship)
-		m.shelf.inside[k] = append(m.shelf.inside[k], r.ID)
+		m.held.inside[k] = append(m.held.inside[k], r.ID)
 	}
 	return nil
 }
@@ -128,12 +128,12 @@ func (m *memory) insert(r Record) error {
 func (m *memory) update(r Record) error {
 	m.lock()
 	defer m.unlock()
-	stored, ok := m.shelf.records[r.ID]
+	stored, ok := m.held.records[r.ID]
 	if !ok || stored.Org != r.Org {
 		return fmt.Errorf("%w: %s", ErrNotFound, r.ID)
 	}
 	kept := r.clone()
-	m.shelf.records[r.ID] = &kept
+	m.held.records[r.ID] = &kept
 	return nil
 }
 
@@ -141,27 +141,27 @@ func (m *memory) erase(rs []Record) error {
 	m.lock()
 	defer m.unlock()
 	for _, r := range rs {
-		delete(m.shelf.records, r.ID)
-		delete(m.shelf.identity, key(r.Org, r.identity))
+		delete(m.held.records, r.ID)
+		delete(m.held.identity, key(r.Org, r.identity))
 		for _, p := range r.Parties {
 			k := key(r.Org, p)
-			if rest := drop(m.shelf.party[k], r.ID); len(rest) == 0 {
-				delete(m.shelf.party, k)
+			if rest := drop(m.held.party[k], r.ID); len(rest) == 0 {
+				delete(m.held.party, k)
 			} else {
-				m.shelf.party[k] = rest
+				m.held.party[k] = rest
 			}
 		}
 		if r.Relationship != "" {
 			k := key(r.Org, r.Relationship)
-			if rest := drop(m.shelf.inside[k], r.ID); len(rest) == 0 {
-				delete(m.shelf.inside, k)
+			if rest := drop(m.held.inside[k], r.ID); len(rest) == 0 {
+				delete(m.held.inside, k)
 			} else {
-				m.shelf.inside[k] = rest
+				m.held.inside[k] = rest
 			}
 		}
 		// A destroyed relationship stops indexing what was retained inside it.
 		// Anything of its own that outlives it did so by extension, on purpose.
-		delete(m.shelf.inside, key(r.Org, r.ID))
+		delete(m.held.inside, key(r.Org, r.ID))
 	}
 	return nil
 }
@@ -169,13 +169,13 @@ func (m *memory) erase(rs []Record) error {
 func (m *memory) inside(org, relationship string) ([]Record, error) {
 	m.lock()
 	defer m.unlock()
-	return m.collect(org, m.shelf.inside[key(org, relationship)])
+	return m.collect(org, m.held.inside[key(org, relationship)])
 }
 
 func (m *memory) party(org, party string) ([]Record, error) {
 	m.lock()
 	defer m.unlock()
-	return m.collect(org, m.shelf.party[key(org, party)])
+	return m.collect(org, m.held.party[key(org, party)])
 }
 
 func (m *memory) collect(org string, ids []string) ([]Record, error) {
@@ -204,8 +204,8 @@ func (m *memory) each(org string, c Class, visit func(Record) error) error {
 	}
 
 	m.lock()
-	order := make([]place, 0, len(m.shelf.records))
-	for id, r := range m.shelf.records {
+	order := make([]place, 0, len(m.held.records))
+	for id, r := range m.held.records {
 		if r.Org != org || (c != "" && r.Class != c) {
 			continue
 		}
@@ -241,7 +241,7 @@ func (m *memory) expired(now time.Time, limit int) ([]Record, error) {
 	defer m.unlock()
 
 	var doomed []Record
-	for _, r := range m.shelf.records {
+	for _, r := range m.held.records {
 		if r.Expired(now) {
 			doomed = append(doomed, r.clone())
 		}
@@ -253,10 +253,29 @@ func (m *memory) expired(now time.Time, limit int) ([]Record, error) {
 	return doomed, nil
 }
 
+func (m *memory) orphans(limit int) ([]string, error) {
+	m.lock()
+	defer m.unlock()
+
+	var out []string
+	for _, ids := range m.held.party {
+		for _, id := range ids {
+			if _, ok := m.held.records[id]; !ok {
+				out = append(out, id)
+			}
+		}
+	}
+	slices.Sort(out)
+	if limit > 0 && len(out) > limit {
+		out = out[:limit]
+	}
+	return out, nil
+}
+
 func (m *memory) count() (int, error) {
 	m.lock()
 	defer m.unlock()
-	return len(m.shelf.records), nil
+	return len(m.held.records), nil
 }
 
 func drop(ids []string, id string) []string {
