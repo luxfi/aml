@@ -5,7 +5,9 @@ package engine
 
 import (
 	"fmt"
+	"math"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
@@ -17,6 +19,9 @@ type Engine struct {
 	evaluator *Evaluator
 	mu        sync.RWMutex
 	rules     []types.Rule
+	scorer    Scorer
+	faults    atomic.Int64
+	rejects   atomic.Int64
 }
 
 // New creates an Engine with the given rules.
@@ -55,6 +60,71 @@ func (e *Engine) Evaluator() *Evaluator {
 	return e.evaluator
 }
 
+// SetScorer installs the Scorer consulted alongside the rules, or nil to run on
+// rules alone.
+func (e *Engine) SetScorer(s Scorer) {
+	e.mu.Lock()
+	e.scorer = s
+	e.mu.Unlock()
+}
+
+// ScorerFaults is the number of times the Scorer failed and its evidence was
+// discarded — a panic, a negative weight, or a weight that is not a number.
+//
+// It has to be readable. A Scorer that faults on every transaction contributes
+// nothing while the engine keeps answering, and the only difference between that
+// and a Scorer finding nothing to report is this counter.
+func (e *Engine) ScorerFaults() int64 { return e.faults.Load() + e.rejects.Load() }
+
+// assess consults the Scorer, and confines it.
+//
+// Three things a Scorer must not be able to do, each enforced here rather than
+// trusted to the Scorer, because the property has to hold for one that is wrong
+// as well as one that is honest:
+//
+// It must not take the rule plane down. The transaction has already been
+// evaluated against every rule by the time this runs, and losing that verdict to
+// a fault in the statistical plane would turn a degraded control into no control
+// — so a panic is contained, counted, and the rules' answer stands.
+//
+// It must not weaken a verdict. Weight-of-evidence is a sum, so a negative weight
+// would subtract from a score built by the rules, and a model would be able to
+// argue a transaction down. Non-negative weights are already required of rules
+// for that reason; a computed weight is held to it too, along with the NaN a
+// computation can produce and a constant cannot.
+//
+// It must not act. Its action is capped at types.ActionCeiling, so the strongest
+// thing a statistical judgement can do is put a transaction in front of a person.
+func (e *Engine) assess(tx types.Transaction, entity types.Entity) (hit types.RuleHit, ok bool) {
+	e.mu.RLock()
+	sc := e.scorer
+	e.mu.RUnlock()
+	if sc == nil {
+		return types.RuleHit{}, false
+	}
+
+	defer func() {
+		if r := recover(); r != nil {
+			e.faults.Add(1)
+			hit, ok = types.RuleHit{}, false
+		}
+	}()
+
+	hit, ok = sc.Assess(tx, entity)
+	if !ok {
+		return types.RuleHit{}, false
+	}
+	if hit.Rule.Weight < 0 || math.IsNaN(hit.Rule.Weight) || math.IsInf(hit.Rule.Weight, 0) {
+		e.rejects.Add(1)
+		return types.RuleHit{}, false
+	}
+	if types.ActionRank(hit.Rule.Action) > types.ActionRank(types.ActionCeiling) {
+		hit.Rule.Action = types.ActionCeiling
+	}
+	hit.Match = true
+	return hit, true
+}
+
 // Evaluate runs all rules against a transaction and its primary entity.
 // Returns the computed alerts, the aggregate score, and the enforcement action.
 func (e *Engine) Evaluate(tx types.Transaction, entity types.Entity) ([]types.Alert, float64, string) {
@@ -68,6 +138,15 @@ func (e *Engine) Evaluate(tx types.Transaction, entity types.Entity) ([]types.Al
 	}
 
 	hits := e.evaluator.EvalAll(rules, ctx)
+
+	// The Scorer is consulted after the rules and its evidence joins theirs, so
+	// the statistical plane can only add to what the rules found. It can raise a
+	// transaction no rule matched, which is the point of having it; it cannot
+	// lower one they did.
+	if hit, ok := e.assess(tx, entity); ok {
+		hits = append(hits, hit)
+	}
+
 	if len(hits) == 0 {
 		return nil, 0, types.ActionAllow
 	}
@@ -86,6 +165,7 @@ func (e *Engine) Evaluate(tx types.Transaction, entity types.Entity) ([]types.Al
 			Severity:       h.Rule.Severity,
 			Score:          breakdown[h.Rule.ID],
 			ScoreBreakdown: breakdown,
+			Causes:         h.Causes,
 			ActionTaken:    h.Rule.Action,
 			CreatedAt:      now,
 			UpdatedAt:      now,
@@ -96,23 +176,12 @@ func (e *Engine) Evaluate(tx types.Transaction, entity types.Entity) ([]types.Al
 	return alerts, score, action
 }
 
-// resolveAction picks the most severe action from a set of alerts.
-// Priority: block > report > review > flag > allow.
+// resolveAction picks the most demanding action from a set of alerts.
 func resolveAction(alerts []types.Alert) string {
-	priority := map[string]int{
-		types.ActionBlock:  4,
-		types.ActionReport: 3,
-		types.ActionReview: 2,
-		types.ActionFlag:   1,
-		types.ActionAllow:  0,
-	}
-
 	best := types.ActionAllow
-	bestP := 0
 	for _, a := range alerts {
-		if p, ok := priority[a.ActionTaken]; ok && p > bestP {
+		if types.ActionRank(a.ActionTaken) > types.ActionRank(best) {
 			best = a.ActionTaken
-			bestP = p
 		}
 	}
 	return best
