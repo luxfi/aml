@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/hanzoai/base/core"
 	"github.com/hanzoai/base/tests"
 
@@ -390,8 +391,32 @@ func mustOnly(t *testing.T, l *Ledger) string {
 	return ids[0]
 }
 
-// TestConcurrentRetriesRetainOnce: two retries in flight together both find nothing
-// retained before either writes, unless the read and the write are one transaction.
+// TestOneIdentityOneRecord: whatever else happens — two retries in flight together,
+// two processes writing to one ledger — a second record cannot take an identity that
+// is already taken. The write is attempted directly on the shelf here, because the
+// ledger's own read-then-write is what this is the backstop for.
+func TestOneIdentityOneRecord(t *testing.T) {
+	l := fresh(t)
+
+	id, err := transact(l, org, "", "tx-1", []string{"subject:p1"}, ago(1), body("tx"))
+	if err != nil {
+		t.Fatalf("transaction: %v", err)
+	}
+
+	twin := mustGet(t, l, id)
+	twin.ID = uuid.NewString()
+	if err := l.shelf.insert(twin); !errors.Is(err, ErrConflict) {
+		t.Fatalf("a second record took the identity %q: err = %v, want ErrConflict", twin.identity, err)
+	}
+	if held := mustLen(t, l); held != 1 {
+		t.Errorf("ledger holds %d records under one identity", held)
+	}
+}
+
+// TestConcurrentRetriesRetainOnce: retries in flight together must each come back
+// with the one record. It cannot force the interleaving it is aiming at, so it is
+// evidence about the ordinary case and not about the race; the guarantee under a
+// race is the identity constraint, which TestOneIdentityOneRecord asks for directly.
 func TestConcurrentRetriesRetainOnce(t *testing.T) {
 	l := fresh(t)
 
