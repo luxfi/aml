@@ -5,40 +5,30 @@
 package retention
 
 import (
+	"errors"
 	"fmt"
 	"slices"
-	"strings"
-	"sync"
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/hanzoai/base/core"
 )
 
-// Ledger holds an org's retained records, the party index the five-year
-// lookback is answered from, and the relationship index the clock cascades
-// through.
-type Ledger struct {
-	mu      sync.RWMutex
-	records map[string]*Record
-	// parties maps org and party to the records that name that party. AMLR
-	// Art. 78 must be answered "fully and speedily", which is an index and not a
-	// scan: a lookback examines one party's records, never the ledger.
-	parties map[string][]string
-	// inside maps a relationship to the records retained inside it, so ending the
-	// relationship starts their clocks too.
-	inside map[string][]string
-}
+// Ledger holds an org's retained records. It is the obligations and nothing else —
+// which clock starts when, how far a closure cascades, what a read is allowed to
+// be for, what a disposal has to prove — and the records themselves are in a
+// [store]. So each obligation is written once and holds wherever the records are
+// kept.
+type Ledger struct{ store store }
 
-// New returns an empty ledger.
-func New() *Ledger {
-	return &Ledger{
-		records: make(map[string]*Record),
-		parties: make(map[string][]string),
-		inside:  make(map[string][]string),
-	}
-}
+// New returns a ledger that keeps records in memory, for exercising the
+// obligations without a database. What is in it does not survive a restart, so it
+// is not what an instance serves from.
+func New() *Ledger { return &Ledger{store: newMemory()} }
 
-func partyKey(org, party string) string { return org + "\x00" + party }
+// NewBase returns a ledger that keeps records in Base collections, which do
+// survive a restart. [Ensure] has to have run first.
+func NewBase(app core.App) *Ledger { return &Ledger{store: durable{app: app}} }
 
 // Retain writes a record and returns its id.
 //
@@ -54,6 +44,11 @@ func partyKey(org, party string) string { return org + "\x00" + party }
 //
 // So Record.Start is not an input. A record arriving with one set is refused,
 // because a caller that can name its own expiry can name one that never comes.
+//
+// A retry is not a second fact. A client that resends because it never saw the
+// first response gets back the id it already has rather than a second record of
+// one transaction — [Record.identify] is what "the same" means for each class,
+// and [ErrConflict] is what happens when two different records claim one identity.
 func (l *Ledger) Retain(r Record) (string, error) {
 	if r.Org == "" {
 		return "", ErrOrg
@@ -62,59 +57,76 @@ func (l *Ledger) Retain(r Record) (string, error) {
 		return "", fmt.Errorf("%w: the clock is the ledger's to start", ErrClock)
 	}
 
-	l.mu.Lock()
-	defer l.mu.Unlock()
-
-	switch r.Trigger {
-	case TriggerRefusal, TriggerOccasional:
-		if r.Relationship != "" {
-			return "", fmt.Errorf("%w: %s does not run inside a relationship", ErrTrigger, r.Trigger)
-		}
-		r.Start = r.Occurred
-	case TriggerRelationshipEnd:
-		if r.Relationship == "" {
-			// The relationship itself. Its clock starts when it ends.
-			if r.Class != ClassRelationship {
-				return "", fmt.Errorf("%w: %s needs the relationship it is retained inside", ErrRelationship, r.Class)
+	var id string
+	err := l.store.tx(func(s store) error {
+		switch r.Trigger {
+		case TriggerRefusal, TriggerOccasional:
+			if r.Relationship != "" {
+				return fmt.Errorf("%w: %s does not run inside a relationship", ErrTrigger, r.Trigger)
 			}
-			break
+			r.Start = r.Occurred
+		case TriggerRelationshipEnd:
+			if r.Relationship == "" {
+				// The relationship itself. Its clock starts when it ends.
+				if r.Class != ClassRelationship {
+					return fmt.Errorf("%w: %s needs the relationship it is retained inside", ErrRelationship, r.Class)
+				}
+				break
+			}
+			rel, err := s.read(r.Org, r.Relationship)
+			if err != nil || rel.Class != ClassRelationship {
+				return fmt.Errorf("%w: %s", ErrRelationship, r.Relationship)
+			}
+			r.Start = rel.Start
+		default:
+			return fmt.Errorf("%w: %q", ErrTrigger, r.Trigger)
 		}
-		rel, ok := l.records[r.Relationship]
-		if !ok || rel.Org != r.Org || rel.Class != ClassRelationship {
-			return "", fmt.Errorf("%w: %s", ErrRelationship, r.Relationship)
-		}
-		r.Start = rel.Start
-	default:
-		return "", fmt.Errorf("%w: %q", ErrTrigger, r.Trigger)
-	}
 
-	if err := r.validate(); err != nil {
+		if err := r.validate(); err != nil {
+			return err
+		}
+
+		// The read and the write are one transaction, so two retries arriving
+		// together cannot both find nothing and both write.
+		r.identity = r.identify()
+		prior, err := s.retained(r.Org, r.identity)
+		switch {
+		case err == nil:
+			if prior.digest() != r.digest() {
+				return fmt.Errorf("%w: %s", ErrConflict, r.identity)
+			}
+			id = prior.ID
+			return nil
+		case !errors.Is(err, ErrNotFound):
+			return err
+		}
+
+		r.ID = uuid.NewString()
+		r.Written = time.Now().UTC()
+		// One representation of a moment, everywhere in the ledger.
+		r.Occurred = r.Occurred.UTC()
+		if !r.Start.IsZero() {
+			r.Start = r.Start.UTC()
+		}
+		if err := s.insert(r); err != nil {
+			return err
+		}
+		id = r.ID
+		return nil
+	})
+	if err != nil {
 		return "", err
 	}
-
-	r.ID = uuid.NewString()
-	r.Written = time.Now().UTC()
-	// One representation of a moment, everywhere in the ledger.
-	r.Occurred = r.Occurred.UTC()
-	if !r.Start.IsZero() {
-		r.Start = r.Start.UTC()
-	}
-
-	stored := r.clone()
-	l.records[r.ID] = &stored
-	for _, p := range r.Parties {
-		k := partyKey(r.Org, p)
-		l.parties[k] = append(l.parties[k], r.ID)
-	}
-	if r.Relationship != "" {
-		l.inside[r.Relationship] = append(l.inside[r.Relationship], r.ID)
-	}
-	return r.ID, nil
+	return id, nil
 }
 
 // Close ends a business relationship and starts the retention clock on it and on
 // every record retained inside it. It returns how many records' clocks started,
 // the relationship included: a caller that expects the cascade can check it.
+//
+// The relationship and the cascade are one write. Half a cascade leaves records
+// with no expiry at all, and a record with no expiry is never disposed of — of the
+// two ways this can fail, that is the one nobody notices.
 func (l *Ledger) Close(org, id string, at time.Time) (int, error) {
 	if org == "" {
 		return 0, ErrOrg
@@ -123,36 +135,47 @@ func (l *Ledger) Close(org, id string, at time.Time) (int, error) {
 		return 0, ErrOccurred
 	}
 
-	l.mu.Lock()
-	defer l.mu.Unlock()
-
-	rel, ok := l.records[id]
-	if !ok || rel.Org != org || rel.Class != ClassRelationship {
-		return 0, fmt.Errorf("%w: %s", ErrRelationship, id)
-	}
-	if !rel.Ended.IsZero() {
-		return 0, fmt.Errorf("%w: %s ended %s", ErrClosed, id, rel.Ended.UTC().Format(time.RFC3339))
-	}
-	if at.Before(rel.Occurred) {
-		return 0, fmt.Errorf("%w: %s cannot end before it began", ErrOccurred, id)
-	}
-
-	at = at.UTC()
-	rel.Ended = at
-	rel.Start = at
-	started := 1
-
-	for _, child := range l.inside[id] {
-		r, ok := l.records[child]
-		if !ok {
-			continue
+	started := 0
+	err := l.store.tx(func(s store) error {
+		started = 0
+		rel, err := s.read(org, id)
+		if err != nil || rel.Class != ClassRelationship {
+			return fmt.Errorf("%w: %s", ErrRelationship, id)
 		}
-		// Only a clock that has not started; an extended or already-started
-		// record is never moved backwards.
-		if r.Start.IsZero() {
-			r.Start = at
+		if !rel.Ended.IsZero() {
+			return fmt.Errorf("%w: %s ended %s", ErrClosed, id, rel.Ended.UTC().Format(time.RFC3339))
+		}
+		if at.Before(rel.Occurred) {
+			return fmt.Errorf("%w: %s cannot end before it began", ErrOccurred, id)
+		}
+
+		ended := at.UTC()
+		rel.Ended, rel.Start = ended, ended
+		if err := s.update(rel); err != nil {
+			return err
+		}
+		started = 1
+
+		retained, err := s.inside(org, id)
+		if err != nil {
+			return err
+		}
+		for _, r := range retained {
+			// Only a clock that has not started; an extended or already-started
+			// record is never moved backwards.
+			if !r.Start.IsZero() {
+				continue
+			}
+			r.Start = ended
+			if err := s.update(r); err != nil {
+				return err
+			}
 			started++
 		}
+		return nil
+	})
+	if err != nil {
+		return 0, err
 	}
 	return started, nil
 }
@@ -169,26 +192,25 @@ func (l *Ledger) Extend(org, id string, by time.Duration, reason, who string) er
 		return fmt.Errorf("%w: needs a positive period, a reason and a decider", ErrExtension)
 	}
 
-	l.mu.Lock()
-	defer l.mu.Unlock()
+	return l.store.tx(func(s store) error {
+		r, err := s.read(org, id)
+		if err != nil {
+			return fmt.Errorf("%w: %s", ErrNotFound, id)
+		}
+		if r.Start.IsZero() {
+			return fmt.Errorf("%w: %s", ErrClock, id)
+		}
+		if r.Extended != nil {
+			return fmt.Errorf("%w: %s is already extended", ErrExtension, id)
+		}
+		limit := r.Start.AddDate(Period+Extension, 0, 0)
+		if r.Start.AddDate(Period, 0, 0).Add(by).After(limit) {
+			return fmt.Errorf("%w: %s past %s", ErrExtension, by, limit.UTC().Format(time.RFC3339))
+		}
 
-	r, ok := l.records[id]
-	if !ok || r.Org != org {
-		return fmt.Errorf("%w: %s", ErrNotFound, id)
-	}
-	if r.Start.IsZero() {
-		return fmt.Errorf("%w: %s", ErrClock, id)
-	}
-	if r.Extended != nil {
-		return fmt.Errorf("%w: %s is already extended", ErrExtension, id)
-	}
-	limit := r.Start.AddDate(Period+Extension, 0, 0)
-	if r.Start.AddDate(Period, 0, 0).Add(by).After(limit) {
-		return fmt.Errorf("%w: %s past %s", ErrExtension, by, limit.UTC().Format(time.RFC3339))
-	}
-
-	r.Extended = &Extended{By: by, Reason: reason, Who: who, At: time.Now().UTC()}
-	return nil
+		r.Extended = &Extended{By: by, Reason: reason, Who: who, At: time.Now().UTC()}
+		return s.update(r)
+	})
 }
 
 // Get returns one record for a permitted purpose. The returned record is a copy:
@@ -200,71 +222,20 @@ func (l *Ledger) Get(p Purpose, org, id string) (Record, error) {
 	if org == "" {
 		return Record{}, ErrOrg
 	}
-
-	l.mu.RLock()
-	defer l.mu.RUnlock()
-
-	r, ok := l.records[id]
-	if !ok || r.Org != org {
-		return Record{}, fmt.Errorf("%w: %s", ErrNotFound, id)
-	}
-	return r.clone(), nil
+	return l.store.read(org, id)
 }
 
 // Each visits an org's records of one class, oldest event first, for a permitted
 // purpose. An empty class visits every class. Iteration is ordered so that a
 // file produced from it is reproducible.
-func (l *Ledger) Each(p Purpose, org string, c Class, fn func(Record) error) error {
+func (l *Ledger) Each(p Purpose, org string, c Class, visit func(Record) error) error {
 	if !p.permitted() {
 		return fmt.Errorf("%w: %q", ErrPurpose, p)
 	}
 	if org == "" {
 		return ErrOrg
 	}
-
-	// The order is settled first, on the cheap fields, and each record is copied
-	// as it is visited. A walk therefore does not double the ledger in memory,
-	// and it does not hold the lock across the caller's callback.
-	type key struct {
-		id string
-		at time.Time
-	}
-
-	l.mu.RLock()
-	keys := make([]key, 0, len(l.records))
-	for id, r := range l.records {
-		if r.Org != org || (c != "" && r.Class != c) {
-			continue
-		}
-		keys = append(keys, key{id: id, at: r.Occurred})
-	}
-	l.mu.RUnlock()
-
-	slices.SortFunc(keys, func(a, b key) int {
-		if d := a.at.Compare(b.at); d != 0 {
-			return d
-		}
-		return strings.Compare(a.id, b.id)
-	})
-
-	for _, k := range keys {
-		l.mu.RLock()
-		stored, ok := l.records[k.id]
-		var r Record
-		if ok {
-			r = stored.clone()
-		}
-		l.mu.RUnlock()
-		if !ok {
-			// Disposed between settling the order and reading it. A destroyed
-			// record is not visited.
-			continue
-		}
-		if err := fn(r); err != nil {
-			return err
-		}
-	}
-	return nil
+	return l.store.each(org, c, visit)
 }
 
 // Answer answers AMLR Art. 78: whether a business relationship with a named
@@ -313,16 +284,15 @@ func (l *Ledger) Lookback(p Purpose, org, party string, now time.Time) (Answer, 
 		To:   now,
 	}
 
-	l.mu.RLock()
-	defer l.mu.RUnlock()
-
-	ids := l.parties[partyKey(org, party)]
-	answer.Examined = len(ids)
+	found, err := l.store.party(org, party)
+	if err != nil {
+		return Answer{}, err
+	}
+	answer.Examined = len(found)
 
 	natures := make(map[string]bool)
-	for _, id := range ids {
-		r, ok := l.records[id]
-		if !ok || r.Class != ClassRelationship {
+	for _, r := range found {
+		if r.Class != ClassRelationship {
 			continue
 		}
 		// Open now, or ended inside the window.
@@ -335,7 +305,7 @@ func (l *Ledger) Lookback(p Purpose, org, party string, now time.Time) (Answer, 
 		}
 		answer.Maintained = true
 		answer.Current = answer.Current || current
-		answer.Records = append(answer.Records, id)
+		answer.Records = append(answer.Records, r.ID)
 		if r.Nature != "" {
 			natures[r.Nature] = true
 		}
@@ -370,111 +340,93 @@ type Disposal struct {
 // post-conditions and returns an error rather than a count if any of them fails.
 // And it deletes whole records only — there is no partial disposal, which is
 // what keeps deletion-on-expiry from becoming redaction.
+//
+// A run works in batches, each of them one write, because the size of a run is
+// the ledger's and not one party's. A batch that comes back a second time is a
+// batch that survived its own destruction, which is reported rather than retried
+// forever.
 func (l *Ledger) Dispose(now time.Time) (Disposal, error) {
 	if err := checkNow(now); err != nil {
 		return Disposal{}, err
 	}
 
-	l.mu.Lock()
-	defer l.mu.Unlock()
-
-	d := Disposal{At: now.UTC(), Examined: len(l.records)}
-
-	var doomed []string
-	for id, r := range l.records {
-		if r.Expired(now) {
-			doomed = append(doomed, id)
-		}
+	held, err := l.store.count()
+	if err != nil {
+		return Disposal{}, err
 	}
-	slices.Sort(doomed)
+	d := Disposal{At: now.UTC(), Examined: held}
 
-	for _, id := range doomed {
-		r := l.records[id]
-		delete(l.records, id)
-		for _, party := range r.Parties {
-			k := partyKey(r.Org, party)
-			if rest := drop(l.parties[k], id); len(rest) == 0 {
-				delete(l.parties, k)
-			} else {
-				l.parties[k] = rest
-			}
+	var disposed []Record
+	previous := ""
+	for {
+		doomed, err := l.store.expired(now, batch)
+		if err != nil {
+			return Disposal{}, err
 		}
-		if r.Relationship != "" {
-			if rest := drop(l.inside[r.Relationship], id); len(rest) == 0 {
-				delete(l.inside, r.Relationship)
-			} else {
-				l.inside[r.Relationship] = rest
-			}
+		if len(doomed) == 0 {
+			break
 		}
-		// A disposed relationship stops indexing what was retained inside it.
-		// Anything of its own that outlives it did so by extension, on purpose.
-		delete(l.inside, id)
+		if doomed[0].ID == previous {
+			return Disposal{}, fmt.Errorf("%w: %s survived its own destruction", ErrDisposal, previous)
+		}
+		previous = doomed[0].ID
+
+		if err := l.store.tx(func(s store) error { return s.erase(doomed) }); err != nil {
+			return Disposal{}, err
+		}
+		disposed = append(disposed, doomed...)
 	}
-	d.Disposed = doomed
 
-	if err := l.proveLocked(doomed, now); err != nil {
+	for _, r := range disposed {
+		d.Disposed = append(d.Disposed, r.ID)
+	}
+	slices.Sort(d.Disposed)
+
+	if err := l.prove(disposed, now); err != nil {
 		return Disposal{}, err
 	}
 	return d, nil
 }
 
-// proveLocked is the post-condition of a disposal run. It is the difference
-// between "the delete statement ran" and "the right records are gone".
-func (l *Ledger) proveLocked(disposed []string, now time.Time) error {
-	gone := make(map[string]bool, len(disposed))
-	for _, id := range disposed {
-		gone[id] = true
+// prove is the post-condition of a disposal run. It is the difference between "the
+// delete statement ran" and "the right records are gone", and it asks the store
+// rather than the run's own bookkeeping, because a run that believes its own count
+// is exactly the run that hides this bug.
+func (l *Ledger) prove(disposed []Record, now time.Time) error {
+	for _, r := range disposed {
+		if _, err := l.store.read(r.Org, r.ID); !errors.Is(err, ErrNotFound) {
+			return fmt.Errorf("%w: %s survived disposal", ErrDisposal, r.ID)
+		}
+		retained, err := l.store.inside(r.Org, r.ID)
+		if err != nil {
+			return err
+		}
+		if len(retained) > 0 {
+			return fmt.Errorf("%w: %s still indexes %d records retained inside it", ErrDisposal, r.ID, len(retained))
+		}
+		for _, p := range r.Parties {
+			found, err := l.store.party(r.Org, p)
+			if err != nil {
+				return err
+			}
+			if slices.ContainsFunc(found, func(other Record) bool { return other.ID == r.ID }) {
+				return fmt.Errorf("%w: %s is still indexed under a party", ErrDisposal, r.ID)
+			}
+		}
 	}
 
-	for _, id := range disposed {
-		if _, ok := l.records[id]; ok {
-			return fmt.Errorf("%w: %s survived disposal", ErrDisposal, id)
-		}
-		if _, ok := l.inside[id]; ok {
-			return fmt.Errorf("%w: %s still indexes records retained inside it", ErrDisposal, id)
-		}
+	// Nothing expired is left anywhere. This is what catches a record the run
+	// never reached, including one reachable only through an index entry that
+	// should have gone with something else.
+	left, err := l.store.expired(now, 1)
+	if err != nil {
+		return err
 	}
-	for _, ids := range l.parties {
-		for _, id := range ids {
-			if gone[id] {
-				return fmt.Errorf("%w: %s is still indexed under a party", ErrDisposal, id)
-			}
-			if _, ok := l.records[id]; !ok {
-				return fmt.Errorf("%w: party index references vanished record %s", ErrDisposal, id)
-			}
-		}
-	}
-	for rel, ids := range l.inside {
-		if _, ok := l.records[rel]; !ok {
-			return fmt.Errorf("%w: relationship index references vanished record %s", ErrDisposal, rel)
-		}
-		for _, id := range ids {
-			if _, ok := l.records[id]; !ok {
-				return fmt.Errorf("%w: relationship %s references vanished record %s", ErrDisposal, rel, id)
-			}
-		}
-	}
-	for id, r := range l.records {
-		if r.Expired(now) {
-			return fmt.Errorf("%w: %s is expired and was not disposed", ErrDisposal, id)
-		}
+	if len(left) > 0 {
+		return fmt.Errorf("%w: %s is expired and was not disposed", ErrDisposal, left[0].ID)
 	}
 	return nil
 }
 
-func drop(ids []string, id string) []string {
-	out := ids[:0:0]
-	for _, existing := range ids {
-		if existing != id {
-			out = append(out, existing)
-		}
-	}
-	return out
-}
-
-// Len is how many records the ledger holds.
-func (l *Ledger) Len() int {
-	l.mu.RLock()
-	defer l.mu.RUnlock()
-	return len(l.records)
-}
+// Len is how many records the ledger holds, in every org.
+func (l *Ledger) Len() (int, error) { return l.store.count() }
