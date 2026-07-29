@@ -111,8 +111,12 @@ export function Rules() {
                           Test Rule
                         </button>
                         {testResult && (
-                          <span style={{ fontSize: 13, color: testResult.match ? '#22c55e' : '#737373' }}>
-                            {testResult.match ? 'Matched' : 'No match'}
+                          <span style={{ fontSize: 13, color: testResult.candidate.alerts > 0 ? '#22c55e' : '#737373' }}>
+                            {testResult.candidate.alerts} alert
+                            {testResult.candidate.alerts === 1 ? '' : 's'} over {testResult.events} transaction
+                            {testResult.events === 1 ? '' : 's'}
+                            {testResult.candidate.false_positive_proportion !== undefined &&
+                              ` — ${Math.round(testResult.candidate.false_positive_proportion * 100)}% false positive`}
                           </span>
                         )}
                         {testErr && (

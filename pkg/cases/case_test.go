@@ -1,6 +1,8 @@
 package cases
 
 import (
+	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -227,5 +229,41 @@ func TestCaseStoreEvictExpiredDirect(t *testing.T) {
 		if s.Get(id) == nil {
 			t.Errorf("open case %s should not be evicted", id)
 		}
+	}
+}
+
+// TestResolveRefusesWithoutARetainedAssessment: closing a case is a decision
+// about whether to report, and that decision is a retained record whether or not
+// it produced one. Without it there is no closure — a dismissed alert must not be
+// a row that quietly changes state.
+func TestResolveRefusesWithoutARetainedAssessment(t *testing.T) {
+	s := NewStore()
+	c := s.Create("org1", types.SeverityHigh, []string{"alert-1"}, []string{"user-1"})
+
+	if err := s.Resolve(c.ID, types.ResolutionFalsePositive, "mlro", ""); !errors.Is(err, ErrNoAssessment) {
+		t.Fatalf("err = %v, want ErrNoAssessment", err)
+	}
+	got := s.Get(c.ID)
+	if got.Status == types.CaseClosed {
+		t.Error("the case closed without a retained decision")
+	}
+	if got.ClosedAt != nil {
+		t.Error("the case carries a closing date it did not earn")
+	}
+
+	if err := s.Resolve(c.ID, types.ResolutionFalsePositive, "mlro", "assessment-1"); err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+	got = s.Get(c.ID)
+	if got.Status != types.CaseClosed {
+		t.Errorf("status = %q, want closed", got.Status)
+	}
+	if got.Assessment != "assessment-1" {
+		t.Errorf("assessment = %q, want assessment-1", got.Assessment)
+	}
+	// The timeline names the decision, so the case file leads to it.
+	events := s.Events(c.ID)
+	if len(events) == 0 || !strings.Contains(events[len(events)-1].Body, "assessment-1") {
+		t.Errorf("the closing event does not name the assessment: %+v", events)
 	}
 }
