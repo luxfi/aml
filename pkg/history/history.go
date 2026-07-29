@@ -11,6 +11,8 @@ package history
 import (
 	"context"
 	"fmt"
+	"slices"
+	"strings"
 	"time"
 )
 
@@ -76,13 +78,25 @@ type Store interface {
 	Window(ctx context.Context, subj Subject, lookback time.Duration) ([]Event, error)
 }
 
-// unknownKind and incomplete are the two ways a subject can fail to name anyone.
-// Both are errors rather than empty windows: a rule evaluated over an empty window
-// reports no activity, which is indistinguishable from a customer who did nothing.
-func unknownKind(kind string) error {
-	return fmt.Errorf("history: unknown subject kind %q", kind)
-}
+// Kinds are the subject kinds a window can be grouped by.
+var Kinds = []string{SubjectUser, SubjectAccount, SubjectCounterparty, SubjectDevice, SubjectAddress}
 
-func incomplete(s Subject) error {
-	return fmt.Errorf("history: subject %q is incomplete (organisation %q, identifier %q)", s.Kind, s.OrgID, s.ID)
+// Valid reports why a subject cannot name anyone, if it cannot.
+//
+// This is defined once and called by everything that builds or consumes a
+// Subject, because each of these failures has the same consequence and it is the
+// worst one available: a subject that names nobody yields an empty window, a rule
+// over an empty window sees no activity, and no activity is indistinguishable
+// from a customer who did nothing. Every one of them is an error instead.
+func (s Subject) Valid() error {
+	if !slices.Contains(Kinds, s.Kind) {
+		return fmt.Errorf("history: unknown subject kind %q, want one of %s", s.Kind, strings.Join(Kinds, ", "))
+	}
+	if s.OrgID == "" {
+		return fmt.Errorf("history: subject %q names no organisation, so the window would cross tenants", s.Kind)
+	}
+	if s.ID == "" {
+		return fmt.Errorf("history: subject %q carries no identifier", s.Kind)
+	}
+	return nil
 }
