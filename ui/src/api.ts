@@ -135,3 +135,39 @@ export function searchSanctions(name: string, dob?: string): Promise<SanctionsRe
 export function health(): Promise<{ status: string; time: string }> {
   return json('/v1/aml/health')
 }
+
+// Screening readiness, per sanctions list.
+//
+// A list that has stopped loading returns no matches, and no matches is what a
+// clean party also returns — so the count and the date are the only way to tell
+// "nobody on this payment is designated" from "the list is empty". loaded_at is
+// null for a list that has never loaded, which is not the same as a list with
+// nobody on it.
+export interface ScreeningSource {
+  source: string
+  entries: number
+  loaded_at: string | null
+  age_hours: number
+  fresh: boolean
+  sha256?: string
+  error?: string
+  attempted_at: string | null
+}
+
+export interface Screening {
+  ready: boolean
+  unfit: string[]
+  total_entries: number
+  sources: ScreeningSource[]
+}
+
+// screeningSources answers 503 when any list is unfit, so the body is read on
+// both outcomes rather than treated as an error: an unready instance is exactly
+// the state this panel exists to show.
+export async function screeningSources(): Promise<Screening> {
+  const res = await fetch('/v1/aml/sanctions/sources')
+  if (res.status !== 200 && res.status !== 503) {
+    throw new Error(`${res.status}: ${await res.text()}`)
+  }
+  return res.json()
+}

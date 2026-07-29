@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react'
 import { listCases, health, type Case } from '../api'
+import { ScreeningPanel } from './Screening'
 
 const cardStyle: React.CSSProperties = {
   background: '#0a0a0a',
@@ -55,6 +56,8 @@ export function Dashboard() {
       {err && (
         <div style={{ color: '#ef4444', fontSize: 13 }}>{err}</div>
       )}
+
+      <ScreeningPanel />
 
       <div style={{ display: 'flex', gap: 16, flexWrap: 'wrap' }}>
         <div style={cardStyle}>

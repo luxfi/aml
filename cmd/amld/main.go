@@ -9,6 +9,7 @@ package main
 
 import (
 	"fmt"
+	"log"
 	"os"
 
 	"github.com/hanzoai/base"
@@ -17,6 +18,7 @@ import (
 	"github.com/hanzoai/base/tools/hook"
 	"github.com/spf13/cobra"
 
+	"github.com/luxfi/aml/pkg/anomaly"
 	"github.com/luxfi/aml/pkg/api"
 	"github.com/luxfi/aml/pkg/cases"
 	"github.com/luxfi/aml/pkg/engine"
@@ -24,6 +26,7 @@ import (
 	"github.com/luxfi/aml/pkg/rules"
 	"github.com/luxfi/aml/pkg/sanctions"
 	"github.com/luxfi/aml/pkg/token"
+	"github.com/luxfi/aml/pkg/velocity"
 	uiaml "github.com/luxfi/aml/ui"
 )
 
@@ -51,6 +54,9 @@ func main() {
 	caseStore := cases.NewStore()
 	alertStore := api.NewAlertStore()
 	sanctionsStore := api.NewSanctionsStore()
+	// Per-source screening readiness. Built from the configured lists so a source
+	// that has never once loaded is reported as unfit rather than being absent.
+	screening := sanctions.NewMonitor(sanctions.DefaultLists())
 
 	// The record plane. AML_TOKEN_KEY carries the KMS-held root that per-org
 	// tokenisation keys are derived from: 32 bytes or more, hex encoded. There is
@@ -59,6 +65,22 @@ func main() {
 	// control whose whole job is to have kept the record.
 	records := retention.New()
 	keys := token.NewKeyring(token.Env("AML_TOKEN_KEY"))
+
+	// The behavioural plane. Sliding aggregates are the substrate every
+	// behavioural measure reads; the model reads them to score whether a
+	// transaction is unusual for the entity, as a complement to the rules.
+	//
+	// It starts in shadow. Detection has to be testable before it is activated, so
+	// a new deployment scores, learns, and records what it would have alerted on
+	// at GET /v1/aml/anomaly, and contributes nothing to any transaction's outcome
+	// until someone has read that and set AML_ANOMALY=live. Nothing about the
+	// rules changes either way.
+	windows := velocity.New(velocity.Config{})
+	model, err := anomaly.New(anomaly.Config{Shadow: os.Getenv("AML_ANOMALY") != "live"}, windows)
+	if err != nil {
+		log.Fatalf("[aml] behavioural plane: %v", err)
+	}
+	eng.SetScorer(model)
 
 	handler := &api.Handler{
 		// The gateway authenticates the caller and sets X-Org-Id from the verified
@@ -70,8 +92,11 @@ func main() {
 		Cases:     caseStore,
 		Alerts:    alertStore,
 		Sanctions: sanctionsStore,
+		Screening: screening,
 		Records:   records,
 		Keys:      keys,
+		Velocity:  windows,
+		Anomaly:   model,
 	}
 
 	app.OnServe().Bind(&hook.Handler[*core.ServeEvent]{
@@ -82,7 +107,7 @@ func main() {
 
 			// Wire SanctionsStore (Base-backed) and register refresh cron.
 			baseSanctionsStore := sanctions.NewBaseSanctionsStore(app)
-			sanctions.RefreshCron(app, baseSanctionsStore)
+			sanctions.RefreshCron(app, baseSanctionsStore, screening)
 
 			// Destroy records whose retention period has run out, daily.
 			retention.Cron(app, records)

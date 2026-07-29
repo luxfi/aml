@@ -14,10 +14,15 @@ import (
 	"github.com/hanzoai/base/core"
 )
 
-// RefreshCron registers a daily 06:00 UTC refresh of every active list.
-func RefreshCron(app core.App, store SanctionsStore) {
+// RefreshCron registers a daily 06:00 UTC refresh of every active list, recording
+// each outcome in the monitor so readiness stays answerable between refreshes.
+func RefreshCron(app core.App, store SanctionsStore, monitor *Monitor) {
 	app.Cron().Add("sanctions-refresh", "0 6 * * *", func() {
-		if _, err := RefreshAll(context.Background(), store); err != nil {
+		results, err := RefreshAll(context.Background(), store)
+		if monitor != nil {
+			monitor.Record(results, time.Now().UTC())
+		}
+		if err != nil {
 			log.Printf("[sanctions-refresh] FAILED: %v", err)
 		}
 	})
