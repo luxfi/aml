@@ -147,7 +147,7 @@ func TestResolve(t *testing.T) {
 	s := NewStore()
 	c := s.Create("org1", types.SeverityHigh, nil, nil)
 
-	err := s.Resolve(c.ID, types.ResolutionSARFiled, "user1")
+	err := s.Resolve(c.ID, types.ResolutionSARFiled, "user1", "assessment-1")
 	if err != nil {
 		t.Fatalf("Resolve error: %v", err)
 	}
@@ -184,7 +184,7 @@ func TestCaseStoreEviction(t *testing.T) {
 	// Create and immediately close 15 cases.
 	for i := 0; i < 15; i++ {
 		c := s.Create("org1", types.SeverityLow, nil, nil)
-		s.Resolve(c.ID, types.ResolutionCleared, "system")
+		s.Resolve(c.ID, types.ResolutionCleared, "system", "assessment-1")
 	}
 
 	// Wait for closed cases to become stale.
@@ -208,7 +208,7 @@ func TestCaseStoreEvictExpiredDirect(t *testing.T) {
 	for i := 0; i < 5; i++ {
 		c := s.Create("org1", types.SeverityLow, nil, nil)
 		if i < 3 {
-			s.Resolve(c.ID, types.ResolutionCleared, "system")
+			s.Resolve(c.ID, types.ResolutionCleared, "system", "assessment-1")
 		} else {
 			openIDs = append(openIDs, c.ID)
 		}

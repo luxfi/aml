@@ -384,6 +384,13 @@ func (s *Store) Late() int64 {
 	return s.late
 }
 
+// Windows are the windows this Store keeps, so a caller that reads observations
+// by name can check at construction that the names it needs exist rather than
+// silently reading zero for a window nobody configured.
+func (s *Store) Windows() []Window {
+	return append([]Window(nil), s.cfg.Windows...)
+}
+
 // Keys is the number of live keys, for capacity monitoring against MaxKeys.
 func (s *Store) Keys() int {
 	n := 0

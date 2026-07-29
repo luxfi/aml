@@ -96,7 +96,7 @@ func TestCheckEscalation_NotBreached(t *testing.T) {
 func TestCheckEscalation_AlreadyClosed(t *testing.T) {
 	s := NewStore()
 	c := s.Create("org1", types.SeverityCritical, nil, nil)
-	_ = s.Resolve(c.ID, "cleared", "analyst")
+	_ = s.Resolve(c.ID, "cleared", "analyst", "assessment-1")
 
 	config := DefaultTriageConfig()
 	escalated := s.CheckEscalation(c, config)

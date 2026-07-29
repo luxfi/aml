@@ -203,8 +203,20 @@ func (s *Store) Assign(caseID, assigneeID string) error {
 	return nil
 }
 
-// Resolve closes a case with a resolution.
-func (s *Store) Resolve(caseID, resolution, authorID string) error {
+// Resolve closes a case with a resolution, against the retained assessment that
+// decided it.
+//
+// The assessment id is required. Closing a case is a decision about whether to
+// report, and that decision is retained whether or not it produced one
+// (Regulation (EU) 2024/1624 Art. 77(1)(b)); where the decision is not to
+// report, the reasons must be documented and kept with the internal suspicion
+// report (JMLSG 6.32). So a dismissal here cannot be a row that quietly changes
+// state: without the record of the decision there is no closure.
+func (s *Store) Resolve(caseID, resolution, authorID, assessment string) error {
+	if assessment == "" {
+		return ErrNoAssessment
+	}
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -216,6 +228,7 @@ func (s *Store) Resolve(caseID, resolution, authorID string) error {
 	now := time.Now().UTC()
 	c.Status = types.CaseClosed
 	c.Resolution = resolution
+	c.Assessment = assessment
 	c.ClosedAt = &now
 	c.UpdatedAt = now
 
@@ -224,7 +237,7 @@ func (s *Store) Resolve(caseID, resolution, authorID string) error {
 		CaseID:    caseID,
 		AuthorID:  authorID,
 		Kind:      types.EventStatusChange,
-		Body:      "closed: " + resolution,
+		Body:      "closed: " + resolution + " (assessment " + assessment + ")",
 		CreatedAt: now,
 	})
 

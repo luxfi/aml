@@ -24,6 +24,36 @@ const (
 	ActionReport = "report"
 )
 
+// ActionCeiling is the strongest action that evidence from a statistical model
+// may ask for: it escalates to a person, and does not block a payment or file a
+// report on its own.
+//
+// Two reasons, both external to this codebase. A risk score must be overridable
+// by a person with a documented rationale, which only means something if the
+// score has not already acted. And the weighting behind a decision must not be
+// driven by a single factor, which a model's output would be if it could act
+// alone.
+const ActionCeiling = ActionReview
+
+// ActionRank orders actions by how much they demand, so that "the strongest of
+// these" and "no stronger than this" are one comparison rather than two tables.
+// An unknown action ranks lowest: an action nobody defined cannot be allowed to
+// outrank one that was.
+func ActionRank(action string) int {
+	switch action {
+	case ActionBlock:
+		return 4
+	case ActionReport:
+		return 3
+	case ActionReview:
+		return 2
+	case ActionFlag:
+		return 1
+	default:
+		return 0
+	}
+}
+
 // Case statuses.
 const (
 	CaseOpen      = "open"
@@ -104,6 +134,16 @@ type Transaction struct {
 	Qty               float64         `json:"qty"`
 	Notional          float64         `json:"notional"`
 	Currency          string          `json:"currency"`
+	// USD is Notional converted at ingest, and it is set by the engine on the
+	// way in — a value supplied by a client is overwritten.
+	//
+	// It is frozen at ingest rather than converted on read for two reasons. A
+	// threshold applied today over a window of past transactions must not move
+	// because a rate moved, or the same history answers a reporting question
+	// differently on two days. And every aggregate and every ratio computed
+	// downstream is then in one unit, so no comparison carries a silent
+	// assumption about which currency it is in.
+	USD float64 `json:"usd"`
 	Counterparty      string          `json:"counterparty,omitempty"`
 	IPAddress         string          `json:"ip_address,omitempty"`
 	DeviceFingerprint string          `json:"device_fingerprint,omitempty"`
@@ -159,7 +199,10 @@ type Alert struct {
 	Severity       string             `json:"severity"`
 	Score          float64            `json:"score"`
 	ScoreBreakdown map[string]float64 `json:"score_breakdown,omitempty"`
-	ActionTaken    string             `json:"action_taken"`
+	// Causes carries the per-feature explanation when a model raised this
+	// alert. Empty for a rule alert, whose expression is its explanation.
+	Causes      []Cause `json:"causes,omitempty"`
+	ActionTaken string  `json:"action_taken"`
 	ReviewedBy     string             `json:"reviewed_by,omitempty"`
 	ReviewedAt     *time.Time         `json:"reviewed_at,omitempty"`
 	Decision       string             `json:"decision,omitempty"`
@@ -180,6 +223,9 @@ type Case struct {
 	OpenedAt   time.Time  `json:"opened_at"`
 	ClosedAt   *time.Time `json:"closed_at,omitempty"`
 	Resolution string     `json:"resolution,omitempty"`
+	// Assessment is the retained Art. 69(2) decision that closed the case — the
+	// information considered, the result and the reasons. A closed case has one.
+	Assessment string `json:"assessment,omitempty"`
 	CreatedAt  time.Time  `json:"created_at"`
 	UpdatedAt  time.Time  `json:"updated_at"`
 }
@@ -238,12 +284,45 @@ type Webhook struct {
 	UpdatedAt      time.Time  `json:"updated_at"`
 }
 
+// Cause is one feature's contribution to an alert a model raised.
+//
+// Where a rule is its own explanation — the expression says what fired — a
+// model's output is a number, and a number on its own cannot go to an
+// investigator. What is owed instead is the features that influenced the output,
+// the risk associated with each, and the risk indicators behind them, and a Cause
+// is exactly that owed set for one feature.
+//
+// Observed and Baseline are the arithmetic the score came from, in the terms Unit
+// names, so the explanation is the same calculation rather than a second account
+// of it. Without is the score the model would have produced had this feature been
+// unremarkable, holding everything else: it is a counterfactual on the model
+// itself and it is what makes the contribution a measurement rather than an
+// attribution scheme's opinion.
+type Cause struct {
+	Feature   string  `json:"feature"`
+	Typology  string  `json:"typology"`
+	Indicator string  `json:"indicator"`
+	Citation  string  `json:"citation"`
+	Severity  string  `json:"severity"`
+	Unit      string  `json:"unit"`
+	Observed  float64 `json:"observed"`
+	Baseline  float64 `json:"baseline"`
+	Without   float64 `json:"without"`
+	// Share is this feature's part of the score, in [0,1]. Zero across every
+	// cause means no single feature accounts for the alert and the combination
+	// does; the causes are then ordered by how far each sits from unremarkable.
+	Share float64 `json:"share"`
+}
+
 // RuleHit is the result of evaluating a single rule against a transaction.
 type RuleHit struct {
 	Rule    Rule
 	Match   bool
 	Score   float64
 	EvalErr string // non-empty if the rule evaluation failed (fail-closed)
+	// Causes explains a hit that came from a model rather than an expression.
+	// Empty for rules, which explain themselves.
+	Causes []Cause
 }
 
 // EvalContext is the evaluation context passed to expr-lang rules.
