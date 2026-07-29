@@ -56,6 +56,15 @@ func assess(l *Ledger, o, rel, ref string, parties []string, a Assessment) (stri
 	})
 }
 
+func mustLen(t *testing.T, l *Ledger) int {
+	t.Helper()
+	held, err := l.Len()
+	if err != nil {
+		t.Fatalf("Len: %v", err)
+	}
+	return held
+}
+
 func mustGet(t *testing.T, l *Ledger, id string) Record {
 	t.Helper()
 	r, err := l.Get(PurposeInvestigation, org, id)
@@ -69,7 +78,7 @@ func mustGet(t *testing.T, l *Ledger, id string) Record {
 // relationship, from the occasional transaction, or from the date of refusal.
 // The third is the one implementations miss, so it is asserted like the others.
 func TestThreeTriggers(t *testing.T) {
-	l := New()
+	l := fresh(t)
 
 	// From the occasional transaction.
 	occasional, err := transact(l, org, "", "tx-occasional", []string{"subject:p1"}, ago(4), body("occ"))
@@ -123,7 +132,7 @@ func TestThreeTriggers(t *testing.T) {
 // TestRefusalNeedsAReason: a refusal with no reason answers nothing about why
 // the firm refrained, which is the point of retaining it.
 func TestRefusalNeedsAReason(t *testing.T) {
-	l := New()
+	l := fresh(t)
 	if _, err := refuse(l, org, "tx-1", []string{"subject:p1"}, ago(1), ""); !errors.Is(err, ErrReason) {
 		t.Fatalf("err = %v, want ErrReason", err)
 	}
@@ -132,7 +141,7 @@ func TestRefusalNeedsAReason(t *testing.T) {
 // TestTheClockIsNotTheCallersToSet: a caller that can name its own expiry can
 // name one that never arrives, so Retain refuses a record that brings a clock.
 func TestTheClockIsNotTheCallersToSet(t *testing.T) {
-	l := New()
+	l := fresh(t)
 	_, err := l.Retain(Record{
 		Org: org, Class: ClassRefusal, Trigger: TriggerRefusal, Ref: "tx-1",
 		Parties: []string{"subject:p1"}, Occurred: ago(6), Reason: "refused",
@@ -149,7 +158,7 @@ func TestTheClockIsNotTheCallersToSet(t *testing.T) {
 // TestTriggerAndRelationshipMustAgree: a trigger is a statement about where the
 // period runs from, so it cannot contradict where the record sits.
 func TestTriggerAndRelationshipMustAgree(t *testing.T) {
-	l := New()
+	l := fresh(t)
 	rel, err := open(l, org, "payments", []string{"subject:p1"}, ago(3))
 	if err != nil {
 		t.Fatalf("open: %v", err)
@@ -187,7 +196,7 @@ func TestTriggerAndRelationshipMustAgree(t *testing.T) {
 // its expiry when it is written, because the period runs from the end of the
 // relationship. Closing the relationship starts every one of those clocks.
 func TestClockCascadesOnClose(t *testing.T) {
-	l := New()
+	l := fresh(t)
 
 	rel, err := open(l, org, "brokerage", []string{"subject:p1"}, ago(9))
 	if err != nil {
@@ -239,7 +248,7 @@ func TestClockCascadesOnClose(t *testing.T) {
 // TestCloseRefusals: a relationship closes once, in its own org, and not before
 // it opened.
 func TestCloseRefusals(t *testing.T) {
-	l := New()
+	l := fresh(t)
 	rel, err := open(l, org, "payments", []string{"subject:p1"}, ago(3))
 	if err != nil {
 		t.Fatalf("open: %v", err)
@@ -266,7 +275,7 @@ func TestCloseRefusals(t *testing.T) {
 // TestDisposeDestroysExpiredAndProvesIt: the whole record and every index entry
 // that referenced it, and nothing that is still within its period.
 func TestDisposeDestroysExpiredAndProvesIt(t *testing.T) {
-	l := New()
+	l := fresh(t)
 
 	expired, err := refuse(l, org, "tx-old", []string{"subject:gone", "name:gone"}, ago(6), "refused")
 	if err != nil {
@@ -326,7 +335,7 @@ func TestDisposeDestroysExpiredAndProvesIt(t *testing.T) {
 // TestDisposeCascadeLeavesNoDanglingIndex: closing a relationship expires it and
 // everything inside it together, and the relationship index goes with them.
 func TestDisposeCascadeLeavesNoDanglingIndex(t *testing.T) {
-	l := New()
+	l := fresh(t)
 	rel, err := open(l, org, "payments", []string{"subject:p1"}, ago(12))
 	if err != nil {
 		t.Fatalf("open: %v", err)
@@ -345,18 +354,32 @@ func TestDisposeCascadeLeavesNoDanglingIndex(t *testing.T) {
 	if len(d.Disposed) != 2 {
 		t.Fatalf("disposed %d records, want 2", len(d.Disposed))
 	}
-	if l.Len() != 0 {
-		t.Errorf("ledger holds %d records, want 0", l.Len())
+	if held := mustLen(t, l); held != 0 {
+		t.Errorf("ledger holds %d records, want 0", held)
 	}
-	if len(l.parties) != 0 || len(l.inside) != 0 {
-		t.Errorf("indexes left behind: %d party keys, %d relationships", len(l.parties), len(l.inside))
+
+	// Nothing is findable by either index. The party index is asked through the
+	// answer it feeds, and the relationship index through the cascade it feeds.
+	answer, err := l.Lookback(PurposeDisclosure, org, "subject:p1", time.Now().UTC())
+	if err != nil {
+		t.Fatalf("Lookback: %v", err)
+	}
+	if answer.Examined != 0 {
+		t.Errorf("the party index still holds %d entries", answer.Examined)
+	}
+	retained, err := l.shelf.inside(org, rel)
+	if err != nil {
+		t.Fatalf("inside: %v", err)
+	}
+	if len(retained) != 0 {
+		t.Errorf("the destroyed relationship still indexes %d records", len(retained))
 	}
 }
 
 // TestDisposeRefusesTheFuture: a disposal run cannot be talked into early
 // destruction by a date the clock has not reached.
 func TestDisposeRefusesTheFuture(t *testing.T) {
-	l := New()
+	l := fresh(t)
 	id, err := refuse(l, org, "tx-1", []string{"subject:p1"}, ago(1), "refused")
 	if err != nil {
 		t.Fatalf("refusal: %v", err)
@@ -375,11 +398,11 @@ func TestDisposeRefusesTheFuture(t *testing.T) {
 // pointing at a record that is not there — because that is the shape of the bug a
 // disposal job hides when it counts only its own delete statements.
 func TestDisposeReportsNoSuccessWhenProofFails(t *testing.T) {
-	l := New()
+	l := fresh(t)
 	if _, err := refuse(l, org, "tx-1", []string{"subject:p1"}, ago(1), "refused"); err != nil {
 		t.Fatalf("refusal: %v", err)
 	}
-	l.parties[partyKey(org, "subject:ghost")] = []string{"a-record-that-is-not-there"}
+	poison(t, l, "subject:ghost", "a-record-that-is-not-there")
 
 	d, err := l.Dispose(time.Now().UTC())
 	if !errors.Is(err, ErrDisposal) {
@@ -393,7 +416,7 @@ func TestDisposeReportsNoSuccessWhenProofFails(t *testing.T) {
 // TestLookbackAnswersArticle78: is or was a relationship maintained with this
 // party in the prior five years, and what was its nature.
 func TestLookbackAnswersArticle78(t *testing.T) {
-	l := New()
+	l := fresh(t)
 	now := time.Now().UTC()
 
 	// Ended inside the window.
@@ -469,7 +492,7 @@ func TestLookbackAnswersArticle78(t *testing.T) {
 // TestLookbackIgnoresRecordsThatAreNotRelationships: Art. 78 asks about business
 // relationships, and a transaction with a party is not one.
 func TestLookbackIgnoresRecordsThatAreNotRelationships(t *testing.T) {
-	l := New()
+	l := fresh(t)
 	if _, err := transact(l, org, "", "tx-1", []string{"name:one off"}, ago(1), body("x")); err != nil {
 		t.Fatalf("transaction: %v", err)
 	}
@@ -490,7 +513,7 @@ func TestLookbackIgnoresRecordsThatAreNotRelationships(t *testing.T) {
 // available, so the work a lookback does is proportional to one party's records
 // and not to the ledger. Examined is that proof and it stays flat.
 func TestLookbackIsIndexedNotScanned(t *testing.T) {
-	l := New()
+	l := fresh(t)
 	now := time.Now().UTC()
 
 	if _, err := open(l, org, "payments", []string{"name:target"}, ago(3)); err != nil {
@@ -515,7 +538,7 @@ func TestLookbackIsIndexedNotScanned(t *testing.T) {
 	}
 	if after.Examined != before.Examined || after.Examined != 1 {
 		t.Fatalf("examined went from %d to %d as the ledger grew to %d records",
-			before.Examined, after.Examined, l.Len())
+			before.Examined, after.Examined, mustLen(t, l))
 	}
 	if !after.Maintained {
 		t.Error("answer changed as unrelated records were added")
@@ -524,7 +547,7 @@ func TestLookbackIsIndexedNotScanned(t *testing.T) {
 
 // TestOrgBoundary: no read crosses it, in either direction, on any surface.
 func TestOrgBoundary(t *testing.T) {
-	l := New()
+	l := fresh(t)
 	const other = "beta"
 
 	mine, err := open(l, org, "payments", []string{"name:shared party"}, ago(2))
@@ -562,7 +585,7 @@ func TestOrgBoundary(t *testing.T) {
 // TestReadsRefuseOtherPurposes: retained personal data is for preventing money
 // laundering and terrorist financing, so a commercial purpose gets no data.
 func TestReadsRefuseOtherPurposes(t *testing.T) {
-	l := New()
+	l := fresh(t)
 	id, err := refuse(l, org, "tx-1", []string{"subject:p1"}, ago(1), "refused")
 	if err != nil {
 		t.Fatalf("refusal: %v", err)
@@ -585,7 +608,7 @@ func TestReadsRefuseOtherPurposes(t *testing.T) {
 // reader that alters what it was given has not altered the retained record.
 // Redaction is prohibited, and here it is also not reachable.
 func TestRecordsAreNotRedactableThroughAReader(t *testing.T) {
-	l := New()
+	l := fresh(t)
 	id, err := assess(l, org, "", "case-1", []string{"subject:p1"}, Assessment{
 		Considered: []string{"velocity", "profile"},
 		Result:     NotReported,
@@ -632,7 +655,7 @@ func TestRecordsAreNotRedactableThroughAReader(t *testing.T) {
 // TestExtendRefusals: an extension is a decision somebody made about one case,
 // within five further years, once.
 func TestExtendRefusals(t *testing.T) {
-	l := New()
+	l := fresh(t)
 	id, err := refuse(l, org, "tx-1", []string{"subject:p1"}, ago(1), "refused")
 	if err != nil {
 		t.Fatalf("refusal: %v", err)
@@ -677,7 +700,7 @@ func TestExtendRefusals(t *testing.T) {
 // TestExtensionSurvivesDisposal: an extended record is not swept up on the date
 // it would otherwise have expired.
 func TestExtensionSurvivesDisposal(t *testing.T) {
-	l := New()
+	l := fresh(t)
 	id, err := refuse(l, org, "tx-1", []string{"subject:p1"}, ago(6), "refused")
 	if err != nil {
 		t.Fatalf("refusal: %v", err)
@@ -701,7 +724,7 @@ func TestExtensionSurvivesDisposal(t *testing.T) {
 // TestWriteRefusals: what the ledger will not accept, because a record that
 // cannot answer for itself is not worth retaining.
 func TestWriteRefusals(t *testing.T) {
-	l := New()
+	l := fresh(t)
 	rel, err := open(l, org, "payments", []string{"subject:p1"}, ago(1))
 	if err != nil {
 		t.Fatalf("open: %v", err)
@@ -755,7 +778,7 @@ func TestWriteRefusals(t *testing.T) {
 
 // TestEachIsOrderedOldestFirst: a file produced from the ledger is reproducible.
 func TestEachIsOrderedOldestFirst(t *testing.T) {
-	l := New()
+	l := fresh(t)
 	for i, years := range []int{1, 4, 2, 3} {
 		if _, err := refuse(l, org, fmt.Sprint("tx-", i), []string{"subject:p1"}, ago(years), "refused"); err != nil {
 			t.Fatalf("refusal: %v", err)
@@ -782,7 +805,7 @@ func TestEachIsOrderedOldestFirst(t *testing.T) {
 // TestEachFiltersByClass: the class filter is a filter, and an empty one means
 // every class.
 func TestEachFiltersByClass(t *testing.T) {
-	l := New()
+	l := fresh(t)
 	if _, err := refuse(l, org, "tx-1", []string{"subject:p1"}, ago(1), "refused"); err != nil {
 		t.Fatalf("refusal: %v", err)
 	}
@@ -813,7 +836,7 @@ func TestEachFiltersByClass(t *testing.T) {
 
 // TestEachStopsOnError: a caller can abandon the walk, and the error is its own.
 func TestEachStopsOnError(t *testing.T) {
-	l := New()
+	l := fresh(t)
 	for i := range 3 {
 		if _, err := refuse(l, org, fmt.Sprint("tx-", i), []string{"subject:p1"}, ago(1), "refused"); err != nil {
 			t.Fatalf("refusal: %v", err)

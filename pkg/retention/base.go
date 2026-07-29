@@ -184,6 +184,11 @@ func (d durable) each(org string, c Class, visit func(Record) error) error {
 			}
 		}
 		last := rows[len(rows)-1]
+		if last.Id == id {
+			// The page did not move, so the next one would be this one again. A walk
+			// that cannot advance says so rather than never returning.
+			return fmt.Errorf("%w: a walk of %s stopped advancing at %s", ErrStore, org, id)
+		}
 		at, id = last.GetDateTime(fieldOccurred).Time(), last.Id
 	}
 }

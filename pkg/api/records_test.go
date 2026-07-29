@@ -82,6 +82,16 @@ func ingest(t *testing.T, h *Handler, body any) *httptest.ResponseRecorder {
 	return rec
 }
 
+// ledgerLen is how many records the handler's ledger holds.
+func ledgerLen(t *testing.T, h *Handler) int {
+	t.Helper()
+	held, err := h.Records.Len()
+	if err != nil {
+		t.Fatalf("ledger: %v", err)
+	}
+	return held
+}
+
 func only(t *testing.T, h *Handler, class retention.Class) retention.Record {
 	t.Helper()
 	var found []retention.Record
@@ -113,8 +123,8 @@ func TestIngestRefusesWithoutKeyMaterial(t *testing.T) {
 	}
 
 	// And nothing was stored on the way to refusing.
-	if h.Records.Len() != 0 {
-		t.Errorf("ledger holds %d records", h.Records.Len())
+	if held, err := h.Records.Len(); err != nil || held != 0 {
+		t.Errorf("ledger holds %d records (%v)", held, err)
 	}
 	if h.Alerts.Len() != 0 {
 		t.Errorf("alert store holds %d transactions", h.Alerts.Len())
@@ -466,8 +476,8 @@ func TestResolveRetainsTheDecision(t *testing.T) {
 	if got := h.Cases.Get(c.ID); got.Status == types.CaseClosed {
 		t.Fatal("a case closed without a retained decision")
 	}
-	if h.Records.Len() != 0 {
-		t.Errorf("an incomplete assessment was retained: %d records", h.Records.Len())
+	if held, err := h.Records.Len(); err != nil || held != 0 {
+		t.Errorf("an incomplete assessment was retained: %d records (%v)", held, err)
 	}
 
 	rec := resolve(map[string]any{
@@ -563,7 +573,7 @@ func TestSandboxReplaysTheEngineOverRetainedHistory(t *testing.T) {
 			t.Fatalf("ingest %v: status %d: %s", notional, rec.Code, rec.Body.String())
 		}
 	}
-	records, opened := h.Records.Len(), h.Cases.Len()
+	records, opened := ledgerLen(t, h), h.Cases.Len()
 
 	e, rec := send(http.MethodPost, "/v1/aml/rules/test", map[string]any{
 		"dsl":       "Tx.Notional >= 9000.0 && Tx.Notional < 10000.0",
@@ -601,8 +611,8 @@ func TestSandboxReplaysTheEngineOverRetainedHistory(t *testing.T) {
 	// A sandbox that can mutate live state is not a sandbox. The ingested 15000
 	// opened a case on the way in; the replay must not open another, nor retain
 	// anything, nor alert.
-	if h.Records.Len() != records {
-		t.Errorf("the replay changed the ledger: %d records, was %d", h.Records.Len(), records)
+	if held := ledgerLen(t, h); held != records {
+		t.Errorf("the replay changed the ledger: %d records, was %d", held, records)
 	}
 	if h.Cases.Len() != opened {
 		t.Errorf("the replay opened %d cases", h.Cases.Len()-opened)
@@ -657,8 +667,8 @@ func TestSandboxOverASampleDoesNotTouchTheRecordPlane(t *testing.T) {
 	if !report.From.IsZero() || !report.To.IsZero() {
 		t.Errorf("a sample claims the window %s..%s", report.From, report.To)
 	}
-	if h.Records.Len() != 0 {
-		t.Errorf("a sample replay wrote %d records", h.Records.Len())
+	if held := ledgerLen(t, h); held != 0 {
+		t.Errorf("a sample replay wrote %d records", held)
 	}
 }
 

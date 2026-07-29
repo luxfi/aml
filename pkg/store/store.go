@@ -34,8 +34,10 @@ package store
 import (
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/hanzoai/base/core"
+	"github.com/hanzoai/base/tools/types"
 	"github.com/hanzoai/dbx"
 )
 
@@ -153,11 +155,37 @@ func (k Kind) Count(app core.App) (int, error) {
 }
 
 func (k Kind) records(app core.App, filter, sort string, limit int, params dbx.Params) ([]*core.Record, error) {
-	out, err := app.FindRecordsByFilter(k.Name, filter, sort, limit, 0, params)
+	out, err := app.FindRecordsByFilter(k.Name, filter, sort, limit, 0, bind(params))
 	if err != nil {
 		return nil, fmt.Errorf("store: %s: %w", k.Name, err)
 	}
 	return out, nil
+}
+
+// bind puts the parameters in the form the store compares values in.
+//
+// A moment is the one that has to be converted. Dates are stored in a single fixed
+// layout and compared as text; a Go time bound straight into the filter arrives in
+// a different layout and compares as neither greater nor less than what it means.
+// Nothing errors — the query simply answers with the wrong rows, which for a walk
+// that pages by the last record seen is a page that never ends, and for an expiry
+// check is a record destroyed a year early or never at all. Converting here rather
+// than at each call site is what makes that unforgettable.
+func bind(params dbx.Params) dbx.Params {
+	for name, value := range params {
+		moment, ok := value.(time.Time)
+		if !ok {
+			continue
+		}
+		converted, err := types.ParseDateTime(moment)
+		if err != nil {
+			// ParseDateTime accepts every time.Time; a value it rejects would be a
+			// filter comparing against something that is not a moment at all.
+			continue
+		}
+		params[name] = converted
+	}
+	return params
 }
 
 // name is an index's full name, which is unique across collections because an
