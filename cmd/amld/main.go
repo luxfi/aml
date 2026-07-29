@@ -20,8 +20,10 @@ import (
 	"github.com/luxfi/aml/pkg/api"
 	"github.com/luxfi/aml/pkg/cases"
 	"github.com/luxfi/aml/pkg/engine"
+	"github.com/luxfi/aml/pkg/retention"
 	"github.com/luxfi/aml/pkg/rules"
 	"github.com/luxfi/aml/pkg/sanctions"
+	"github.com/luxfi/aml/pkg/token"
 	uiaml "github.com/luxfi/aml/ui"
 )
 
@@ -50,11 +52,26 @@ func main() {
 	alertStore := api.NewAlertStore()
 	sanctionsStore := api.NewSanctionsStore()
 
+	// The record plane. AML_TOKEN_KEY carries the KMS-held root that per-org
+	// tokenisation keys are derived from: 32 bytes or more, hex encoded. There is
+	// no default, so an instance without it reports itself unfit and refuses to
+	// process transactions it could not record — which is the right failure for a
+	// control whose whole job is to have kept the record.
+	records := retention.New()
+	keys := token.NewKeyring(token.Env("AML_TOKEN_KEY"))
+
 	handler := &api.Handler{
+		// The gateway authenticates the caller and sets X-Org-Id from the verified
+		// JWT owner claim, and this service is reachable only through it. That is an
+		// assumption about the deployment, so it is stated here rather than buried
+		// in a handler.
+		Identity:  api.TrustedProxyHeader("X-Org-Id"),
 		Engine:    eng,
 		Cases:     caseStore,
 		Alerts:    alertStore,
 		Sanctions: sanctionsStore,
+		Records:   records,
+		Keys:      keys,
 	}
 
 	app.OnServe().Bind(&hook.Handler[*core.ServeEvent]{
@@ -66,6 +83,9 @@ func main() {
 			// Wire SanctionsStore (Base-backed) and register refresh cron.
 			baseSanctionsStore := sanctions.NewBaseSanctionsStore(app)
 			sanctions.RefreshCron(app, baseSanctionsStore)
+
+			// Destroy records whose retention period has run out, daily.
+			retention.Cron(app, records)
 
 			handler.Register(se)
 

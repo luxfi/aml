@@ -1,10 +1,16 @@
 // Package api registers AML HTTP routes on a Base app.
-// All endpoints enforce X-Org-Id and require IAM auth.
+//
+// Every route resolves its tenant through the Handler's Identity and refuses the
+// request if it cannot. Nothing here reads a tenant from the request directly.
 package api
 
 import (
 	"encoding/json"
+	"errors"
+	"fmt"
+	"log"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
@@ -13,16 +19,30 @@ import (
 
 	"github.com/luxfi/aml/pkg/cases"
 	"github.com/luxfi/aml/pkg/engine"
+	"github.com/luxfi/aml/pkg/replay"
+	"github.com/luxfi/aml/pkg/retention"
 	"github.com/luxfi/aml/pkg/sanctions"
+	"github.com/luxfi/aml/pkg/token"
 	"github.com/luxfi/aml/pkg/types"
 )
 
 // Handler wires AML engine + case store + sanctions to HTTP routes.
 type Handler struct {
+	// Identity resolves which tenant a request is authenticated to act on.
+	// Without it no route will serve — see tenant.
+	Identity Identity
+
 	Engine    *engine.Engine
 	Cases     *cases.Store
 	Alerts    *AlertStore
 	Sanctions *SanctionsStore
+
+	// Records is the retained record plane. Ingest refuses without it: a
+	// transaction that cannot be recorded must not be processed.
+	Records *retention.Ledger
+	// Keys tokenises direct identifiers before they are retained, and opens
+	// sealed records for the reads that are entitled to them.
+	Keys *token.Keyring
 }
 
 // DefaultMaxAlerts is the default maximum number of transaction IDs in the alert store.
@@ -76,11 +96,20 @@ func (s *AlertStore) Add(txID string, alerts []types.Alert) {
 	}
 }
 
-// ByTx returns alerts for a transaction.
-func (s *AlertStore) ByTx(txID string) []types.Alert {
+// ByTx returns an org's alerts for a transaction. A transaction id is not a
+// secret and the store is shared, so the org is what scopes the read: without it
+// knowing an id in another org would be enough to read its alerts.
+func (s *AlertStore) ByTx(org, txID string) []types.Alert {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	return s.alerts[txID]
+
+	var out []types.Alert
+	for _, a := range s.alerts[txID] {
+		if a.OrgID == org {
+			out = append(out, a)
+		}
+	}
+	return out
 }
 
 // Len returns the number of transaction IDs in the store.
@@ -151,32 +180,134 @@ func (h *Handler) Register(se *core.ServeEvent) {
 	se.Router.GET("/v1/aml/transactions/{id}/alerts", h.getAlerts())
 	se.Router.GET("/v1/aml/cases", h.listCases())
 	se.Router.POST("/v1/aml/cases/{id}/events", h.addCaseEvent())
+	se.Router.POST("/v1/aml/cases/{id}/resolve", h.resolveCase())
 	se.Router.GET("/v1/aml/rules", h.listRules())
 	se.Router.POST("/v1/aml/rules/test", h.testRule())
+	se.Router.POST("/v1/aml/relationships", h.openRelationship())
+	se.Router.POST("/v1/aml/relationships/{id}/close", h.closeRelationship())
+	se.Router.POST("/v1/aml/relationships/search", h.searchRelationships())
 	se.Router.POST("/v1/aml/sanctions/search", h.searchSanctions())
 	se.Router.GET("/v1/aml/health", h.health())
 }
 
+// Identity resolves the tenant a request is authenticated to act on, or returns
+// an error if it is not authenticated.
+//
+// It is a seam rather than an implementation because this package must not be the
+// second place that decides what a valid credential is. The deployment supplies
+// one, and every route asks it the same question.
+type Identity func(*http.Request) (org string, err error)
+
+// ErrNoIdentity is returned when no Identity is configured.
+var ErrNoIdentity = errors.New("no identity configured, so no request can be attributed to a tenant")
+
+// TrustedProxyHeader resolves the tenant from a header written by an
+// authenticating proxy.
+//
+// This is only sound where the proxy authenticates the caller, sets this header
+// from the verified token, strips any client-supplied copy of it, and is the sole
+// route to this service. Where the service is directly reachable, the header is
+// an unauthenticated assertion and anyone can name any tenant — so this
+// constructor exists to make that assumption something a deployment states out
+// loud rather than something a reader has to infer from a comment.
+func TrustedProxyHeader(name string) Identity {
+	return func(r *http.Request) (string, error) {
+		if id := strings.TrimSpace(r.Header.Get(name)); id != "" {
+			return id, nil
+		}
+		return "", fmt.Errorf("header %s is absent, so the caller named no tenant", name)
+	}
+}
+
+// tenant returns the authenticated tenant for a request.
+//
+// With no Identity configured it refuses. A compliance product that falls back to
+// trusting a client-supplied tenant header is worse than one that will not serve:
+// the fallback answers every request with another tenant's records and looks
+// healthy doing it.
+func (h *Handler) tenant(e *core.RequestEvent) (string, error) {
+	if h.Identity == nil {
+		return "", ErrNoIdentity
+	}
+	org, err := h.Identity(e.Request)
+	if err != nil {
+		return "", err
+	}
+	if strings.TrimSpace(org) == "" {
+		return "", errors.New("identity resolved an empty tenant")
+	}
+	return org, nil
+}
+
+// refuse answers an unauthenticated request. The reason is logged for the
+// operator and not returned, so a caller cannot probe for which tenants exist.
+func refuse(e *core.RequestEvent, err error) error {
+	log.Printf("[aml] unauthenticated request to %s: %v", e.Request.URL.Path, err)
+	return fail(e, http.StatusUnauthorized, "unauthenticated")
+}
+
+func fail(e *core.RequestEvent, code int, message string) error {
+	return e.JSON(code, map[string]string{"error": message})
+}
+
+// unavailable is the answer when the record plane cannot take a record. The
+// reason is logged for the operator and not returned to the caller.
+func unavailable(e *core.RequestEvent, what string, err error) error {
+	log.Printf("[aml] %s: %v", what, err)
+	return fail(e, http.StatusServiceUnavailable, "record plane unavailable")
+}
+
+// health reports whether this instance can do its job, which is not the same as
+// whether it is running: an instance that cannot record a transaction must not
+// be sent one, so it reports itself unfit rather than accepting traffic it will
+// have to refuse one request at a time.
+//
+// With no org header it can only check that the plane is wired; with one it
+// checks that the org's key material is actually reachable.
 func (h *Handler) health() func(e *core.RequestEvent) error {
 	return func(e *core.RequestEvent) error {
-		return e.JSON(http.StatusOK, map[string]string{
-			"status": "ok",
-			"time":   time.Now().UTC().Format(time.RFC3339),
-		})
+		body := map[string]string{
+			"status":  "ok",
+			"records": "ok",
+			"time":    time.Now().UTC().Format(time.RFC3339),
+		}
+		code := http.StatusOK
+
+		switch {
+		case h.Records == nil || h.Keys == nil:
+			body["status"], body["records"] = "degraded", "not wired"
+			code = http.StatusServiceUnavailable
+		default:
+			if id, err := h.tenant(e); err == nil {
+				if _, err := h.vault(id); err != nil {
+					log.Printf("[aml] health: %v", err)
+					body["status"], body["records"] = "degraded", "no key material"
+					code = http.StatusServiceUnavailable
+				}
+			}
+		}
+		return e.JSON(code, body)
 	}
 }
 
 func (h *Handler) ingestTransaction() func(e *core.RequestEvent) error {
 	return func(e *core.RequestEvent) error {
-		orgID := e.Request.Header.Get("X-Org-Id")
-		if orgID == "" {
-			return e.JSON(http.StatusUnauthorized, map[string]string{"error": "missing X-Org-Id"})
+		orgID, err := h.tenant(e)
+		if err != nil {
+			return refuse(e, err)
 		}
 
-		var tx types.Transaction
-		if err := json.NewDecoder(e.Request.Body).Decode(&tx); err != nil {
-			return e.JSON(http.StatusBadRequest, map[string]string{"error": "invalid request body"})
+		// The relationship a transaction sits inside decides where its retention
+		// period starts, so it travels with the transaction rather than being
+		// guessed afterwards.
+		var in struct {
+			types.Transaction
+			Relationship string `json:"relationship"`
 		}
+		if err := json.NewDecoder(e.Request.Body).Decode(&in); err != nil {
+			return fail(e, http.StatusBadRequest, "invalid request body")
+		}
+		tx := in.Transaction
 		if tx.ID == "" {
 			tx.ID = uuid.NewString()
 		}
@@ -196,7 +327,24 @@ func (h *Handler) ingestTransaction() func(e *core.RequestEvent) error {
 			EntityType: types.EntityUser,
 		}
 
+		vault, err := h.vault(orgID)
+		if err != nil {
+			return unavailable(e, "ingest", err)
+		}
+
 		alerts, score, action := h.Engine.Evaluate(tx, entity)
+
+		// Record before answering. Nothing else is stored until the record is,
+		// so a failure here leaves no half-processed transaction behind.
+		record, err := h.retain(vault, tx, entity, in.Relationship, alerts, action)
+		switch {
+		case errors.Is(err, errNoParty):
+			return fail(e, http.StatusBadRequest, "transaction names no party to retain it under")
+		case errors.Is(err, retention.ErrRelationship):
+			return fail(e, http.StatusBadRequest, "unknown relationship")
+		case err != nil:
+			return unavailable(e, "retain transaction", err)
+		}
 
 		alertIDs := make([]string, len(alerts))
 		for i, a := range alerts {
@@ -204,10 +352,12 @@ func (h *Handler) ingestTransaction() func(e *core.RequestEvent) error {
 		}
 		h.Alerts.Add(tx.ID, alerts)
 
-		result := types.EvalResult{
-			Action:   action,
-			Score:    score,
-			AlertIDs: alertIDs,
+		result := struct {
+			types.EvalResult
+			Record string `json:"record"`
+		}{
+			EvalResult: types.EvalResult{Action: action, Score: score, AlertIDs: alertIDs},
+			Record:     record,
 		}
 
 		// On critical: auto-create case.
@@ -222,8 +372,11 @@ func (h *Handler) ingestTransaction() func(e *core.RequestEvent) error {
 
 func (h *Handler) getAlerts() func(e *core.RequestEvent) error {
 	return func(e *core.RequestEvent) error {
-		txID := e.Request.PathValue("id")
-		alerts := h.Alerts.ByTx(txID)
+		orgID, err := h.tenant(e)
+		if err != nil {
+			return refuse(e, err)
+		}
+		alerts := h.Alerts.ByTx(orgID, e.Request.PathValue("id"))
 		if alerts == nil {
 			alerts = []types.Alert{}
 		}
@@ -233,7 +386,10 @@ func (h *Handler) getAlerts() func(e *core.RequestEvent) error {
 
 func (h *Handler) listCases() func(e *core.RequestEvent) error {
 	return func(e *core.RequestEvent) error {
-		orgID := e.Request.Header.Get("X-Org-Id")
+		orgID, err := h.tenant(e)
+		if err != nil {
+			return refuse(e, err)
+		}
 		status := e.Request.URL.Query().Get("status")
 		result := h.Cases.List(orgID, status)
 		if result == nil {
@@ -243,20 +399,91 @@ func (h *Handler) listCases() func(e *core.RequestEvent) error {
 	}
 }
 
+// caseOf resolves a case within the caller's org. A case id is not a secret, so
+// the org is what decides whether the caller may see it.
+func (h *Handler) caseOf(e *core.RequestEvent) (*types.Case, string, error) {
+	orgID, err := h.tenant(e)
+	if err != nil {
+		return nil, "", refuse(e, err)
+	}
+	c := h.Cases.Get(e.Request.PathValue("id"))
+	if c == nil || c.OrgID != orgID {
+		return nil, "", fail(e, http.StatusNotFound, "no such case")
+	}
+	return c, orgID, nil
+}
+
 func (h *Handler) addCaseEvent() func(e *core.RequestEvent) error {
 	return func(e *core.RequestEvent) error {
-		caseID := e.Request.PathValue("id")
+		c, _, err := h.caseOf(e)
+		if err != nil {
+			return err
+		}
 
 		var evt types.CaseEvent
 		if err := json.NewDecoder(e.Request.Body).Decode(&evt); err != nil {
-			return e.JSON(http.StatusBadRequest, map[string]string{"error": "invalid request body"})
+			return fail(e, http.StatusBadRequest, "invalid request body")
 		}
-
-		if err := h.Cases.AddEvent(caseID, evt); err != nil {
-			return e.JSON(http.StatusNotFound, map[string]string{"error": err.Error()})
+		if err := h.Cases.AddEvent(c.ID, evt); err != nil {
+			return fail(e, http.StatusNotFound, err.Error())
 		}
-
 		return e.JSON(http.StatusCreated, map[string]string{"status": "ok"})
+	}
+}
+
+// resolution is a decision to close a case, and it carries what Art. 69(2)
+// requires of one.
+type resolution struct {
+	Resolution string   `json:"resolution"`
+	Considered []string `json:"considered"`
+	Rationale  string   `json:"rationale"`
+	By         string   `json:"by"`
+}
+
+// resolveCase closes a case against a retained assessment.
+//
+// The assessment is written first and the case is closed against its id, so a
+// case cannot be closed without a retained decision — which is the requirement
+// most systems miss. A dismissed alert is a retained decision with its rationale
+// (AMLR Art. 77(1)(b); JMLSG 6.32), not a deleted row.
+func (h *Handler) resolveCase() func(e *core.RequestEvent) error {
+	return func(e *core.RequestEvent) error {
+		c, orgID, err := h.caseOf(e)
+		if err != nil {
+			return err
+		}
+
+		var in resolution
+		if err := json.NewDecoder(e.Request.Body).Decode(&in); err != nil {
+			return fail(e, http.StatusBadRequest, "invalid request body")
+		}
+		if in.Resolution == "" {
+			return fail(e, http.StatusBadRequest, "resolution is required")
+		}
+
+		vault, err := h.vault(orgID)
+		if err != nil {
+			return unavailable(e, "resolve case", err)
+		}
+
+		assessment, err := h.assess(vault, orgID, c, in)
+		switch {
+		case errors.Is(err, retention.ErrAssessment):
+			return fail(e, http.StatusBadRequest, err.Error())
+		case errors.Is(err, errNoParty):
+			return fail(e, http.StatusBadRequest, "case names no party to retain the decision under")
+		case err != nil:
+			return unavailable(e, "retain assessment", err)
+		}
+
+		if err := h.Cases.Resolve(c.ID, in.Resolution, in.By, assessment); err != nil {
+			return fail(e, http.StatusBadRequest, err.Error())
+		}
+		return e.JSON(http.StatusOK, map[string]string{
+			"case":       c.ID,
+			"resolution": in.Resolution,
+			"assessment": assessment,
+		})
 	}
 }
 
@@ -273,10 +500,10 @@ func (h *Handler) searchSanctions() func(e *core.RequestEvent) error {
 			DOB  string `json:"dob"`
 		}
 		if err := json.NewDecoder(e.Request.Body).Decode(&req); err != nil {
-			return e.JSON(http.StatusBadRequest, map[string]string{"error": "invalid request body"})
+			return fail(e, http.StatusBadRequest, "invalid request body")
 		}
 		if req.Name == "" {
-			return e.JSON(http.StatusBadRequest, map[string]string{"error": "name is required"})
+			return fail(e, http.StatusBadRequest, "name is required")
 		}
 
 		if h.Sanctions == nil {
@@ -316,42 +543,220 @@ func (h *Handler) searchSanctions() func(e *core.RequestEvent) error {
 // maxDSLLength is the maximum allowed DSL expression length (RED-15).
 const maxDSLLength = 2048
 
+// testRule replays a candidate rule over history before anyone activates it.
+//
+// JMLSG 5.7.18 requires the functionality; FCG 3.2.5A requires a retirement to be
+// justified against the outgoing rule's performance, which is why an incumbent can
+// be named and the report carries the difference. With no sample the replay runs
+// over the org's retained transactions; a sample replaces the history rather than
+// adding to it, so an author can try an expression without touching the record
+// plane. Either way nothing is written.
 func (h *Handler) testRule() func(e *core.RequestEvent) error {
 	return func(e *core.RequestEvent) error {
+		orgID, err := h.tenant(e)
+		if err != nil {
+			return refuse(e, err)
+		}
+
 		var req struct {
-			DSL    string            `json:"dsl"`
-			Tx     types.Transaction `json:"tx"`
-			Entity types.Entity      `json:"entity"`
+			DSL       string         `json:"dsl"`
+			Incumbent string         `json:"incumbent"`
+			Sample    []replay.Event `json:"sample"`
 		}
 		if err := json.NewDecoder(e.Request.Body).Decode(&req); err != nil {
-			return e.JSON(http.StatusBadRequest, map[string]string{"error": "invalid request body"})
+			return fail(e, http.StatusBadRequest, "invalid request body")
 		}
 
 		// RED-15: Reject oversized DSL to prevent DoS via computation bombs.
 		if len(req.DSL) > maxDSLLength {
-			return e.JSON(http.StatusBadRequest, map[string]string{
-				"error": "DSL expression exceeds maximum length of 2048 bytes",
-			})
+			return fail(e, http.StatusBadRequest, "DSL expression exceeds maximum length of 2048 bytes")
+		}
+		if len(req.Sample) > maxSample {
+			return fail(e, http.StatusBadRequest, "sample exceeds maximum of 1000 events")
 		}
 
-		testRule := types.Rule{
-			ID:      "test",
-			Name:    "test",
-			DSL:     req.DSL,
-			Enabled: true,
+		var incumbent *types.Rule
+		if req.Incumbent != "" {
+			for _, r := range h.Engine.Rules() {
+				if r.ID == req.Incumbent {
+					found := r
+					incumbent = &found
+					break
+				}
+			}
+			if incumbent == nil {
+				return fail(e, http.StatusBadRequest, "no such rule to replace")
+			}
 		}
 
-		match, err := h.Engine.Evaluator().Eval(testRule, types.EvalContext{
-			Tx:     req.Tx,
-			Entity: req.Entity,
+		var history replay.History = replay.Slice(req.Sample)
+		if len(req.Sample) == 0 {
+			vault, err := h.vault(orgID)
+			if err != nil {
+				return unavailable(e, "replay", err)
+			}
+			stored, err := h.history(orgID, vault)
+			if err != nil {
+				return unavailable(e, "read history", err)
+			}
+			history = stored
+		}
+
+		candidate := types.Rule{ID: "candidate", Name: "candidate", DSL: req.DSL}
+		report, err := replay.Run(h.Engine.Evaluator(), history, candidate, incumbent)
+		switch {
+		case errors.Is(err, replay.ErrEmpty):
+			return fail(e, http.StatusConflict, "no history to replay against")
+		case errors.Is(err, replay.ErrNoRule):
+			return fail(e, http.StatusBadRequest, "dsl is required")
+		case errors.Is(err, replay.ErrEval):
+			return fail(e, http.StatusBadRequest, err.Error())
+		case err != nil:
+			return unavailable(e, "replay", err)
+		}
+		return e.JSON(http.StatusOK, report)
+	}
+}
+
+// openRelationship records the start of a business relationship, whose retention
+// period runs from the end of it (AMLR Art. 77(3)).
+func (h *Handler) openRelationship() func(e *core.RequestEvent) error {
+	return func(e *core.RequestEvent) error {
+		orgID, err := h.tenant(e)
+		if err != nil {
+			return refuse(e, err)
+		}
+
+		var in struct {
+			// Ref is the firm's own reference. It is retained in the clear, so it
+			// must be a synthetic reference and not a direct identifier.
+			Ref     string    `json:"ref"`
+			Nature  string    `json:"nature"`
+			Opened  time.Time `json:"opened"`
+			UserID  string    `json:"user_id"`
+			Name    string    `json:"name"`
+			Account string    `json:"account_id"`
+			Wallet  string    `json:"wallet"`
+		}
+		if err := json.NewDecoder(e.Request.Body).Decode(&in); err != nil {
+			return fail(e, http.StatusBadRequest, "invalid request body")
+		}
+		if in.Opened.IsZero() {
+			in.Opened = time.Now().UTC()
+		}
+
+		vault, err := h.vault(orgID)
+		if err != nil {
+			return unavailable(e, "open relationship", err)
+		}
+		party, err := parties(vault, map[token.Domain]string{
+			token.DomainSubject: in.UserID,
+			token.DomainName:    in.Name,
+			token.DomainAccount: in.Account,
+			token.DomainWallet:  in.Wallet,
 		})
 		if err != nil {
-			return e.JSON(http.StatusBadRequest, map[string]string{"error": err.Error()})
+			return fail(e, http.StatusBadRequest, "relationship names no party")
 		}
 
-		return e.JSON(http.StatusOK, map[string]interface{}{
-			"match": match,
-			"dsl":   req.DSL,
+		body, err := seal(vault, retention.ClassRelationship, in.Ref, in)
+		if err != nil {
+			return unavailable(e, "seal relationship", err)
+		}
+
+		id, err := h.Records.Retain(retention.Record{
+			Org:      orgID,
+			Class:    retention.ClassRelationship,
+			Trigger:  retention.TriggerRelationshipEnd,
+			Ref:      in.Ref,
+			Nature:   in.Nature,
+			Parties:  party,
+			Occurred: in.Opened,
+			Body:     body,
 		})
+		switch {
+		case errors.Is(err, retention.ErrNature):
+			return fail(e, http.StatusBadRequest, "nature is required")
+		case err != nil:
+			return unavailable(e, "retain relationship", err)
+		}
+		return e.JSON(http.StatusCreated, map[string]string{"relationship": id})
+	}
+}
+
+// closeRelationship ends a relationship, which starts the retention clock on it
+// and on everything retained inside it.
+func (h *Handler) closeRelationship() func(e *core.RequestEvent) error {
+	return func(e *core.RequestEvent) error {
+		orgID, err := h.tenant(e)
+		if err != nil {
+			return refuse(e, err)
+		}
+		if h.Records == nil {
+			return unavailable(e, "close relationship", errNoRecords)
+		}
+
+		var in struct {
+			Ended time.Time `json:"ended"`
+		}
+		if err := json.NewDecoder(e.Request.Body).Decode(&in); err != nil {
+			return fail(e, http.StatusBadRequest, "invalid request body")
+		}
+		if in.Ended.IsZero() {
+			in.Ended = time.Now().UTC()
+		}
+
+		started, err := h.Records.Close(orgID, e.Request.PathValue("id"), in.Ended)
+		switch {
+		case errors.Is(err, retention.ErrRelationship):
+			return fail(e, http.StatusNotFound, "no such relationship")
+		case errors.Is(err, retention.ErrClosed), errors.Is(err, retention.ErrOccurred):
+			return fail(e, http.StatusBadRequest, err.Error())
+		case err != nil:
+			return unavailable(e, "close relationship", err)
+		}
+		return e.JSON(http.StatusOK, map[string]int{"clocks_started": started})
+	}
+}
+
+// searchRelationships answers AMLR Art. 78: whether a business relationship with
+// a named person is or was maintained in the prior five years, and its nature.
+// The name is tokenised and the answer comes from the party index, so it is an
+// index lookup rather than a scan — which is what "fully and speedily" needs.
+func (h *Handler) searchRelationships() func(e *core.RequestEvent) error {
+	return func(e *core.RequestEvent) error {
+		orgID, err := h.tenant(e)
+		if err != nil {
+			return refuse(e, err)
+		}
+
+		var in struct {
+			Party  string       `json:"party"`
+			Domain token.Domain `json:"domain"`
+		}
+		if err := json.NewDecoder(e.Request.Body).Decode(&in); err != nil {
+			return fail(e, http.StatusBadRequest, "invalid request body")
+		}
+		if in.Party == "" {
+			return fail(e, http.StatusBadRequest, "party is required")
+		}
+		if in.Domain == "" {
+			in.Domain = token.DomainName
+		}
+
+		vault, err := h.vault(orgID)
+		if err != nil {
+			return unavailable(e, "relationship search", err)
+		}
+		pseudonym, err := vault.Pseudonym(in.Domain, in.Party)
+		if err != nil {
+			return fail(e, http.StatusBadRequest, err.Error())
+		}
+
+		answer, err := h.Records.Lookback(retention.PurposeDisclosure, orgID, pseudonym, time.Now().UTC())
+		if err != nil {
+			return unavailable(e, "relationship search", err)
+		}
+		return e.JSON(http.StatusOK, answer)
 	}
 }
