@@ -1,0 +1,17 @@
+# The image build reads go.mod/go.sum, the Go sources, and ui/. Everything else
+# only inflates the context — 332 MB down to a few MB — and keeps local build
+# output and the git history from ever reaching a layer.
+.git
+.github
+amld
+/dist/
+/data/
+THIRD-PARTY-NOTICES
+ui/node_modules
+ui/dist
+ui/tsconfig.tsbuildinfo
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+.env

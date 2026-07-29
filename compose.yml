@@ -1,0 +1,14 @@
+services:
+  amld:
+    build: .
+    container_name: amld
+    ports:
+      - "8090:8090"
+    volumes:
+      - aml-data:/data
+    environment:
+      AML_DEFAULT_ORG: ${AML_DEFAULT_ORG:-default}
+    restart: unless-stopped
+
+volumes:
+  aml-data:
