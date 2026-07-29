@@ -20,9 +20,11 @@ import (
 	"github.com/luxfi/aml/pkg/anomaly"
 	"github.com/luxfi/aml/pkg/cases"
 	"github.com/luxfi/aml/pkg/engine"
+	"github.com/luxfi/aml/pkg/history"
 	"github.com/luxfi/aml/pkg/replay"
 	"github.com/luxfi/aml/pkg/retention"
 	"github.com/luxfi/aml/pkg/sanctions"
+	"github.com/luxfi/aml/pkg/screen"
 	"github.com/luxfi/aml/pkg/token"
 	"github.com/luxfi/aml/pkg/types"
 	"github.com/luxfi/aml/pkg/velocity"
@@ -34,10 +36,20 @@ type Handler struct {
 	// Without it no route will serve — see tenant.
 	Identity Identity
 
-	Engine    *engine.Engine
-	Cases     *cases.Store
-	Alerts    *AlertStore
-	Sanctions *SanctionsStore
+	Engine *engine.Engine
+	Cases  *cases.Store
+	Alerts *AlertStore
+	// Screen is the screening store the refresh fills and every endpoint reads.
+	// There is deliberately no second store here: two of them is how sanctions
+	// search came to answer "no match" for every name while designations were
+	// being loaded somewhere else.
+	Screen *screen.Store
+	// History is the retained transaction history the aggregate rules read.
+	History *history.Base
+	// Rate converts an amount to USD, refusing an unknown currency rather than
+	// passing it through — a threshold in USD is wrong by the exchange rate if
+	// the conversion silently does nothing.
+	Rate engine.Rate
 
 	// Records is the retained record plane. Ingest refuses without it: a
 	// transaction that cannot be recorded must not be processed.
@@ -45,10 +57,9 @@ type Handler struct {
 	// Keys tokenises direct identifiers before they are retained, and opens
 	// sealed records for the reads that are entitled to them.
 	Keys *token.Keyring
-	// Screening reports whether each sanctions list is fit to screen against.
-	// Without it /v1/aml/sanctions/sources cannot answer, and an empty list
-	// cannot be told apart from a clean party.
-	Screening *sanctions.Monitor
+	// Readiness reports which sanctions list is fit to screen against, with a
+	// count and a date. Without it an empty list cannot be told from a clean party.
+	Readiness *screen.Readiness
 
 	// Velocity holds the sliding aggregates every behavioural measure reads.
 	// Ingest is the only writer, so what an alert quotes and what the model
@@ -155,60 +166,6 @@ func (s *AlertStore) Len() int {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return len(s.alerts)
-}
-
-// SanctionsStore is a minimal in-memory sanctions entry store.
-type SanctionsStore struct {
-	mu      sync.RWMutex
-	entries []types.SanctionsEntry
-}
-
-// NewSanctionsStore creates an empty sanctions store.
-func NewSanctionsStore() *SanctionsStore {
-	return &SanctionsStore{}
-}
-
-// Load replaces all entries.
-func (s *SanctionsStore) Load(entries []types.SanctionsEntry) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.entries = entries
-}
-
-// Search finds entries matching the given name above the threshold.
-func (s *SanctionsStore) Search(name string, threshold float64) []sanctionSearchResult {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
-	var results []sanctionSearchResult
-	for _, e := range s.entries {
-		score := sanctions.TokenMatch(name, e.Name)
-		if score >= threshold {
-			results = append(results, sanctionSearchResult{
-				Entry: e,
-				Score: score,
-			})
-			continue
-		}
-		// Check aliases.
-		for _, alias := range e.Aliases {
-			aliasScore := sanctions.TokenMatch(name, alias)
-			if aliasScore >= threshold && aliasScore > score {
-				score = aliasScore
-				results = append(results, sanctionSearchResult{
-					Entry: e,
-					Score: score,
-				})
-				break
-			}
-		}
-	}
-	return results
-}
-
-type sanctionSearchResult struct {
-	Entry types.SanctionsEntry
-	Score float64
 }
 
 // Register adds AML routes to a ServeEvent router.
@@ -365,7 +322,18 @@ func (h *Handler) ingestTransaction() func(e *core.RequestEvent) error {
 		// aggregates, the near-threshold counters and every ratio the model reads
 		// are all in this unit, so accepting one would hand the submitter control
 		// of what counts as just under a reporting limit.
-		tx.USD = engine.USD(tx.Notional, tx.Currency)
+		if h.Rate == nil {
+			return fail(e, http.StatusServiceUnavailable, "no conversion is configured, so no threshold can be applied")
+		}
+		usd, err := h.Rate.USD(e.Request.Context(), tx.Notional, tx.Currency)
+		if err != nil {
+			// Refusing is the only safe answer. Passing the amount through unchanged
+			// understates every currency worth more than a dollar, so a payment three
+			// times over a reporting limit tests as sitting under it.
+			log.Printf("[aml] conversion refused for %s: %v", tx.ID, err)
+			return fail(e, http.StatusBadRequest, "currency cannot be converted, so no threshold can be applied to it")
+		}
+		tx.USD = usd
 
 		// Aggregate before evaluating. The rule plane and the model both read
 		// these windows, so a transaction has to be in them before it is judged
@@ -391,7 +359,7 @@ func (h *Handler) ingestTransaction() func(e *core.RequestEvent) error {
 			return unavailable(e, "ingest", err)
 		}
 
-		alerts, score, action := h.Engine.Evaluate(tx, entity)
+		alerts, score, action := h.Engine.Evaluate(e.Request.Context(), tx, entity)
 
 		// Record before answering. Nothing else is stored until the record is,
 		// so a failure here leaves no half-processed transaction behind.
@@ -565,34 +533,50 @@ func (h *Handler) searchSanctions() func(e *core.RequestEvent) error {
 			return fail(e, http.StatusBadRequest, "name is required")
 		}
 
-		if h.Sanctions == nil {
-			return e.JSON(http.StatusOK, []interface{}{})
+		if h.Screen == nil {
+			return fail(e, http.StatusServiceUnavailable, "screening is not wired")
+		}
+		// An unfit list set cannot produce a clean answer, so it does not produce an
+		// answer at all. Returning an empty result here is a false negative with a
+		// 200 on it.
+		if err := h.Screen.Ready(); err != nil {
+			log.Printf("[aml] screening refused: %v", err)
+			return fail(e, http.StatusServiceUnavailable, "screening is not ready")
 		}
 
-		results := h.Sanctions.Search(req.Name, sanctions.MatchThreshold)
-
-		type entry struct {
-			ID          string   `json:"id"`
-			ListID      string   `json:"list_id"`
-			Name        string   `json:"name"`
-			Aliases     []string `json:"aliases,omitempty"`
-			DOB         string   `json:"dob,omitempty"`
-			Nationality string   `json:"nationality,omitempty"`
-			Type        string   `json:"type"`
-			Score       float64  `json:"score"`
+		results, err := h.Screen.Search(sanctions.Query{Name: req.Name}, sanctions.Threshold)
+		if err != nil {
+			return fail(e, http.StatusBadRequest, err.Error())
 		}
 
-		out := make([]entry, 0, len(results))
-		for _, r := range results {
-			out = append(out, entry{
-				ID:          r.Entry.ID,
-				ListID:      r.Entry.ListID,
-				Name:        r.Entry.Name,
-				Aliases:     r.Entry.Aliases,
-				DOB:         r.Entry.DOB,
-				Nationality: r.Entry.Nationality,
-				Type:        r.Entry.Type,
-				Score:       r.Score,
+		// The response carries why the hit matched and what corroborated or
+		// contradicted it, not just a score. A score alone cannot be cleared: the
+		// question an analyst has to answer is whether this is the same person, and
+		// that is decided on the identifiers that agree and disagree.
+		type hit struct {
+			List     string   `json:"list"`
+			RefID    string   `json:"ref_id"`
+			Name     string   `json:"name"`
+			Kind     string   `json:"kind"`
+			Score    float64  `json:"score"`
+			Reason   string   `json:"reason"`
+			Agree    []string `json:"agree,omitempty"`
+			Conflict []string `json:"conflict,omitempty"`
+			Programs []string `json:"programs,omitempty"`
+		}
+
+		out := make([]hit, 0, len(results))
+		for _, m := range results {
+			out = append(out, hit{
+				List:     m.Entry.List,
+				RefID:    m.Entry.RefID,
+				Name:     m.Name.Full,
+				Kind:     m.Entry.Kind,
+				Score:    m.Score,
+				Reason:   m.Reason,
+				Agree:    m.Agree,
+				Conflict: m.Conflict,
+				Programs: m.Entry.Programs,
 			})
 		}
 		return e.JSON(http.StatusOK, out)
@@ -662,7 +646,7 @@ func (h *Handler) testRule() func(e *core.RequestEvent) error {
 		}
 
 		candidate := types.Rule{ID: "candidate", Name: "candidate", DSL: req.DSL}
-		report, err := replay.Run(h.Engine.Evaluator(), history, candidate, incumbent)
+		report, err := replay.Run(e.Request.Context(), h.Engine.Evaluator(), history, candidate, incumbent)
 		switch {
 		case errors.Is(err, replay.ErrEmpty):
 			return fail(e, http.StatusConflict, "no history to replay against")

@@ -2,6 +2,7 @@ package replay
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -19,13 +20,13 @@ type evaluator struct {
 	fire func(types.Rule, types.EvalContext) (bool, error)
 }
 
-func (e evaluator) EvalAll(rules []types.Rule, ctx types.EvalContext) []types.RuleHit {
+func (e evaluator) EvalAll(_ context.Context, rules []types.Rule, tx types.Transaction, ent types.Entity) []types.RuleHit {
 	var hits []types.RuleHit
 	for _, r := range rules {
 		if !r.Enabled {
 			continue
 		}
-		ok, err := e.fire(r, ctx)
+		ok, err := e.fire(r, types.EvalContext{Tx: tx, Entity: ent})
 		if err != nil {
 			hits = append(hits, types.RuleHit{Rule: r, Match: true, EvalErr: err.Error()})
 			continue
@@ -83,7 +84,7 @@ func TestEmptyHistoryIsRefused(t *testing.T) {
 		"nil slice":   Slice(nil),
 		"empty slice": Slice{},
 	} {
-		report, err := Run(above(), h, rule("cand", "notional > 100"), nil)
+		report, err := Run(context.Background(), above(), h, rule("cand", "notional > 100"), nil)
 		if !errors.Is(err, ErrEmpty) {
 			t.Errorf("%s: err = %v, want ErrEmpty", name, err)
 		}
@@ -98,7 +99,7 @@ func TestEmptyHistoryIsRefused(t *testing.T) {
 func TestQuietRuleOverRealHistoryIsNotAnError(t *testing.T) {
 	h := Slice{event("tx-1", 10, Unjudged), event("tx-2", 20, Unjudged)}
 
-	report, err := Run(above(), h, rule("cand", "notional > 1000000"), nil)
+	report, err := Run(context.Background(), above(), h, rule("cand", "notional > 1000000"), nil)
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
@@ -115,19 +116,19 @@ func TestRefusesWithoutItsParts(t *testing.T) {
 	h := Slice{event("tx-1", 10, Unjudged)}
 	good := rule("cand", "notional > 5")
 
-	if _, err := Run(nil, h, good, nil); !errors.Is(err, ErrNoEvaluator) {
+	if _, err := Run(context.Background(), nil, h, good, nil); !errors.Is(err, ErrNoEvaluator) {
 		t.Errorf("no evaluator: err = %v", err)
 	}
-	if _, err := Run(above(), nil, good, nil); !errors.Is(err, ErrNoHistory) {
+	if _, err := Run(context.Background(), above(), nil, good, nil); !errors.Is(err, ErrNoHistory) {
 		t.Errorf("no history: err = %v", err)
 	}
 	for _, dsl := range []string{"", "   ", "\t\n"} {
-		if _, err := Run(above(), h, rule("cand", dsl), nil); !errors.Is(err, ErrNoRule) {
+		if _, err := Run(context.Background(), above(), h, rule("cand", dsl), nil); !errors.Is(err, ErrNoRule) {
 			t.Errorf("candidate DSL %q: err = %v, want ErrNoRule", dsl, err)
 		}
 	}
 	blank := rule("old", "")
-	if _, err := Run(above(), h, good, &blank); !errors.Is(err, ErrNoRule) {
+	if _, err := Run(context.Background(), above(), h, good, &blank); !errors.Is(err, ErrNoRule) {
 		t.Errorf("incumbent with no DSL: err = %v, want ErrNoRule", err)
 	}
 }
@@ -140,7 +141,7 @@ func TestCountsAlertsAndWhatTheyFellOn(t *testing.T) {
 		event("tx-3", 11000, Unjudged),
 	}
 
-	report, err := Run(above(), h, rule("ctr", "notional > 10000"), nil)
+	report, err := Run(context.Background(), above(), h, rule("ctr", "notional > 10000"), nil)
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
@@ -166,7 +167,7 @@ func TestCandidateIsEvaluatedAsActivated(t *testing.T) {
 	incumbent := rule("old", "notional > 9000")
 	incumbent.Enabled = false
 
-	report, err := Run(above(), h, candidate, &incumbent)
+	report, err := Run(context.Background(), above(), h, candidate, &incumbent)
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
@@ -201,7 +202,7 @@ func TestDeltaAgainstTheRuleItReplaces(t *testing.T) {
 	candidate := rule("new", "typology a")
 	incumbent := rule("old", "typology b")
 
-	report, err := Run(which, h, candidate, &incumbent)
+	report, err := Run(context.Background(), which, h, candidate, &incumbent)
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
@@ -230,7 +231,7 @@ func TestDeltaAgainstTheRuleItReplaces(t *testing.T) {
 func TestNoDeltaWithoutAnIncumbent(t *testing.T) {
 	h := Slice{event("tx-1", 15000, Unjudged)}
 
-	report, err := Run(above(), h, rule("ctr", "notional > 10000"), nil)
+	report, err := Run(context.Background(), above(), h, rule("ctr", "notional > 10000"), nil)
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
@@ -253,7 +254,7 @@ func TestProportionsAreMeasuredOrAbsent(t *testing.T) {
 		event("f", 100, Productive), // does not alert, so does not count
 	}
 
-	report, err := Run(above(), judged, rule("ctr", "notional > 10000"), nil)
+	report, err := Run(context.Background(), above(), judged, rule("ctr", "notional > 10000"), nil)
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
@@ -272,7 +273,7 @@ func TestProportionsAreMeasuredOrAbsent(t *testing.T) {
 	}
 
 	unjudged := Slice{event("a", 15000, Unjudged), event("b", 15000, Unjudged)}
-	report, err = Run(above(), unjudged, rule("ctr", "notional > 10000"), nil)
+	report, err = Run(context.Background(), above(), unjudged, rule("ctr", "notional > 10000"), nil)
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
@@ -305,7 +306,7 @@ func TestEvaluationErrorRefusesTheRun(t *testing.T) {
 		event("tx-2", 15000, Unjudged),
 	}
 
-	report, err := Run(above(), h, rule("broken", "this is not a threshold"), nil)
+	report, err := Run(context.Background(), above(), h, rule("broken", "this is not a threshold"), nil)
 	if !errors.Is(err, ErrEval) {
 		t.Fatalf("err = %v, want ErrEval", err)
 	}
@@ -315,7 +316,7 @@ func TestEvaluationErrorRefusesTheRun(t *testing.T) {
 
 	// The same for the incumbent: half a comparison is not a comparison.
 	broken := rule("brokenOld", "not a threshold either")
-	if _, err := Run(above(), h, rule("ctr", "notional > 10000"), &broken); !errors.Is(err, ErrEval) {
+	if _, err := Run(context.Background(), above(), h, rule("ctr", "notional > 10000"), &broken); !errors.Is(err, ErrEval) {
 		t.Errorf("broken incumbent: err = %v, want ErrEval", err)
 	}
 }
@@ -330,7 +331,7 @@ func TestObservedComesFromHistory(t *testing.T) {
 	}
 
 	incumbent := rule("old", "notional > 10000")
-	report, err := Run(above(), h, rule("new", "notional > 12000"), &incumbent)
+	report, err := Run(context.Background(), above(), h, rule("new", "notional > 12000"), &incumbent)
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
@@ -352,7 +353,7 @@ func TestWindowSpansTheHistory(t *testing.T) {
 		{Tx: types.Transaction{ID: "a", Notional: 15000, Timestamp: first}},
 	}
 
-	report, err := Run(above(), h, rule("ctr", "notional > 10000"), nil)
+	report, err := Run(context.Background(), above(), h, rule("ctr", "notional > 10000"), nil)
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
@@ -362,7 +363,7 @@ func TestWindowSpansTheHistory(t *testing.T) {
 
 	// A sample with no timestamps has no window, and says so.
 	sample := Slice{{Tx: types.Transaction{ID: "synthetic", Notional: 15000}}}
-	report, err = Run(above(), sample, rule("ctr", "notional > 10000"), nil)
+	report, err = Run(context.Background(), above(), sample, rule("ctr", "notional > 10000"), nil)
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
@@ -384,7 +385,7 @@ func TestHistoryIsUnchanged(t *testing.T) {
 	}
 
 	incumbent := rule("old", "notional > 9000")
-	if _, err := Run(above(), h, rule("new", "notional > 10000"), &incumbent); err != nil {
+	if _, err := Run(context.Background(), above(), h, rule("new", "notional > 10000"), &incumbent); err != nil {
 		t.Fatalf("Run: %v", err)
 	}
 
@@ -405,7 +406,7 @@ func TestListsAreBoundedAndCountsAreNot(t *testing.T) {
 		h[i] = event(fmt.Sprintf("tx-%d", i), 15000, Unjudged)
 	}
 
-	report, err := Run(above(), h, rule("ctr", "notional > 10000"), nil)
+	report, err := Run(context.Background(), above(), h, rule("ctr", "notional > 10000"), nil)
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
@@ -421,7 +422,7 @@ func TestListsAreBoundedAndCountsAreNot(t *testing.T) {
 // history, and the difference must not be swallowed.
 func TestHistoryErrorSurfaces(t *testing.T) {
 	unreadable := errors.New("sealed record does not open")
-	report, err := Run(above(), broken{unreadable}, rule("ctr", "notional > 10000"), nil)
+	report, err := Run(context.Background(), above(), broken{unreadable}, rule("ctr", "notional > 10000"), nil)
 	if !errors.Is(err, unreadable) {
 		t.Fatalf("err = %v, want the history's own error", err)
 	}

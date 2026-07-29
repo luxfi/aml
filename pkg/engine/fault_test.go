@@ -1,96 +1,107 @@
 package engine
 
 import (
-	"strings"
+	"context"
 	"testing"
+	"time"
 
 	"github.com/luxfi/aml/pkg/types"
 )
 
-// broken is a rule whose expression cannot evaluate, standing in for the real
-// cause: a helper backed by a store that is unreachable, which fails identically
-// on every transaction.
-func broken(id string) types.Rule {
+// A rule the deployment can evaluate, whose evidence exists.
+func scored(id, dsl string) types.Rule {
 	return types.Rule{
-		ID: id, Name: "broken-" + id,
-		DSL:      `no_such_helper(tx.Notional)`,
-		Enabled:  true, Severity: types.SeverityHigh,
-		Weight:   1,
-		Action:   types.ActionReview,
-		Priority: 1,
+		ID: id, Name: "rule-" + id, DSL: dsl,
+		Enabled: true, Severity: types.SeverityMedium,
+		Weight: 1, Action: types.ActionReview, Priority: 1,
 	}
 }
 
-func working(id, dsl string) types.Rule {
-	return types.Rule{
-		ID: id, Name: "working-" + id,
-		DSL:      dsl,
-		Enabled:  true, Severity: types.SeverityMedium,
-		Weight:   1,
-		Action:   types.ActionReview,
-		Priority: 1,
+// faulting builds an engine whose rules are admitted but fail at evaluation time.
+//
+// This is the real failure, not a contrived one: a rule is admitted because its
+// evidence term exists, then the provider behind that term is unreachable at
+// evaluation and the rule errors on every transaction it sees.
+func faulting(t *testing.T, rules ...types.Rule) *Engine {
+	t.Helper()
+	e := New(Providers{Rate: refusingRate{}, Zone: time.UTC})
+	if err := e.SetRules(rules); err != nil {
+		t.Fatalf("SetRules: %v", err)
 	}
+	return e
 }
 
-func benign() (types.Transaction, types.Entity) {
-	return types.Transaction{ID: "tx-1", OrgID: "acme", Notional: 100, Currency: "USD"},
+// refusingRate stands in for a provider that is reachable at admission and broken
+// at evaluation.
+type refusingRate struct{}
+
+func (refusingRate) USD(context.Context, float64, string) (float64, error) {
+	return 0, context.DeadlineExceeded
+}
+
+func benignTx() (types.Transaction, types.Entity) {
+	return types.Transaction{ID: "tx-1", OrgID: "acme", Notional: 100, USD: 100, Currency: "USD"},
 		types.Entity{ID: "e-1", Jurisdiction: "US"}
 }
 
-// The defect this guards: six rules whose store was unreachable each produced a
-// hit with Match=true, so an ordinary $100 payment came back with six typology
-// alerts and a saturated score. Every transaction alerted, which is the same as
-// none of them alerting, except more expensive to read.
-func TestBrokenRulesDoNotProduceTypologyAlerts(t *testing.T) {
-	e := New([]types.Rule{broken("r1"), broken("r2"), broken("r3"), broken("r4"), broken("r5"), broken("r6")})
-	tx, entity := benign()
+// The defect this guards. Rules whose store was unreachable each produced a hit
+// with Match=true at the rule's full weight, so an ordinary $100 payment came back
+// with six alerts and a saturated score. Every transaction alerted, which ranks
+// exactly as well as nothing alerting and costs more to read.
+//
+// The fix is not to hide the failure — it is still reported per rule, and still
+// forces review. It is that a rule which reached no verdict carries no weight.
+func TestRulesThatCannotRunCarryNoWeight(t *testing.T) {
+	e := faulting(t,
+		scored("r1", `USD() > 10000.0`),
+		scored("r2", `USD() > 20000.0`),
+		scored("r3", `USD() > 30000.0`),
+	)
+	tx, ent := benignTx()
 
-	alerts, score, action := e.Evaluate(tx, entity)
+	alerts, score, action := e.Evaluate(context.Background(), tx, ent)
 
-	// Exactly one alert, describing the fault — not one per broken rule.
-	if len(alerts) != 1 {
-		names := make([]string, 0, len(alerts))
-		for _, a := range alerts {
-			names = append(names, a.RuleName)
+	faults := 0
+	for _, a := range alerts {
+		if a.EvalErr == "" {
+			t.Errorf("rule %q reported a verdict it could not reach", a.RuleID)
+			continue
 		}
-		t.Fatalf("6 unevaluable rules produced %d alerts (%v), want 1 fault alert", len(alerts), names)
+		faults++
+		if a.Score != 0 {
+			t.Errorf("rule %q could not run yet scored %v", a.RuleID, a.Score)
+		}
+		if a.ActionTaken != types.ActionReview {
+			t.Errorf("rule %q could not run yet its action is %q, want review", a.RuleID, a.ActionTaken)
+		}
+	}
+	if faults == 0 {
+		t.Fatal("no rule reported its failure — a rule that did not run must never be silent")
 	}
 
-	fault := alerts[0]
-	if !strings.Contains(fault.RuleName, "could not be evaluated") {
-		t.Errorf("the alert does not say the rules failed to run: %q", fault.RuleName)
-	}
-	if len(fault.Causes) != 6 {
-		t.Errorf("fault alert names %d rules, want all 6", len(fault.Causes))
-	}
-
-	// A rule that did not run is not evidence of risk, so it must not score.
+	// The aggregate is what saturated, and it is what a queue is ordered by.
 	if score != 0 {
-		t.Errorf("score = %v, want 0 — a rule that failed to run is not evidence of risk", score)
+		t.Errorf("aggregate score = %v, want 0 — no rule reached a verdict, so there is no evidence of risk", score)
 	}
-	if fault.Score != 0 {
-		t.Errorf("fault alert score = %v, want 0", fault.Score)
-	}
-
-	// But the transaction must not be cleared: it was not fully assessed.
-	if action == types.ActionAllow {
-		t.Error("a transaction assessed by none of its rules was allowed — the failure must not pass silently")
-	}
+	// But the transaction is not cleared: it was not fully assessed.
 	if action != types.ActionReview {
-		t.Errorf("action = %q, want %q", action, types.ActionReview)
+		t.Errorf("action = %q, want review — a partly assessed transaction has not been cleared", action)
 	}
 }
 
-// A working rule set must leave an ordinary transaction alone. Without this, the
-// engine cannot rank work: if everything alerts, the score orders nothing.
+// A working rule set must leave an ordinary transaction alone. Without this the
+// engine cannot rank work at all: if everything alerts, the score orders nothing.
 func TestBenignTransactionProducesNoAlerts(t *testing.T) {
-	e := New([]types.Rule{
-		working("r1", `tx.Notional > 10000`),
-		working("r2", `tx.Notional > 50000`),
-	})
-	tx, entity := benign()
+	e := New(Providers{Zone: time.UTC})
+	if err := e.SetRules([]types.Rule{
+		scored("r1", `Tx.Notional > 10000.0`),
+		scored("r2", `Tx.Notional > 50000.0`),
+	}); err != nil {
+		t.Fatalf("SetRules: %v", err)
+	}
+	tx, ent := benignTx()
 
-	alerts, score, action := e.Evaluate(tx, entity)
+	alerts, score, action := e.Evaluate(context.Background(), tx, ent)
 	if len(alerts) != 0 {
 		t.Fatalf("a $100 payment produced %d alerts, want 0", len(alerts))
 	}
@@ -102,58 +113,62 @@ func TestBenignTransactionProducesNoAlerts(t *testing.T) {
 	}
 }
 
-// A fault must not mask or dilute a real match: the typology alert keeps its own
-// score, and the fault is reported alongside it.
-func TestFaultAndMatchAreBothReportedAndScoreCountsOnlyTheMatch(t *testing.T) {
-	e := New([]types.Rule{
-		working("r1", `tx.Notional > 50`), // matches
-		broken("r2"),                      // cannot run
-	})
-	tx, entity := benign()
+// A fault must not dilute or mask a real match. The matching rule keeps its score;
+// the failing rule is reported alongside it and contributes nothing.
+func TestFaultDoesNotDiluteARealMatch(t *testing.T) {
+	e := faulting(t,
+		scored("match", `Tx.Notional > 50.0`), // evaluable, fires
+		scored("fault", `USD() > 1000000.0`),  // errors
+	)
+	tx, ent := benignTx()
 
-	alerts, score, action := e.Evaluate(tx, entity)
+	alerts, score, action := e.Evaluate(context.Background(), tx, ent)
 	if len(alerts) != 2 {
 		t.Fatalf("got %d alerts, want 2 (one match, one fault)", len(alerts))
 	}
 	if score <= 0 {
-		t.Errorf("score = %v, want the matching rule's contribution", score)
+		t.Fatalf("score = %v, want the matching rule's contribution", score)
 	}
 
-	var matched, faulted *types.Alert
-	for i := range alerts {
-		if strings.Contains(alerts[i].RuleName, "could not be evaluated") {
-			faulted = &alerts[i]
-		} else {
-			matched = &alerts[i]
+	for _, a := range alerts {
+		switch a.RuleID {
+		case "match":
+			if a.EvalErr != "" {
+				t.Errorf("the evaluable rule reported a failure: %s", a.EvalErr)
+			}
+			if a.Score <= 0 {
+				t.Errorf("the matching rule scored %v, want its weight", a.Score)
+			}
+		case "fault":
+			if a.EvalErr == "" {
+				t.Error("the failing rule did not report its failure")
+			}
+			if a.Score != 0 {
+				t.Errorf("the failing rule scored %v, want 0", a.Score)
+			}
 		}
 	}
-	if matched == nil || faulted == nil {
-		t.Fatalf("expected one match and one fault, got %+v", alerts)
-	}
-	if matched.RuleID != "r1" {
-		t.Errorf("matched alert is for rule %q, want r1", matched.RuleID)
-	}
-	// The fault names only the broken rule, so an analyst is not told a working
-	// rule failed.
-	if len(faulted.Causes) != 1 || faulted.Causes[0].Feature != "broken-r2" {
-		t.Errorf("fault names %+v, want only broken-r2", faulted.Causes)
-	}
 	if action != types.ActionReview {
-		t.Errorf("action = %q, want %q", action, types.ActionReview)
+		t.Errorf("action = %q, want review", action)
 	}
 }
 
-// EvalAll must report a failed rule as a fault and not as a match, since that is
-// the distinction Evaluate depends on.
-func TestEvalAllReportsFailureWithoutClaimingAMatch(t *testing.T) {
-	hits := NewEvaluator().EvalAll([]types.Rule{broken("r1")}, types.EvalContext{})
-	if len(hits) != 1 {
-		t.Fatalf("got %d results, want 1", len(hits))
+// A failing rule must not be able to act. A rule configured to block that cannot
+// evaluate would otherwise decline every payment the moment its provider broke.
+func TestAFailingBlockRuleCannotDeclineEverything(t *testing.T) {
+	block := scored("blocker", `USD() > 1.0`)
+	block.Action = types.ActionBlock
+	e := faulting(t, block)
+	tx, ent := benignTx()
+
+	alerts, _, action := e.Evaluate(context.Background(), tx, ent)
+	if len(alerts) != 1 {
+		t.Fatalf("got %d alerts, want 1", len(alerts))
 	}
-	if hits[0].EvalErr == "" {
-		t.Error("the failure was not reported at all — a rule that did not run must never be silent")
+	if action == types.ActionBlock {
+		t.Fatal("a block rule that could not evaluate blocked the transaction anyway")
 	}
-	if hits[0].Match {
-		t.Error("a rule that could not be evaluated reported Match=true, which is what alerted on every transaction")
+	if action != types.ActionReview {
+		t.Errorf("action = %q, want review", action)
 	}
 }

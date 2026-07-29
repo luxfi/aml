@@ -15,6 +15,7 @@ import (
 
 	"github.com/luxfi/aml/pkg/cases"
 	"github.com/luxfi/aml/pkg/engine"
+	"github.com/luxfi/aml/pkg/reference"
 	"github.com/luxfi/aml/pkg/replay"
 	"github.com/luxfi/aml/pkg/retention"
 	"github.com/luxfi/aml/pkg/token"
@@ -49,18 +50,18 @@ func plane(t *testing.T, rules ...types.Rule) *Handler {
 	t.Helper()
 	if len(rules) == 0 {
 		rules = []types.Rule{{
-			ID: "ctr", Name: "CTR Threshold", DSL: "tx.Notional > 10000",
+			ID: "ctr", Name: "CTR Threshold", DSL: "Tx.Notional > 10000.0",
 			Severity: types.SeverityHigh, Weight: 0.3, Action: types.ActionReport, Enabled: true,
 		}}
 	}
 	return &Handler{
-		Identity:  func(*http.Request) (string, error) { return acme, nil },
-		Engine:    engine.New(rules),
-		Cases:     cases.NewStore(),
-		Alerts:    NewAlertStore(),
-		Sanctions: NewSanctionsStore(),
-		Records:   retention.New(),
-		Keys:      token.NewKeyring(func(string) ([]byte, error) { return root, nil }),
+		Identity: func(*http.Request) (string, error) { return acme, nil },
+		Engine:   testEngine(rules),
+		Rate:     reference.Rates{},
+		Cases:    cases.NewStore(),
+		Alerts:   NewAlertStore(),
+		Records:  retention.New(),
+		Keys:     token.NewKeyring(func(string) ([]byte, error) { return root, nil }),
 	}
 }
 
@@ -219,7 +220,7 @@ func TestIngestRetainsATransactionThatCanBeReconstructed(t *testing.T) {
 // five-year period, and the record says why the firm refrained.
 func TestRefusedTransactionIsRetainedAsARefusal(t *testing.T) {
 	h := plane(t, types.Rule{
-		ID: "mixer", Name: "Crypto Mixer", DSL: "tx.Notional > 0",
+		ID: "mixer", Name: "Crypto Mixer", DSL: "Tx.Notional > 0.0",
 		Severity: types.SeverityCritical, Weight: 1, Action: types.ActionBlock, Enabled: true,
 	})
 
@@ -530,7 +531,7 @@ func TestFilingASARIsRetainedAsReported(t *testing.T) {
 func TestSandboxRefusesAnEmptyHistory(t *testing.T) {
 	h := plane(t)
 
-	e, rec := send(http.MethodPost, "/v1/aml/rules/test", map[string]any{"dsl": "tx.Notional > 10000"})
+	e, rec := send(http.MethodPost, "/v1/aml/rules/test", map[string]any{"dsl": "Tx.Notional > 10000.0"})
 	if err := h.testRule()(e); err != nil {
 		t.Fatalf("transport error: %v", err)
 	}
@@ -561,7 +562,7 @@ func TestSandboxReplaysTheEngineOverRetainedHistory(t *testing.T) {
 	records, opened := h.Records.Len(), h.Cases.Len()
 
 	e, rec := send(http.MethodPost, "/v1/aml/rules/test", map[string]any{
-		"dsl":       "tx.Notional >= 9000 && tx.Notional < 10000",
+		"dsl":       "Tx.Notional >= 9000.0 && Tx.Notional < 10000.0",
 		"incumbent": "ctr",
 	})
 	if err := h.testRule()(e); err != nil {
@@ -627,7 +628,7 @@ func TestSandboxOverASampleDoesNotTouchTheRecordPlane(t *testing.T) {
 	h := plane(t)
 
 	e, rec := send(http.MethodPost, "/v1/aml/rules/test", map[string]any{
-		"dsl": "tx.Notional > 10000",
+		"dsl": "Tx.Notional > 10000.0",
 		"sample": []replay.Event{
 			{Tx: types.Transaction{ID: "sample-1", Notional: 15000}},
 			{Tx: types.Transaction{ID: "sample-2", Notional: 500}},
@@ -692,7 +693,7 @@ func TestSandboxCountsTheDispositionsThatWereRecorded(t *testing.T) {
 		t.Fatalf("resolve: status %d: %s", rec.Code, rec.Body.String())
 	}
 
-	e, rec = send(http.MethodPost, "/v1/aml/rules/test", map[string]any{"dsl": "tx.Notional > 10000"})
+	e, rec = send(http.MethodPost, "/v1/aml/rules/test", map[string]any{"dsl": "Tx.Notional > 10000.0"})
 	if err := h.testRule()(e); err != nil {
 		t.Fatalf("transport error: %v", err)
 	}
@@ -745,7 +746,7 @@ func TestHistoryDoesNotSilentlySkipARecordItCannotOpen(t *testing.T) {
 		t.Fatalf("err = %v, want ErrSealed", err)
 	}
 
-	e, rec := send(http.MethodPost, "/v1/aml/rules/test", map[string]any{"dsl": "tx.Notional > 10000"})
+	e, rec := send(http.MethodPost, "/v1/aml/rules/test", map[string]any{"dsl": "Tx.Notional > 10000.0"})
 	if err := h.testRule()(e); err != nil {
 		t.Fatalf("transport error: %v", err)
 	}
@@ -812,4 +813,17 @@ func TestKeyMaterialIsNotALiteral(t *testing.T) {
 	if _, err := h.vault(acme); err != nil {
 		t.Fatalf("key present: %v", err)
 	}
+}
+
+// testEngine builds an engine over providers a test can satisfy, and installs the
+// rules through SetRules so the test exercises the same admission the daemon does.
+// acme is the tenant every request in these tests is authenticated as.
+const acme = "acme"
+
+func testEngine(rules []types.Rule) *engine.Engine {
+	eng := engine.New(engine.Providers{Rate: reference.Rates{USDPer: map[string]float64{}}, Zone: time.UTC})
+	if err := eng.SetRules(rules); err != nil {
+		panic(err)
+	}
+	return eng
 }

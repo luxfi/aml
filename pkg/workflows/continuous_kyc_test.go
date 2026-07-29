@@ -6,6 +6,7 @@ import (
 	"os"
 	"testing"
 
+	"github.com/luxfi/aml/pkg/sanctions"
 	"github.com/luxfi/aml/pkg/types"
 )
 
@@ -22,8 +23,8 @@ func TestContinuousKYCScreen_NoMatch(t *testing.T) {
 	sink := &MemAlertSink{}
 
 	// Sanctions list with no matching names.
-	entries := []types.SanctionsEntry{
-		{Name: "Vladimir Petrov", ListID: "ofac"},
+	entries := []sanctions.Entry{
+		{RefID: "Vladimir Petrov", Group: "Vladimir Petrov", List: "ofac", Kind: sanctions.Individual, Names: []sanctions.Name{{Full: "Vladimir Petrov", Type: sanctions.Primary, Strong: true}}},
 	}
 
 	cfg := DefaultConfig("org1")
@@ -57,8 +58,8 @@ func TestContinuousKYCScreen_WithMatch(t *testing.T) {
 	source := NewMemEntitySource(entities)
 	sink := &MemAlertSink{}
 
-	entries := []types.SanctionsEntry{
-		{Name: "Vladimir Petrov", ListID: "ofac"},
+	entries := []sanctions.Entry{
+		{RefID: "Vladimir Petrov", Group: "Vladimir Petrov", List: "ofac", Kind: sanctions.Individual, Names: []sanctions.Name{{Full: "Vladimir Petrov", Type: sanctions.Primary, Strong: true}}},
 	}
 
 	cfg := DefaultConfig("org1")
@@ -125,8 +126,8 @@ func TestHighRiskRescreen_MatchCreatesCriticalCase(t *testing.T) {
 	source := NewMemEntitySource(entities)
 	sink := &MemAlertSink{}
 
-	entries := []types.SanctionsEntry{
-		{Name: "Sanctioned Person", ListID: "ofac"},
+	entries := []sanctions.Entry{
+		{RefID: "Sanctioned Person", Group: "Sanctioned Person", List: "ofac", Kind: sanctions.Individual, Names: []sanctions.Name{{Full: "Sanctioned Person", Type: sanctions.Primary, Strong: true}}},
 	}
 
 	cfg := DefaultConfig("org1")
@@ -167,8 +168,11 @@ func TestContinuousKYCScreen_Cancellation(t *testing.T) {
 
 func TestScreenEntity_AliasMatch(t *testing.T) {
 	entity := types.Entity{ID: "e1", Name: "Vlad Petrov"}
-	entries := []types.SanctionsEntry{
-		{Name: "Vladimir Petrovich Petrov", Aliases: []string{"Vlad Petrov"}},
+	entries := []sanctions.Entry{
+		{RefID: "1", Group: "1", List: "ofac", Kind: sanctions.Individual, Names: []sanctions.Name{
+			{Full: "Vladimir Petrovich Petrov", Type: sanctions.Primary, Strong: true},
+			{Full: "Vlad Petrov", Type: sanctions.Also, Strong: true},
+		}},
 	}
 
 	matched, result := screenEntity(entity, entries, 0.85)

@@ -44,7 +44,7 @@ func (h *Handler) readers() map[string]func(*core.RequestEvent) error {
 // prevents is a deployment that serves data because nobody configured who is
 // allowed to ask for it.
 func TestWithoutIdentityEveryRouteRefuses(t *testing.T) {
-	h := &Handler{Alerts: NewAlertStore(), Sanctions: NewSanctionsStore()}
+	h := &Handler{Alerts: NewAlertStore()}
 	for name, handle := range h.readers() {
 		e, rec := event(http.MethodGet, "/v1/aml/x", map[string]string{"X-Org-Id": "victim"})
 		if err := handle(e); err != nil {

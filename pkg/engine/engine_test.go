@@ -1,197 +1,579 @@
 package engine
 
 import (
+	"context"
+	"errors"
+	"strings"
 	"testing"
+	"time"
 
-	"github.com/luxfi/aml/pkg/rules"
+	"github.com/luxfi/aml/pkg/history"
+	"github.com/luxfi/aml/pkg/reference"
 	"github.com/luxfi/aml/pkg/types"
 )
 
-func TestEngineEvaluateAllow(t *testing.T) {
-	eng := New(rules.StarterRules("test"))
+var ref = time.Date(2026, 3, 10, 12, 0, 0, 0, time.UTC)
 
-	tx := types.Transaction{
-		ID:       "tx1",
-		OrgID:    "test",
-		UserID:   "u1",
-		Notional: 100,
-		Currency: "USD",
-	}
-	entity := types.Entity{
-		ID:    "u1",
-		OrgID: "test",
-	}
-
-	alerts, score, action := eng.Evaluate(tx, entity)
-	if action != types.ActionAllow {
-		t.Errorf("expected allow for small transaction, got %s", action)
-	}
-	if len(alerts) != 0 {
-		t.Errorf("expected 0 alerts, got %d", len(alerts))
-	}
-	if score != 0 {
-		t.Errorf("expected score 0, got %f", score)
-	}
+// screenList answers from a fixed set of names.
+type screenList struct {
+	sanctioned []string
+	pep        []string
+	err        error
 }
 
-func TestEngineEvaluateStructuring(t *testing.T) {
-	eng := New(rules.StarterRules("test"))
-
-	tx := types.Transaction{
-		ID:       "tx2",
-		OrgID:    "test",
-		UserID:   "u1",
-		Notional: 9500,
-		Currency: "USD",
+func (s screenList) Hit(_ context.Context, name, class string) (Hit, error) {
+	if s.err != nil {
+		return Hit{}, s.err
 	}
-	entity := types.Entity{
-		ID:    "u1",
-		OrgID: "test",
+	want := s.sanctioned
+	if class == ClassPEP {
+		want = s.pep
 	}
-
-	alerts, _, action := eng.Evaluate(tx, entity)
-	// Structuring (flag) + Travel Rule (report) both fire at $9500.
-	// Highest action wins: report > flag.
-	if action != types.ActionReport {
-		t.Errorf("expected report (travel rule outranks structuring flag), got %s", action)
-	}
-
-	var structuringFired bool
-	for _, a := range alerts {
-		if a.RuleName == "Structuring" {
-			structuringFired = true
-			break
+	for _, n := range want {
+		if strings.EqualFold(n, name) {
+			return Hit{Matched: true, Score: 1, Name: n, List: class}, nil
 		}
 	}
-	if !structuringFired {
-		t.Error("expected Structuring rule to fire")
+	return Hit{}, nil
+}
+
+func providers(store history.Store) Providers {
+	return Providers{
+		History: store,
+		Screen:  screenList{sanctioned: []string{"Ivan Petrov"}, pep: []string{"Jane Minister"}},
+		Reference: reference.Jurisdictions{
+			AsOf:       ref.AddDate(0, -1, 0),
+			Action:     []string{"KP"},
+			Monitoring: []string{"SY"},
+		},
+		Rate: reference.Rates{AsOf: ref, USDPer: map[string]float64{"EUR": 1.08, "KWD": 3.25}},
+		Now:  func() time.Time { return ref },
+		Zone: time.UTC,
 	}
 }
 
-func TestEngineEvaluateCTR(t *testing.T) {
-	eng := New(rules.StarterRules("test"))
-
-	tx := types.Transaction{
-		ID:       "tx3",
-		OrgID:    "test",
-		UserID:   "u1",
-		Notional: 15000,
-		Currency: "USD",
-	}
-	entity := types.Entity{
-		ID:    "u1",
-		OrgID: "test",
-	}
-
-	alerts, _, action := eng.Evaluate(tx, entity)
-
-	// CTR fires (report) and travel_rule fires (report), so action = report.
-	if action != types.ActionReport {
-		t.Errorf("expected report for CTR, got %s", action)
-	}
-
-	var ctrFired bool
-	for _, a := range alerts {
-		if a.RuleName == "CTR Threshold" {
-			ctrFired = true
-		}
-	}
-	if !ctrFired {
-		t.Error("expected CTR Threshold rule to fire")
+func rule(id, dsl string) types.Rule {
+	return types.Rule{
+		ID: id, Name: id, DSL: dsl, Enabled: true, Weight: 0.3,
+		Severity: types.SeverityHigh, Action: types.ActionReview,
 	}
 }
 
-func TestEngineEvaluatePEP(t *testing.T) {
-	eng := New(rules.StarterRules("test"))
-
-	tx := types.Transaction{
-		ID:       "tx4",
-		OrgID:    "test",
-		UserID:   "u1",
-		Notional: 15000,
-		Currency: "USD",
-	}
-	entity := types.Entity{
-		ID:    "u1",
-		OrgID: "test",
-		PEP:   true,
-	}
-
-	alerts, _, _ := eng.Evaluate(tx, entity)
-
-	var pepFired bool
-	for _, a := range alerts {
-		if a.RuleName == "PEP Large Transaction" {
-			pepFired = true
-		}
-	}
-	if !pepFired {
-		t.Error("expected PEP Large Transaction rule to fire")
+func tx(usd float64) types.Transaction {
+	return types.Transaction{
+		ID: "tx-1", OrgID: "org", UserID: "u1", Notional: usd,
+		Currency: "USD", Timestamp: ref,
 	}
 }
 
-func TestEngineSetRules(t *testing.T) {
-	eng := New(nil)
-	if len(eng.Rules()) != 0 {
-		t.Fatal("expected 0 rules")
-	}
+// --- admission ---------------------------------------------------------------
 
-	if err := eng.SetRules(rules.StarterRules("test")); err != nil {
-		t.Fatalf("SetRules failed: %v", err)
-	}
-	if len(eng.Rules()) != 23 {
-		t.Errorf("expected 23 rules, got %d", len(eng.Rules()))
-	}
-}
-
-// TestSetRulesRejectsNegativeWeight (RED-19) verifies that SetRules rejects
-// rules with negative weights, preventing score suppression attacks.
-func TestSetRulesRejectsNegativeWeight(t *testing.T) {
-	eng := New(nil)
-	err := eng.SetRules([]types.Rule{
-		{ID: "good", Weight: 0.3, Enabled: true},
-		{ID: "evil", Weight: -1.0, Enabled: true},
-	})
+func TestRuleNamingAbsentEvidenceIsRejected(t *testing.T) {
+	// The central fix. A deployment with no screening provider must refuse a rule
+	// that screens, rather than installing it and answering "no match" for ever.
+	e := New(Providers{History: history.NewMemory(nil), Rate: reference.Rates{}})
+	err := e.SetRules([]types.Rule{rule("sanctions", `Screened(Entity.Name, "sanctions")`)})
 	if err == nil {
-		t.Fatal("RED-19: SetRules should reject negative weight, got nil error")
+		t.Fatal("a rule that screens must be rejected when no screening provider is configured")
 	}
-	// Verify the rules were NOT set.
-	if len(eng.Rules()) != 0 {
-		t.Errorf("rules should remain empty after rejected SetRules, got %d", len(eng.Rules()))
+	if !errors.Is(err, ErrNoProvider) {
+		t.Fatalf("want a missing-provider error, got %v", err)
+	}
+	if !strings.Contains(err.Error(), "Screened") {
+		t.Fatalf("the error must name the term that cannot be answered, got %v", err)
 	}
 }
 
-// TestSetRulesAcceptsZeroWeight verifies that weight=0 is allowed (disabled rule).
-func TestSetRulesAcceptsZeroWeight(t *testing.T) {
-	eng := New(nil)
-	err := eng.SetRules([]types.Rule{
-		{ID: "zero", Weight: 0.0, Enabled: true},
+func TestRejectedRuleSetInstallsNothing(t *testing.T) {
+	store := history.NewMemory(func() time.Time { return ref })
+	e := New(providers(store))
+	good := rule("ok", `Count("user", "24h") > 0`)
+	bad := rule("bad", `Nonsense("user") > 0`)
+
+	if err := e.SetRules([]types.Rule{good, bad}); err == nil {
+		t.Fatal("a set containing an uninstallable rule must be rejected")
+	}
+	if n := len(e.Rules()); n != 0 {
+		t.Fatalf("nothing must be installed from a rejected set, got %d rules", n)
+	}
+	// The good rule alone installs.
+	if err := e.SetRules([]types.Rule{good}); err != nil {
+		t.Fatalf("the valid rule alone must install: %v", err)
+	}
+	if n := len(e.Rules()); n != 1 {
+		t.Fatalf("want 1 rule installed, got %d", n)
+	}
+}
+
+func TestRuleMustYieldBoolean(t *testing.T) {
+	e := New(providers(history.NewMemory(func() time.Time { return ref })))
+	// A rule that returns a number is an authoring error: read as truthy it fires
+	// on any activity at all.
+	if err := e.SetRules([]types.Rule{rule("numeric", `Sum("user", "24h")`)}); err == nil {
+		t.Fatal("a rule that does not yield a boolean must be rejected")
+	}
+	if err := e.SetRules([]types.Rule{rule("boolean", `Sum("user", "24h") > 100`)}); err != nil {
+		t.Fatalf("the comparison form must be accepted: %v", err)
+	}
+}
+
+func TestEmptyAndUnparseableRulesRejected(t *testing.T) {
+	e := New(providers(history.NewMemory(nil)))
+	for _, dsl := range []string{"", "   ", "Count(", "&&"} {
+		if err := e.SetRules([]types.Rule{rule("r", dsl)}); err == nil {
+			t.Errorf("rule %q must be rejected", dsl)
+		}
+	}
+}
+
+func TestNegativeWeightRejected(t *testing.T) {
+	e := New(providers(history.NewMemory(nil)))
+	r := rule("negative", `Count("user", "24h") > 0`)
+	r.Weight = -1
+	if err := e.SetRules([]types.Rule{r}); err == nil {
+		t.Fatal("a negative weight would subtract from the risk score and must be rejected")
+	}
+}
+
+func TestVocabularyReportsOnlyAnswerableTerms(t *testing.T) {
+	full := New(providers(history.NewMemory(nil))).Evaluator().Vocabulary()
+	if len(full) == 0 {
+		t.Fatal("a fully configured deployment must report a vocabulary")
+	}
+	bare := New(Providers{History: history.NewMemory(nil)}).Evaluator().Vocabulary()
+	for _, term := range bare {
+		if term == "Screened" || term == "Tier" || term == "USD" {
+			t.Fatalf("term %q must not be offered when its provider is absent", term)
+		}
+	}
+	if len(bare) >= len(full) {
+		t.Fatalf("a deployment missing providers must report fewer terms: bare %d, full %d", len(bare), len(full))
+	}
+}
+
+// --- detection ---------------------------------------------------------------
+
+func deposit(user string, hoursAgo int, usd float64, dir string) history.Event {
+	return history.Event{
+		ID: "e", At: ref.Add(-time.Duration(hoursAgo) * time.Hour),
+		USD: usd, Currency: "USD", Direction: dir, User: user,
+	}
+}
+
+func TestStructuringFiresOnSplitDeposits(t *testing.T) {
+	store := history.NewMemory(func() time.Time { return ref })
+	for i := 1; i <= 5; i++ {
+		store.Append("org", deposit("u1", i, 2500, history.In))
+	}
+	e := New(providers(store))
+	r := rule("structuring", `Structured("user", "24h", 10000.0, 3)`)
+	if err := e.SetRules([]types.Rule{r}); err != nil {
+		t.Fatal(err)
+	}
+	alerts, _, action := e.Evaluate(context.Background(), tx(2500), types.Entity{ID: "u1"})
+	if len(alerts) != 1 {
+		t.Fatalf("five sub-threshold deposits totalling 12,500 must raise an alert, got %d", len(alerts))
+	}
+	if action != types.ActionReview {
+		t.Fatalf("action = %q, want review", action)
+	}
+}
+
+func TestStructuringDoesNotFireOnOrdinaryActivity(t *testing.T) {
+	store := history.NewMemory(func() time.Time { return ref })
+	store.Append("org", deposit("u1", 2, 200, history.In))
+	store.Append("org", deposit("u1", 4, 150, history.In))
+	e := New(providers(store))
+	if err := e.SetRules([]types.Rule{rule("structuring", `Structured("user", "24h", 10000.0, 3)`)}); err != nil {
+		t.Fatal(err)
+	}
+	alerts, _, action := e.Evaluate(context.Background(), tx(200), types.Entity{ID: "u1"})
+	if len(alerts) != 0 {
+		t.Fatalf("two small deposits must not raise an alert, got %d", len(alerts))
+	}
+	if action != types.ActionAllow {
+		t.Fatalf("action = %q, want allow", action)
+	}
+}
+
+func TestHistoryIsScopedToTheOrganisation(t *testing.T) {
+	// The same customer identifier in two tenants must not aggregate together.
+	store := history.NewMemory(func() time.Time { return ref })
+	for i := 1; i <= 5; i++ {
+		store.Append("other-org", deposit("u1", i, 2500, history.In))
+	}
+	e := New(providers(store))
+	if err := e.SetRules([]types.Rule{rule("structuring", `Structured("user", "24h", 10000.0, 3)`)}); err != nil {
+		t.Fatal(err)
+	}
+	alerts, _, _ := e.Evaluate(context.Background(), tx(2500), types.Entity{ID: "u1"})
+	if len(alerts) != 0 {
+		t.Fatalf("another tenant's transactions must not count towards this one, got %d alerts", len(alerts))
+	}
+}
+
+func TestSanctionsRuleFires(t *testing.T) {
+	// A literal listed name must produce an alert. In the previous engine this
+	// rule could not fire under any circumstances.
+	store := history.NewMemory(func() time.Time { return ref })
+	e := New(providers(store))
+	r := rule("sanctions", `Screened(Entity.Name, "sanctions")`)
+	r.Action = types.ActionBlock
+	if err := e.SetRules([]types.Rule{r}); err != nil {
+		t.Fatal(err)
+	}
+	alerts, _, action := e.Evaluate(context.Background(), tx(100), types.Entity{ID: "u1", Name: "Ivan Petrov"})
+	if len(alerts) != 1 {
+		t.Fatalf("a listed name must raise an alert, got %d", len(alerts))
+	}
+	if action != types.ActionBlock {
+		t.Fatalf("action = %q, want block", action)
+	}
+	// An unlisted name must not.
+	alerts, _, action = e.Evaluate(context.Background(), tx(100), types.Entity{ID: "u1", Name: "Maria Gonzalez"})
+	if len(alerts) != 0 || action != types.ActionAllow {
+		t.Fatalf("an unlisted name must not raise an alert, got %d alerts and action %q", len(alerts), action)
+	}
+}
+
+func TestJurisdictionTiersAreDistinguished(t *testing.T) {
+	e := New(providers(history.NewMemory(nil)))
+	r := rule("countermeasures", `Tier(Entity.Jurisdiction) == "action"`)
+	r.Action = types.ActionBlock
+	if err := e.SetRules([]types.Rule{r}); err != nil {
+		t.Fatal(err)
+	}
+	for code, wantAlerts := range map[string]int{"KP": 1, "SY": 0, "FR": 0} {
+		alerts, _, _ := e.Evaluate(context.Background(), tx(100), types.Entity{ID: "u1", Jurisdiction: code})
+		if len(alerts) != wantAlerts {
+			t.Errorf("jurisdiction %s: got %d alerts, want %d", code, len(alerts), wantAlerts)
+		}
+	}
+}
+
+func TestCurrencyConvertedBeforeComparingToThreshold(t *testing.T) {
+	e := New(providers(history.NewMemory(nil)))
+	if err := e.SetRules([]types.Rule{rule("report", `USD() > 10000.0`)}); err != nil {
+		t.Fatal(err)
+	}
+	// 10,000 Kuwaiti dinar is about 32,500 dollars and is over the threshold.
+	// Passing the amount through as though it were dollars would place it exactly
+	// on the wrong side.
+	kwd := tx(10000)
+	kwd.Currency = "KWD"
+	alerts, _, _ := e.Evaluate(context.Background(), kwd, types.Entity{ID: "u1"})
+	if len(alerts) != 1 {
+		t.Fatalf("10,000 KWD is over a 10,000 dollar threshold and must alert, got %d", len(alerts))
+	}
+	// 10,000 dollars exactly is not over it.
+	alerts, _, _ = e.Evaluate(context.Background(), tx(10000), types.Entity{ID: "u1"})
+	if len(alerts) != 0 {
+		t.Fatalf("exactly 10,000 dollars is not over the threshold, got %d alerts", len(alerts))
+	}
+}
+
+func TestUnknownCurrencyGoesToReviewNotThrough(t *testing.T) {
+	e := New(providers(history.NewMemory(nil)))
+	if err := e.SetRules([]types.Rule{rule("report", `USD() > 10000.0`)}); err != nil {
+		t.Fatal(err)
+	}
+	odd := tx(10_000_000)
+	odd.Currency = "ZWL"
+	alerts, _, action := e.Evaluate(context.Background(), odd, types.Entity{ID: "u1"})
+	if len(alerts) != 1 {
+		t.Fatalf("a transaction the engine cannot value must not pass silently, got %d alerts", len(alerts))
+	}
+	if alerts[0].EvalErr == "" {
+		t.Fatal("the alert must record why the rule reached no verdict")
+	}
+	if action != types.ActionReview {
+		t.Fatalf("action = %q, want review — an unassessable transaction needs a person", action)
+	}
+}
+
+func TestStoreFailureGoesToReviewNotThrough(t *testing.T) {
+	e := New(Providers{
+		History: failing{},
+		Rate:    reference.Rates{AsOf: ref},
+		Now:     func() time.Time { return ref },
 	})
-	if err != nil {
-		t.Fatalf("SetRules should accept weight=0, got: %v", err)
+	if err := e.SetRules([]types.Rule{rule("velocity", `Sum("user", "24h") > 1000.0`)}); err != nil {
+		t.Fatal(err)
+	}
+	alerts, _, action := e.Evaluate(context.Background(), tx(500), types.Entity{ID: "u1"})
+	if len(alerts) != 1 || action != types.ActionReview {
+		t.Fatalf("a storage failure must route to review, got %d alerts and action %q", len(alerts), action)
+	}
+	if !strings.Contains(alerts[0].EvalErr, "unavailable") {
+		t.Fatalf("the failure must be recorded, got %q", alerts[0].EvalErr)
 	}
 }
 
-func TestResolveAction(t *testing.T) {
-	tests := []struct {
-		actions []string
-		want    string
-	}{
-		{nil, types.ActionAllow},
-		{[]string{types.ActionFlag}, types.ActionFlag},
-		{[]string{types.ActionFlag, types.ActionReview}, types.ActionReview},
-		{[]string{types.ActionReview, types.ActionBlock}, types.ActionBlock},
-		{[]string{types.ActionReport, types.ActionBlock}, types.ActionBlock},
+type failing struct{}
+
+func (failing) Window(context.Context, history.Subject, time.Duration) ([]history.Event, error) {
+	return nil, errors.New("store unavailable")
+}
+
+func TestAbsentSubjectIsAnErrorNotAnEmptyHistory(t *testing.T) {
+	// A rule counting per device, on a transaction with no device fingerprint. An
+	// empty window would report no velocity for exactly the transactions that
+	// withheld the evidence.
+	e := New(providers(history.NewMemory(func() time.Time { return ref })))
+	if err := e.SetRules([]types.Rule{rule("device", `Count("device", "24h") > 5`)}); err != nil {
+		t.Fatal(err)
+	}
+	alerts, _, action := e.Evaluate(context.Background(), tx(100), types.Entity{ID: "u1"})
+	if len(alerts) != 1 || action != types.ActionReview {
+		t.Fatalf("a rule needing an absent subject must route to review, got %d alerts action %q", len(alerts), action)
+	}
+}
+
+func TestUnknownSubjectAndDimensionRejectedAtEvaluation(t *testing.T) {
+	e := New(providers(history.NewMemory(func() time.Time { return ref })))
+	// These compile — the argument is a string — so they are caught when evaluated,
+	// and must produce a recorded failure rather than a zero count.
+	for _, dsl := range []string{
+		`Count("customer", "24h") > 0`,
+		`Distinct("user", "postcode", "24h") > 0`,
+		`Count("user", "7") > 0`,
+		`Count("user", "24x") > 0`,
+	} {
+		e2 := New(providers(history.NewMemory(func() time.Time { return ref })))
+		if err := e2.SetRules([]types.Rule{rule("r", dsl)}); err != nil {
+			t.Fatalf("%s: %v", dsl, err)
+		}
+		alerts, _, action := e2.Evaluate(context.Background(), tx(100), types.Entity{ID: "u1"})
+		if len(alerts) != 1 || alerts[0].EvalErr == "" || action != types.ActionReview {
+			t.Errorf("%s: want a recorded failure routed to review, got %d alerts action %q", dsl, len(alerts), action)
+		}
+	}
+	_ = e
+}
+
+func TestDayAggregatesTheBusinessDay(t *testing.T) {
+	store := history.NewMemory(func() time.Time { return ref })
+	// 6,000 earlier the same day, and 6,000 now: the day totals 12,000.
+	store.Append("org", deposit("u1", 3, 6000, history.In))
+	e := New(providers(store))
+	if err := e.SetRules([]types.Rule{rule("report", `Day("user") > 10000.0`)}); err != nil {
+		t.Fatal(err)
+	}
+	alerts, _, _ := e.Evaluate(context.Background(), tx(6000), types.Entity{ID: "u1"})
+	if len(alerts) != 1 {
+		t.Fatalf("two 6,000 transactions on one day exceed a 10,000 day threshold, got %d alerts", len(alerts))
 	}
 
-	for _, tt := range tests {
-		alerts := make([]types.Alert, len(tt.actions))
-		for i, a := range tt.actions {
-			alerts[i] = types.Alert{ActionTaken: a}
+	// The same two amounts on different days do not.
+	store2 := history.NewMemory(func() time.Time { return ref })
+	store2.Append("org", deposit("u1", 14, 6000, history.In)) // previous calendar day
+	e2 := New(providers(store2))
+	if err := e2.SetRules([]types.Rule{rule("report", `Day("user") > 10000.0`)}); err != nil {
+		t.Fatal(err)
+	}
+	alerts, _, _ = e2.Evaluate(context.Background(), tx(6000), types.Entity{ID: "u1"})
+	if len(alerts) != 0 {
+		t.Fatalf("amounts on separate calendar days must not aggregate, got %d alerts", len(alerts))
+	}
+}
+
+func TestDisabledRuleDoesNotFire(t *testing.T) {
+	store := history.NewMemory(func() time.Time { return ref })
+	e := New(providers(store))
+	r := rule("off", `USD() > 1.0`)
+	r.Enabled = false
+	if err := e.SetRules([]types.Rule{r}); err != nil {
+		t.Fatal(err)
+	}
+	if alerts, _, _ := e.Evaluate(context.Background(), tx(100), types.Entity{ID: "u1"}); len(alerts) != 0 {
+		t.Fatalf("a disabled rule must not fire, got %d alerts", len(alerts))
+	}
+}
+
+func TestRuleScopeFilters(t *testing.T) {
+	store := history.NewMemory(func() time.Time { return ref })
+	e := New(providers(store))
+	r := rule("crypto", `USD() > 1.0`)
+	r.AssetClassFilter = []string{"crypto"}
+	if err := e.SetRules([]types.Rule{r}); err != nil {
+		t.Fatal(err)
+	}
+	equity := tx(100)
+	equity.AssetClass = "equity"
+	if alerts, _, _ := e.Evaluate(context.Background(), equity, types.Entity{ID: "u1"}); len(alerts) != 0 {
+		t.Fatal("a rule scoped to crypto must not evaluate an equity transaction")
+	}
+	crypto := tx(100)
+	crypto.AssetClass = "crypto"
+	if alerts, _, _ := e.Evaluate(context.Background(), crypto, types.Entity{ID: "u1"}); len(alerts) != 1 {
+		t.Fatal("a rule scoped to crypto must evaluate a crypto transaction")
+	}
+}
+
+func TestAlertCarriesTypologyAndCitations(t *testing.T) {
+	store := history.NewMemory(func() time.Time { return ref })
+	e := New(providers(store))
+	r := rule("cited", `USD() > 1.0`)
+	r.Typology = "structuring"
+	r.Citations = citationFixture()
+	if err := e.SetRules([]types.Rule{r}); err != nil {
+		t.Fatal(err)
+	}
+	alerts, _, _ := e.Evaluate(context.Background(), tx(100), types.Entity{ID: "u1"})
+	if len(alerts) != 1 {
+		t.Fatal("expected one alert")
+	}
+	if alerts[0].Typology != "structuring" {
+		t.Errorf("alert must carry the typology, got %q", alerts[0].Typology)
+	}
+	if len(alerts[0].Citations) == 0 {
+		t.Error("alert must carry the citations of the rule that raised it")
+	}
+}
+
+func TestWindowIsQueriedOncePerSubjectAndLookback(t *testing.T) {
+	// Several rules asking the same question of the same window must produce one
+	// query, not one per rule.
+	store := history.NewMemory(func() time.Time { return ref })
+	store.Append("org", deposit("u1", 1, 100, history.In))
+	counted := &counting{Store: store}
+
+	e := New(Providers{
+		History: counted,
+		Rate:    reference.Rates{AsOf: ref},
+		Now:     func() time.Time { return ref },
+		Zone:    time.UTC,
+	})
+	if err := e.SetRules([]types.Rule{
+		rule("a", `Count("user", "24h") > 0`),
+		rule("b", `Sum("user", "24h") > 0.0`),
+		rule("c", `Max("user", "24h") > 0.0`),
+		rule("d", `Round("user", "24h", 100.0) > 0.5`),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	e.Evaluate(context.Background(), tx(100), types.Entity{ID: "u1"})
+	if counted.calls != 1 {
+		t.Fatalf("four rules over one window must issue one query, got %d", counted.calls)
+	}
+}
+
+type counting struct {
+	history.Store
+	calls int
+}
+
+func (c *counting) Window(ctx context.Context, s history.Subject, d time.Duration) ([]history.Event, error) {
+	c.calls++
+	return c.Store.Window(ctx, s, d)
+}
+
+func TestFailingRuleIsEscalatedNotDowngraded(t *testing.T) {
+	// A rule that reached no verdict must go to review whatever it would otherwise
+	// have done. A failing flag-only rule must escalate, because nobody looks at a
+	// flag; and a failing block rule must not block, because an evidence outage
+	// would then decline every payment.
+	for _, configured := range []string{types.ActionFlag, types.ActionBlock, types.ActionReport, types.ActionAllow} {
+		e := New(Providers{
+			History: failing{},
+			Rate:    reference.Rates{AsOf: ref},
+			Now:     func() time.Time { return ref },
+		})
+		r := rule("velocity", `Sum("user", "24h") > 1000.0`)
+		r.Action = configured
+		if err := e.SetRules([]types.Rule{r}); err != nil {
+			t.Fatal(err)
 		}
-		got := resolveAction(alerts)
-		if got != tt.want {
-			t.Errorf("resolveAction(%v) = %s, want %s", tt.actions, got, tt.want)
+		alerts, _, action := e.Evaluate(context.Background(), tx(500), types.Entity{ID: "u1"})
+		if len(alerts) != 1 {
+			t.Fatalf("%s: want one alert, got %d", configured, len(alerts))
 		}
+		if alerts[0].ActionTaken != types.ActionReview {
+			t.Errorf("a rule configured to %s that failed must record review, got %q", configured, alerts[0].ActionTaken)
+		}
+		if action != types.ActionReview {
+			t.Errorf("a rule configured to %s that failed must resolve to review, got %q", configured, action)
+		}
+	}
+}
+
+func TestUnknownScreeningClassIsRejected(t *testing.T) {
+	e := New(providers(history.NewMemory(func() time.Time { return ref })))
+	if err := e.SetRules([]types.Rule{rule("r", `Screened(Entity.Name, "watchlist")`)}); err != nil {
+		t.Fatal(err)
+	}
+	alerts, _, action := e.Evaluate(context.Background(), tx(100), types.Entity{ID: "u1", Name: "Ivan Petrov"})
+	if len(alerts) != 1 || alerts[0].EvalErr == "" || action != types.ActionReview {
+		t.Fatalf("an unrecognised screening class must be recorded as a failure, got %d alerts action %q", len(alerts), action)
+	}
+}
+
+func TestMalformedWindowUnitsRejected(t *testing.T) {
+	for _, w := range []string{"xh", "7", "24x", "-3d", "0d", "", "h"} {
+		e := New(providers(history.NewMemory(func() time.Time { return ref })))
+		if err := e.SetRules([]types.Rule{rule("r", `Count("user", "`+w+`") > 0`)}); err != nil {
+			t.Fatalf("%q: %v", w, err)
+		}
+		alerts, _, action := e.Evaluate(context.Background(), tx(100), types.Entity{ID: "u1"})
+		if len(alerts) != 1 || alerts[0].EvalErr == "" || action != types.ActionReview {
+			t.Errorf("window %q must be rejected at evaluation, got %d alerts action %q", w, len(alerts), action)
+		}
+	}
+}
+
+func TestUnloadedJurisdictionListingFailsLoudly(t *testing.T) {
+	// The whole point of the reference provider. An empty listing answering
+	// "not listed" for every country reads as a world with no high-risk
+	// jurisdictions in it, and no operator would ever notice.
+	e := New(Providers{
+		History:   history.NewMemory(func() time.Time { return ref }),
+		Reference: reference.Jurisdictions{},
+		Rate:      reference.Rates{AsOf: ref},
+		Now:       func() time.Time { return ref },
+	})
+	if err := e.SetRules([]types.Rule{rule("r", `Tier(Entity.Jurisdiction) == "action"`)}); err != nil {
+		t.Fatal(err)
+	}
+	alerts, _, action := e.Evaluate(context.Background(), tx(100), types.Entity{ID: "u1", Jurisdiction: "KP"})
+	if len(alerts) != 1 || alerts[0].EvalErr == "" || action != types.ActionReview {
+		t.Fatalf("an unloaded jurisdiction listing must fail loudly, got %d alerts action %q", len(alerts), action)
+	}
+
+	// A listing with entries but no date is equally unusable: its currency cannot
+	// be assessed, and a listing from two years ago is not the current one.
+	e2 := New(Providers{
+		History:   history.NewMemory(func() time.Time { return ref }),
+		Reference: reference.Jurisdictions{Action: []string{"KP"}},
+		Rate:      reference.Rates{AsOf: ref},
+		Now:       func() time.Time { return ref },
+	})
+	if err := e2.SetRules([]types.Rule{rule("r", `Tier(Entity.Jurisdiction) == "action"`)}); err != nil {
+		t.Fatal(err)
+	}
+	alerts, _, _ = e2.Evaluate(context.Background(), tx(100), types.Entity{ID: "u1", Jurisdiction: "KP"})
+	if len(alerts) != 1 || alerts[0].EvalErr == "" {
+		t.Fatal("an undated jurisdiction listing must fail loudly")
+	}
+}
+
+func TestSubjectValidationIsSharedByStoreAndScope(t *testing.T) {
+	// The scope builds Subjects and the stores consume them; both defer to the same
+	// validation, so there is one definition of what naming nobody means.
+	store := history.NewMemory(func() time.Time { return ref })
+	for _, s := range []history.Subject{
+		{OrgID: "org", Kind: "customer", ID: "u1"},
+		{OrgID: "", Kind: history.SubjectUser, ID: "u1"},
+		{OrgID: "org", Kind: history.SubjectUser, ID: ""},
+	} {
+		if _, err := store.Window(context.Background(), s, time.Hour); err == nil {
+			t.Errorf("subject %+v must be rejected by the store", s)
+		}
+		if err := s.Valid(); err == nil {
+			t.Errorf("subject %+v must be reported invalid", s)
+		}
+	}
+	ok := history.Subject{OrgID: "org", Kind: history.SubjectUser, ID: "u1"}
+	if err := ok.Valid(); err != nil {
+		t.Errorf("a complete subject must be valid: %v", err)
 	}
 }
