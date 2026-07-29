@@ -1,0 +1,150 @@
+name: Release
+# Builds oci.hanzo.ai/luxfi/aml on the native runners (git.hanzo.ai → git-runner).
+#
+# A tag push vX.Y.Z is a release: the image carries the semver tags plus the sha
+# tag; a main push carries only the sha tag. The image must pass the smoke below
+# before it is allowed to exist at the registry, and the pushed manifest is
+# proven resolvable — so a tag can never point at an image nothing built. A
+# version that claims an artifact it does not have is worse than no version,
+# because a deploy pin will believe it.
+#
+# oci.hanzo.ai is the canonical name for our own OCI registry — registry:2,
+# S3-backed, Hanzo IAM token auth, with registry.hanzo.ai kept as an alias so
+# existing pins keep resolving. Builds run on our runners and publish to our
+# registry; nothing in this path depends on a third party being available.
+#
+# The /v2/ in the registry API is the OCI Distribution Specification's, not ours.
+# Every route this product itself serves is /v1/.
+#
+# Auth: OCI_USER / OCI_TOKEN — org Actions secrets on this forge, sourced from
+# KMS. The instance GITHUB_TOKEN is a Hanzo Git token and is not a registry
+# credential. The luxfi/ namespace is kept because the engine is a Lux product;
+# Hanzo AML is a thin wrapper over it, the way hanzoai/kms wraps luxfi/kms.
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  workflow_dispatch:
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: [lux-build-linux-amd64]
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Compute tags
+        id: meta
+        run: |
+          set -euo pipefail
+          SHA_TAG="oci.hanzo.ai/luxfi/aml:sha-${GITHUB_SHA:0:7}"
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            VERSION="${GITHUB_REF#refs/tags/v}"
+            {
+              echo "tags<<EOF"
+              echo "oci.hanzo.ai/luxfi/aml:v${VERSION}"
+              echo "oci.hanzo.ai/luxfi/aml:${VERSION}"
+              echo "$SHA_TAG"
+              echo "EOF"
+            } >> "$GITHUB_OUTPUT"
+            echo "probe=oci.hanzo.ai/luxfi/aml:v${VERSION}" >> "$GITHUB_OUTPUT"
+            echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          else
+            {
+              echo "tags<<EOF"
+              echo "$SHA_TAG"
+              echo "EOF"
+            } >> "$GITHUB_OUTPUT"
+            echo "probe=$SHA_TAG" >> "$GITHUB_OUTPUT"
+            echo "version=sha-${GITHUB_SHA:0:7}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: docker/setup-buildx-action@v3
+        with:
+          driver: docker-container
+          driver-opts: network=host
+
+      - uses: docker/login-action@v3
+        with:
+          registry: oci.hanzo.ai
+          username: ${{ secrets.OCI_USER }}
+          password: ${{ secrets.OCI_TOKEN }}
+
+      - name: Build (load for smoke, not yet pushed)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          platforms: linux/amd64
+          build-args: |
+            VERSION=${{ steps.meta.outputs.version }}
+          load: true
+          push: false
+          provenance: false
+          tags: ${{ steps.meta.outputs.tags }}
+
+      - name: Smoke — it serves, it refuses, and it does not clear a benign payment by accident
+        # An image that builds but cannot answer deploys and half-works. Beyond
+        # liveness this checks the two behaviours that have actually regressed in
+        # this engine: an unauthenticated read must be refused rather than
+        # served, and an ordinary payment must come back allowed rather than
+        # carrying a saturated score — a monitoring system that alerts on
+        # everything ranks nothing and is indistinguishable from one that alerts
+        # on nothing.
+        run: |
+          set -euo pipefail
+          img="${{ steps.meta.outputs.probe }}"
+          docker run --rm --entrypoint sh "$img" -c 'command -v amld'
+
+          cid=$(docker run -d \
+            -e AML_TENANT_HEADER=X-Org-Id \
+            -e AML_TOKEN_KEY="$(head -c 32 /dev/urandom | xxd -p -c 64)" \
+            -p 127.0.0.1:8799:8090 "$img")
+          trap 'docker logs "$cid" | tail -60; docker rm -f "$cid" >/dev/null 2>&1 || true' EXIT
+
+          ready=""
+          for i in $(seq 1 30); do
+            if curl -sf -o /dev/null http://127.0.0.1:8799/v1/aml/health; then ready=1; break; fi
+            sleep 2
+          done
+          [ -n "$ready" ] || { echo "::error::amld never answered /v1/aml/health"; exit 1; }
+
+          code=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8799/v1/aml/cases)
+          [ "$code" = "401" ] || { echo "::error::unauthenticated read returned $code, want 401"; exit 1; }
+
+          body=$(curl -s -X POST http://127.0.0.1:8799/v1/aml/transactions \
+            -H 'X-Org-Id: smoke' -H 'Content-Type: application/json' \
+            -d '{"id":"smoke-1","source":"api","user_id":"u1","account_id":"a1","qty":1,"notional":100,"currency":"USD","asset_class":"fiat"}')
+          echo "ingest: $body"
+          echo "$body" | grep -q '"action":"allow"' \
+            || { echo "::error::a benign \$100 payment was not allowed: $body"; exit 1; }
+
+          echo "serves, refuses, and clears a benign payment"
+
+      - name: Push
+        run: |
+          set -euo pipefail
+          while IFS= read -r t; do
+            [ -n "$t" ] && docker push "$t"
+          done <<< "${{ steps.meta.outputs.tags }}"
+
+      - name: Verify the pushed manifest resolves
+        # The tag is a receipt for an image that exists. Proving it resolves
+        # after the push is what makes it one.
+        run: |
+          set -euo pipefail
+          img="${{ steps.meta.outputs.probe }}"
+          for i in 1 2 3 4 5 6; do
+            if docker manifest inspect "$img" >/dev/null 2>&1; then
+              echo "$img is resolvable"; exit 0
+            fi
+            echo "manifest not visible yet (attempt ${i}/6) — retrying"; sleep 5
+          done
+          echo "::error::$img not pullable after push"; exit 1

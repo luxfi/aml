@@ -1,0 +1,100 @@
+name: CI
+# Runs on the native runners at git.hanzo.ai (git-runner, label
+# lux-build-linux-amd64). There are no GitHub-hosted runners in this
+# organisation and none is a permitted fallback: a workflow that names one
+# queues forever, which reads from the outside as a test suite that never fails.
+#
+# Every branch, not only main. A compliance engine's tests are the evidence that
+# its controls work, so they run before the merge that would rely on them.
+
+on:
+  push:
+    branches: ["*"]
+    tags-ignore: ["v*"]
+  pull_request:
+    branches: ["*"]
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: [lux-build-linux-amd64]
+    timeout-minutes: 30
+    # A runner may carry a machine-level go env that routes some module paths
+    # around the proxy and the checksum database. GOENV=off ignores it, so every
+    # module resolves through proxy.golang.org and is verified against
+    # sum.golang.org — a tag that moves later cannot change what was tested.
+    env:
+      GOENV: off
+      GOWORK: off
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/go-build
+            ~/go/pkg/mod
+          key: ${{ runner.os }}-go-${{ hashFiles('go.sum') }}
+          restore-keys: ${{ runner.os }}-go-
+
+      - name: Modules verify against the checksum database
+        # An AML engine's dependency graph is part of its audit surface. This
+        # fails on a moved tag rather than building whatever the cache holds.
+        run: |
+          go mod download
+          go mod verify
+
+      - name: Formatting
+        run: |
+          unformatted=$(gofmt -l pkg cmd)
+          if [ -n "$unformatted" ]; then
+            echo "::error::not gofmt-clean:"; echo "$unformatted"; exit 1
+          fi
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Test with the race detector
+        # Ingest is concurrent by construction — the aggregate windows and the
+        # behavioural model are written on the request path — so -race is the
+        # test run, not an extra one.
+        run: go test -race -count=1 ./...
+
+      - name: Build the daemon with the embedded operator surface
+        run: |
+          CGO_ENABLED=0 go build -trimpath -tags embedui -o /tmp/amld ./cmd/amld
+          test -x /tmp/amld
+
+      - name: It serves, and it refuses what it should
+        # Two facts worth a check on every commit, because both have regressed
+        # before: the process comes up and answers, and an unauthenticated
+        # request is refused rather than served somebody's tenant data.
+        run: |
+          set -euo pipefail
+          dir=$(mktemp -d)
+          AML_TENANT_HEADER=X-Org-Id \
+          AML_TOKEN_KEY=$(head -c 32 /dev/urandom | xxd -p -c 64) \
+            /tmp/amld serve --dir "$dir" --http 127.0.0.1:8791 --dev=false &
+          pid=$!
+          for i in $(seq 1 60); do
+            curl -sf -o /dev/null http://127.0.0.1:8791/v1/aml/health && break
+            sleep 1
+          done
+          curl -sf -o /dev/null http://127.0.0.1:8791/v1/aml/health \
+            || { echo "::error::amld never answered /v1/aml/health"; kill $pid; exit 1; }
+
+          code=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8791/v1/aml/cases)
+          kill $pid
+          if [ "$code" != "401" ]; then
+            echo "::error::an unauthenticated read of /v1/aml/cases returned $code, want 401"
+            exit 1
+          fi
+          echo "serves, and refuses an unauthenticated read"

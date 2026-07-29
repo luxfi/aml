@@ -50,9 +50,15 @@
 package retention
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 	"time"
+
+	"github.com/google/uuid"
 )
 
 // The retention arithmetic, in years, each from its own instrument.
@@ -92,6 +98,8 @@ var (
 	ErrFuture       = errors.New("retention: refusing to act on a future date")
 	ErrExtension    = errors.New("retention: extension exceeds the five further years allowed")
 	ErrDisposal     = errors.New("retention: disposal could not be proven")
+	ErrConflict     = errors.New("retention: a different record is already retained under this identity")
+	ErrStore        = errors.New("retention: the ledger could not be read or written")
 )
 
 // Class is what a record is.
@@ -270,6 +278,90 @@ type Record struct {
 	Assessment *Assessment `json:"assessment,omitempty"`
 
 	Written time.Time `json:"written"`
+
+	// identity is what makes this record the same retained fact as another. It is
+	// the ledger's to compute, like the clock, so it is not something a caller can
+	// name. See [Record.identify].
+	identity string
+}
+
+// identify is the record's identity: the thing that, repeated, means a client
+// retried rather than that something happened twice.
+//
+// What is unique is a property of the class, and it is not unconditional:
+//
+//   - A transaction, a refusal and a relationship are identified by the reference
+//     they retain. One record per transaction, per refused transaction, per
+//     relationship — a resubmission of the same reference finds the record it
+//     already wrote instead of a second copy of it.
+//   - An assessment recurs. The same case is assessed again whenever new
+//     information arrives, and every one of those decisions is retained whether or
+//     not it produced a report (AMLR Art. 77(1)(b)), so the identity includes who
+//     decided and when. Two decisions on one case are two records; a retry of one
+//     decision is one.
+//   - A record with no reference cannot be recognised, because there is nothing to
+//     recognise it by. It is unique per write, which means a retry of it does
+//     duplicate. Every writer in this codebase supplies a reference; validate
+//     requires one of a transaction outright.
+func (r Record) identify() string {
+	if r.Ref == "" {
+		return uuid.NewString()
+	}
+	if r.Class == ClassAssessment && r.Assessment != nil {
+		return fmt.Sprintf("%s:%s:%s:%d", r.Class, r.Ref, r.Assessment.By, r.Assessment.At.UTC().UnixMilli())
+	}
+	return string(r.Class) + ":" + r.Ref
+}
+
+// digest is the retained fact, hashed. Two records with one identity are a retry
+// only if they say the same thing; if they do not, the caller has two different
+// facts under one name, and the ledger refuses rather than choosing between them
+// or rewriting what it holds.
+//
+// Only what the caller supplied is hashed. The id, the clock and the write time
+// are the ledger's, and hashing them would make every retry a conflict. Times are
+// taken to the millisecond they are stored at, so a record and the same record
+// read back digest alike.
+func (r Record) digest() string {
+	type fact struct {
+		Class      Class
+		Trigger    Trigger
+		Parties    []string
+		Ref        string
+		Nature     string
+		Reason     string
+		Inside     string
+		Occurred   int64
+		Body       []byte
+		Assessment *Assessment
+	}
+	f := fact{
+		Class:      r.Class,
+		Trigger:    r.Trigger,
+		Parties:    slices.Sorted(slices.Values(r.Parties)),
+		Ref:        r.Ref,
+		Nature:     r.Nature,
+		Reason:     r.Reason,
+		Inside:     r.Relationship,
+		Occurred:   r.Occurred.UTC().UnixMilli(),
+		Body:       r.Body,
+		Assessment: r.Assessment,
+	}
+	if f.Assessment != nil {
+		a := f.Assessment.clone()
+		a.At = a.At.UTC().Truncate(time.Millisecond)
+		f.Assessment = &a
+	}
+	// A struct marshals in field order, so the encoding is stable; a map would not
+	// be. Marshalling cannot fail on these types, and a digest that silently became
+	// the empty string would make every record a retry of every other, so the
+	// error is not ignored.
+	encoded, err := json.Marshal(f)
+	if err != nil {
+		return fmt.Sprintf("unhashable:%v", err)
+	}
+	sum := sha256.Sum256(encoded)
+	return hex.EncodeToString(sum[:])
 }
 
 // Expiry is when the record must be destroyed. Zero means the retention clock
