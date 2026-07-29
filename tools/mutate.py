@@ -6,7 +6,8 @@ Reports per mutation: ANCHOR MISS (not applied -> not a kill), COMPILE FAIL
 """
 import subprocess, sys, os, shutil
 
-ROOT = os.path.dirname(os.path.abspath(__file__))
+# The module root, one level above this script, so the harness runs from anywhere.
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 ENV = dict(os.environ, TMPDIR="/tmp", GOWORK="off",
            PATH="/usr/local/go/bin:" + os.environ["PATH"])
 
