@@ -5,6 +5,8 @@ package types
 import (
 	"encoding/json"
 	"time"
+
+	"github.com/luxfi/aml/pkg/standard"
 )
 
 // Severity levels for rules and alerts.
@@ -131,31 +133,44 @@ type Entity struct {
 	UpdatedAt     time.Time `json:"updated_at"`
 }
 
-// Rule is an AML evaluation rule using expr-lang DSL.
+// Rule is one detection expressed over the evaluation vocabulary.
+//
+// Typology names the laundering pattern the rule detects and Citations name the
+// published standards that require or describe it. Together they are what makes
+// a coverage claim checkable: a reviewer reads the citation, reads the
+// expression, and decides whether the second implements the first.
 type Rule struct {
-	ID                 string    `json:"id"`
-	OrgID              string    `json:"org_id"`
-	Name               string    `json:"name"`
-	Description        string    `json:"description"`
-	DSL                string    `json:"dsl"`
-	Severity           string    `json:"severity"`
-	Weight             float64   `json:"weight"`
-	Action             string    `json:"action"`
-	Enabled            bool      `json:"enabled"`
-	JurisdictionFilter []string  `json:"jurisdiction_filter,omitempty"`
-	AssetClassFilter   []string  `json:"asset_class_filter,omitempty"`
-	Priority           int       `json:"priority"`
-	CreatedAt          time.Time `json:"created_at"`
-	UpdatedAt          time.Time `json:"updated_at"`
+	ID                 string              `json:"id"`
+	OrgID              string              `json:"org_id"`
+	Name               string              `json:"name"`
+	Description        string              `json:"description"`
+	Typology           string              `json:"typology,omitempty"`
+	Citations          []standard.Citation `json:"citations,omitempty"`
+	DSL                string              `json:"dsl"`
+	Severity           string              `json:"severity"`
+	Weight             float64             `json:"weight"`
+	Action             string              `json:"action"`
+	Enabled            bool                `json:"enabled"`
+	JurisdictionFilter []string            `json:"jurisdiction_filter,omitempty"`
+	AssetClassFilter   []string            `json:"asset_class_filter,omitempty"`
+	Priority           int                 `json:"priority"`
+	CreatedAt          time.Time           `json:"created_at"`
+	UpdatedAt          time.Time           `json:"updated_at"`
 }
 
 // Alert is a rule hit — one per transaction per rule.
 type Alert struct {
-	ID             string             `json:"id"`
-	OrgID          string             `json:"org_id"`
-	TxID           string             `json:"tx_id"`
-	RuleID         string             `json:"rule_id"`
-	RuleName       string             `json:"rule_name"`
+	ID        string              `json:"id"`
+	OrgID     string              `json:"org_id"`
+	TxID      string              `json:"tx_id"`
+	RuleID    string              `json:"rule_id"`
+	RuleName  string              `json:"rule_name"`
+	Typology  string              `json:"typology,omitempty"`
+	Citations []standard.Citation `json:"citations,omitempty"`
+	// EvalErr records why the rule could not reach a verdict, when it could not.
+	// An alert carrying a failure is not a detection; it is a transaction nobody
+	// has assessed, and it is routed to review on that basis.
+	EvalErr        string             `json:"eval_error,omitempty"`
 	Severity       string             `json:"severity"`
 	Score          float64            `json:"score"`
 	ScoreBreakdown map[string]float64 `json:"score_breakdown,omitempty"`

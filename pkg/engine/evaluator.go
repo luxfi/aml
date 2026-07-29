@@ -1,262 +1,164 @@
 package engine
 
 import (
+	"context"
 	"fmt"
+	"sort"
 	"strings"
 	"sync"
 
 	"github.com/expr-lang/expr"
+	"github.com/expr-lang/expr/ast"
+	"github.com/expr-lang/expr/parser"
 	"github.com/expr-lang/expr/vm"
 
 	"github.com/luxfi/aml/pkg/types"
 )
 
-// ExprFunc is the function signature required by expr-lang.
-type ExprFunc = func(params ...any) (any, error)
-
-// DefaultMaxCacheSize is the default max number of compiled programs in the cache.
-const DefaultMaxCacheSize = 10_000
-
-// Evaluator compiles and evaluates expr-lang rule DSL against transaction contexts.
-// Compiled programs are cached per rule ID + DSL hash for reuse.
-// RED-15: Cache has a max size with LRU eviction to prevent memory exhaustion.
+// Evaluator compiles rule expressions and evaluates them against transactions.
+//
+// A rule is admitted only if it parses, names only terms in the vocabulary, uses
+// only terms whose evidence provider is configured, and yields a boolean. There
+// is no fallback for a term the deployment cannot answer. The alternative — a
+// term that returns a plausible constant when its provider is absent — produces
+// a rule that is present in the catalog, visible in the interface, reported to
+// the regulator, and incapable of ever firing.
 type Evaluator struct {
-	mu           sync.RWMutex
-	cache        map[string]*vm.Program // key = rule.ID + ":" + rule.DSL
-	cacheOrder   []string               // insertion order for LRU eviction
-	maxCacheSize int
-	funcs        map[string]ExprFunc
+	p Providers
+
+	mu    sync.RWMutex
+	cache map[string]*vm.Program
 }
 
-// NewEvaluator creates an Evaluator with the default helper functions.
-func NewEvaluator() *Evaluator {
-	return NewEvaluatorWithMaxCache(DefaultMaxCacheSize)
+// NewEvaluator builds an evaluator over the given evidence providers.
+func NewEvaluator(p Providers) *Evaluator {
+	return &Evaluator{p: p, cache: make(map[string]*vm.Program)}
 }
 
-// NewEvaluatorWithMaxCache creates an Evaluator with a custom cache limit.
-func NewEvaluatorWithMaxCache(maxCache int) *Evaluator {
-	if maxCache <= 0 {
-		maxCache = DefaultMaxCacheSize
-	}
-	e := &Evaluator{
-		cache:        make(map[string]*vm.Program),
-		maxCacheSize: maxCache,
-		funcs:        make(map[string]ExprFunc),
-	}
-	e.registerDefaults()
-	return e
-}
-
-// CacheLen returns the number of compiled programs in the cache.
-func (e *Evaluator) CacheLen() int {
-	e.mu.RLock()
-	defer e.mu.RUnlock()
-	return len(e.cache)
-}
-
-// RegisterFunc adds a named function available in the expr-lang environment.
-func (e *Evaluator) RegisterFunc(name string, fn ExprFunc) {
-	e.mu.Lock()
-	e.funcs[name] = fn
-	e.mu.Unlock()
-}
-
-// registerDefaults registers stub helper functions for the DSL.
-// These return conservative defaults. Production wires real implementations.
-func (e *Evaluator) registerDefaults() {
-	e.funcs["count_last_24h"] = func(params ...any) (any, error) { return 0, nil }
-	e.funcs["sum_last_24h"] = func(params ...any) (any, error) { return 0.0, nil }
-	e.funcs["sum_last_30d"] = func(params ...any) (any, error) { return 0.0, nil }
-	e.funcs["first_tx"] = func(params ...any) (any, error) { return false, nil }
-	e.funcs["first_counterparty"] = func(params ...any) (any, error) { return false, nil }
-	e.funcs["last_tx_age"] = func(params ...any) (any, error) { return 0, nil }
-	e.funcs["is_round_trip"] = func(params ...any) (any, error) { return false, nil }
-	e.funcs["geo_match"] = func(params ...any) (any, error) { return true, nil }
-	e.funcs["sanctions_hit"] = func(params ...any) (any, error) { return false, nil }
-	e.funcs["sanctioned_jurisdictions"] = func(params ...any) (any, error) {
-		return []string{"IR", "KP", "SY", "CU", "AF", "BY", "CF", "CD", "LY", "ML", "SO", "SS", "SD", "YE"}, nil
-	}
-	e.funcs["hour"] = func(params ...any) (any, error) { return 12, nil }
-	e.funcs["is_mixer_address"] = func(params ...any) (any, error) { return false, nil }
-	e.funcs["is_darknet_market"] = func(params ...any) (any, error) { return false, nil }
-	e.funcs["layering_score"] = func(params ...any) (any, error) { return 0.0, nil }
-	e.funcs["smurfing_detected"] = func(params ...any) (any, error) { return false, nil }
-	e.funcs["wash_trade_detected"] = func(params ...any) (any, error) { return false, nil }
-	e.funcs["travel_rule_threshold"] = func(params ...any) (any, error) { return 3000.0, nil }
-	e.funcs["travel_rule_complete"] = func(params ...any) (any, error) { return true, nil }
-	e.funcs["chain_risk_score"] = func(params ...any) (any, error) { return 0.0, nil }
-	e.funcs["chain_is_sanctioned"] = func(params ...any) (any, error) { return false, nil }
-
-	// RED-13: notional_usd converts tx.Notional to USD using approximate FX rates.
-	// This ensures CTR rules fire correctly for non-USD currencies.
-	e.funcs["notional_usd"] = func(params ...any) (any, error) {
-		if len(params) < 1 {
-			return 0.0, fmt.Errorf("notional_usd requires a transaction")
-		}
-		// expr-lang passes the struct directly.
-		switch v := params[0].(type) {
-		case types.Transaction:
-			return notionalUSD(v.Notional, v.Currency), nil
-		case *types.Transaction:
-			return notionalUSD(v.Notional, v.Currency), nil
-		case map[string]interface{}:
-			notional, _ := v["Notional"].(float64)
-			currency, _ := v["Currency"].(string)
-			return notionalUSD(notional, currency), nil
-		default:
-			return 0.0, fmt.Errorf("notional_usd: unexpected type %T", params[0])
+// Vocabulary lists the terms this evaluator can answer, sorted. Terms whose
+// provider is not configured are omitted, so the list describes what this
+// deployment can actually detect rather than what the language could express.
+func (e *Evaluator) Vocabulary() []string {
+	out := make([]string, 0, len(vocabulary))
+	for term, cap := range vocabulary {
+		if e.p.has(cap) {
+			out = append(out, term)
 		}
 	}
+	sort.Strings(out)
+	return out
 }
 
-// RED-13: fxRates maps currency codes to their approximate USD exchange rate.
-// Updated by the sanctions refresh cron in production; these are conservative defaults.
-var fxRates = map[string]float64{
-	"USD": 1.0, "EUR": 1.08, "GBP": 1.27, "CHF": 1.12,
-	"JPY": 0.0067, "INR": 0.012, "BRL": 0.20, "AUD": 0.66,
-	"CAD": 0.74, "SGD": 0.75, "AED": 0.27, "KRW": 0.00075,
-	"CNY": 0.14, "MXN": 0.058, "ZAR": 0.055, "TRY": 0.031,
-	"RUB": 0.011, "HKD": 0.13, "NZD": 0.61, "SEK": 0.096,
-	"NOK": 0.094, "DKK": 0.14, "PLN": 0.25, "THB": 0.028,
-}
+// terms collects the name of every function call in an expression.
+type terms struct{ names map[string]struct{} }
 
-// notionalUSD converts a notional amount to USD using approximate FX rates.
-// Unknown currencies return the raw notional value (conservative — assumes USD).
-func notionalUSD(notional float64, currency string) float64 {
-	if currency == "" || currency == "USD" {
-		return notional
-	}
-	rate, ok := fxRates[strings.ToUpper(currency)]
+func (t *terms) Visit(node *ast.Node) {
+	call, ok := (*node).(*ast.CallNode)
 	if !ok {
-		return notional // unknown currency → assume raw = conservative
+		return
 	}
-	return notional * rate
+	if id, ok := call.Callee.(*ast.IdentifierNode); ok {
+		t.names[id.Value] = struct{}{}
+	}
 }
 
-// cacheKey returns the cache key for a compiled rule program.
-func cacheKey(r types.Rule) string {
-	return r.ID + ":" + r.DSL
-}
-
-// Compile compiles a rule DSL into a cached vm.Program.
-func (e *Evaluator) Compile(r types.Rule) (*vm.Program, error) {
-	key := cacheKey(r)
-
+// Admit compiles a rule and reports why it cannot be installed, if it cannot.
+// The compiled program is cached, so admitting a rule also prepares it to run.
+func (e *Evaluator) Admit(r types.Rule) (*vm.Program, error) {
+	key := r.ID + ":" + r.DSL
 	e.mu.RLock()
-	if prog, ok := e.cache[key]; ok {
-		e.mu.RUnlock()
+	prog, ok := e.cache[key]
+	e.mu.RUnlock()
+	if ok {
 		return prog, nil
 	}
-	e.mu.RUnlock()
 
-	opts := []expr.Option{
-		expr.Env(map[string]interface{}{
-			"tx":     types.Transaction{},
-			"entity": types.Entity{},
-		}),
-	}
-	for name, fn := range e.funcs {
-		opts = append(opts, expr.Function(name, fn))
+	if strings.TrimSpace(r.DSL) == "" {
+		return nil, fmt.Errorf("rule %q: expression is empty", r.ID)
 	}
 
-	prog, err := expr.Compile(r.DSL, opts...)
+	tree, err := parser.Parse(r.DSL)
 	if err != nil {
-		return nil, fmt.Errorf("compile rule %q: %w", r.Name, err)
+		return nil, fmt.Errorf("rule %q: %w", r.ID, err)
+	}
+
+	seen := &terms{names: make(map[string]struct{})}
+	ast.Walk(&tree.Node, seen)
+
+	var missing []string
+	for name := range seen.names {
+		cap, known := vocabulary[name]
+		if !known {
+			continue // not an evidence term; the compile below validates it
+		}
+		if !e.p.has(cap) {
+			missing = append(missing, fmt.Sprintf("%s (needs %s)", name, cap))
+		}
+	}
+	if len(missing) > 0 {
+		sort.Strings(missing)
+		return nil, fmt.Errorf("rule %q: %w for %s", r.ID, ErrNoProvider, strings.Join(missing, ", "))
+	}
+
+	prog, err = expr.Compile(r.DSL, expr.Env(&scope{}), expr.AsBool())
+	if err != nil {
+		return nil, fmt.Errorf("rule %q: %w", r.ID, err)
 	}
 
 	e.mu.Lock()
-	// RED-15: Evict oldest entries when cache exceeds max size.
-	if len(e.cache) >= e.maxCacheSize {
-		evictCount := e.maxCacheSize / 10
-		if evictCount < 1 {
-			evictCount = 1
-		}
-		for i := 0; i < evictCount && i < len(e.cacheOrder); i++ {
-			delete(e.cache, e.cacheOrder[i])
-		}
-		if evictCount <= len(e.cacheOrder) {
-			e.cacheOrder = e.cacheOrder[evictCount:]
-		} else {
-			e.cacheOrder = nil
-		}
-	}
 	e.cache[key] = prog
-	e.cacheOrder = append(e.cacheOrder, key)
 	e.mu.Unlock()
-
 	return prog, nil
 }
 
-// Eval evaluates a single rule against a transaction + entity context.
-func (e *Evaluator) Eval(r types.Rule, ctx types.EvalContext) (bool, error) {
-	prog, err := e.Compile(r)
+// Eval runs one rule against a transaction.
+func (e *Evaluator) Eval(ctx context.Context, r types.Rule, tx types.Transaction, ent types.Entity) (bool, error) {
+	prog, err := e.Admit(r)
 	if err != nil {
 		return false, err
 	}
-
-	env := map[string]interface{}{
-		"tx":     ctx.Tx,
-		"entity": ctx.Entity,
-	}
-
-	out, err := expr.Run(prog, env)
+	out, err := expr.Run(prog, newScope(ctx, e.p, tx, ent))
 	if err != nil {
-		return false, fmt.Errorf("eval rule %q: %w", r.Name, err)
+		return false, fmt.Errorf("rule %q: %w", r.ID, err)
 	}
-
-	switch v := out.(type) {
-	case bool:
-		return v, nil
-	case float64:
-		return v > 0, nil
-	case int:
-		return v > 0, nil
-	default:
-		return false, fmt.Errorf("rule %q returned non-bool type %T", r.Name, out)
-	}
+	// Compiling with AsBool guarantees the type.
+	return out.(bool), nil
 }
 
-// EvalAll evaluates all rules against a context and returns matching hits.
-// Rules are filtered by jurisdiction and asset class before evaluation.
-func (e *Evaluator) EvalAll(rules []types.Rule, ctx types.EvalContext) []types.RuleHit {
+// EvalAll evaluates every enabled, in-scope rule and returns the hits.
+//
+// A rule that fails at evaluation time becomes a hit carrying the failure. The
+// rule set was admitted, so a failure here is a data or storage fault — an
+// unknown currency, an absent subject, an unreachable store — and the
+// transaction it happened on is precisely the one nobody has assessed. Passing
+// it through as clean would turn an outage into an approval.
+func (e *Evaluator) EvalAll(ctx context.Context, rules []types.Rule, tx types.Transaction, ent types.Entity) []types.RuleHit {
 	var hits []types.RuleHit
 	for _, r := range rules {
 		if !r.Enabled {
 			continue
 		}
-		if !matchesFilter(r.JurisdictionFilter, ctx.Entity.Jurisdiction) {
+		if !scoped(r.JurisdictionFilter, ent.Jurisdiction) {
 			continue
 		}
-		if !matchesFilter(r.AssetClassFilter, ctx.Tx.AssetClass) {
+		if !scoped(r.AssetClassFilter, tx.AssetClass) {
 			continue
 		}
-
-		match, err := e.Eval(r, ctx)
+		match, err := e.Eval(ctx, r, tx, ent)
 		if err != nil {
-			// RED-03: Fail closed on eval errors. A broken rule should trigger
-			// review, not silently allow the transaction through. The error is
-			// captured in the hit so analysts can see WHY the rule flagged.
-			hits = append(hits, types.RuleHit{
-				Rule:    r,
-				Match:   true,
-				EvalErr: err.Error(),
-			})
+			hits = append(hits, types.RuleHit{Rule: r, Match: true, EvalErr: err.Error()})
 			continue
 		}
-
 		if match {
-			hits = append(hits, types.RuleHit{
-				Rule:  r,
-				Match: true,
-			})
+			hits = append(hits, types.RuleHit{Rule: r, Match: true})
 		}
 	}
 	return hits
 }
 
-// matchesFilter returns true if the filter is empty (matches all)
-// or if val is in the filter list.
-func matchesFilter(filter []string, val string) bool {
+// scoped reports whether a rule restricted to a set of values applies here. An
+// empty restriction applies to everything.
+func scoped(filter []string, val string) bool {
 	if len(filter) == 0 {
 		return true
 	}
