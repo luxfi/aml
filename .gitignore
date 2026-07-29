@@ -1,0 +1,12 @@
+/amld
+/THIRD-PARTY-NOTICES
+/dist/
+/data/
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+.env
+ui/dist/
+ui/node_modules/
+ui/tsconfig.tsbuildinfo
