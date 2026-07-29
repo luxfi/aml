@@ -1,98 +1,71 @@
+// Copyright 2024-2026 Lux Partners Limited. All rights reserved.
+// Use of this source code is governed by the Apache 2.0
+// license that can be found in the LICENSE file.
+
 package sanctions
 
 import (
-	"bytes"
 	"context"
 	"crypto/sha256"
-	"encoding/xml"
 	"fmt"
 	"io"
 	"net/http"
-	"strings"
 	"time"
 
 	"github.com/luxfi/aml/pkg/types"
 )
 
-// maxBodySize is the maximum sanctions list download size (100 MB).
+// maxBodySize bounds a list download. The largest published list is around
+// 30 MB, so 100 MB leaves room for growth while keeping a redirect to something
+// unbounded from exhausting memory.
 const maxBodySize = 100 * 1024 * 1024
 
-// Ingester fetches and parses sanctions lists.
+// fetchTimeout covers connect, transfer, and read of a whole list. It is minutes
+// rather than seconds because the payloads are tens of megabytes: measured
+// against the live sources, the EU file alone does not complete inside 60s, so a
+// short timeout fails the fetch on a healthy list.
+const fetchTimeout = 5 * time.Minute
+
+// Ingester downloads sanctions lists. It owns transport only; schema knowledge
+// lives in the Parser for each source.
 type Ingester struct {
 	client *http.Client
 }
 
-// NewIngester creates a new Ingester with a 60s timeout.
+// NewIngester creates an Ingester.
 func NewIngester() *Ingester {
-	return &Ingester{
-		client: &http.Client{Timeout: 60 * time.Second},
-	}
+	return &Ingester{client: &http.Client{Timeout: fetchTimeout}}
 }
 
-// FetchOFAC fetches and parses the OFAC SDN XML list.
-func (ing *Ingester) FetchOFAC(ctx context.Context, url string) ([]types.SanctionsEntry, string, error) {
-	body, hash, err := ing.fetch(ctx, url)
+// Fetch downloads a list and parses it with the parser registered for its
+// source, returning the entries and the SHA-256 of the payload.
+//
+// A list that parses to zero entries is an error. No published list is empty, so
+// an empty parse means the download or the schema is wrong, and reporting that
+// as success is the failure that lets a designated party through screening
+// against a list nobody knows is blank.
+func (ing *Ingester) Fetch(ctx context.Context, list types.SanctionsList) ([]types.SanctionsEntry, string, error) {
+	parse, err := ParserFor(list.Source)
 	if err != nil {
-		return nil, "", fmt.Errorf("fetch OFAC: %w", err)
+		return nil, "", err
 	}
 
-	// RED-05: Use streaming decoder with entity expansion disabled to prevent
-	// billion-laughs XML bomb attacks. Strict mode + empty entity map means
-	// any entity reference in the XML causes a parse error instead of OOM.
-	var sdnList sdnListXML
-	d := xml.NewDecoder(bytes.NewReader(body))
-	d.Strict = true
-	d.Entity = map[string]string{} // disable entity expansion
-	if err := d.Decode(&sdnList); err != nil {
-		return nil, "", fmt.Errorf("parse OFAC XML: %w", err)
+	body, hash, err := ing.fetch(ctx, list.URL)
+	if err != nil {
+		return nil, "", fmt.Errorf("fetch %s: %w", list.Source, err)
 	}
 
-	entries := make([]types.SanctionsEntry, 0, len(sdnList.Entries))
-	for _, e := range sdnList.Entries {
-		entryType := types.SanctionIndividual
-		if e.SDNType == "Entity" {
-			entryType = types.SanctionEntity
-		} else if e.SDNType == "Vessel" {
-			entryType = types.SanctionVessel
-		} else if e.SDNType == "Aircraft" {
-			entryType = types.SanctionAircraft
-		}
-
-		name := strings.TrimSpace(e.FirstName + " " + e.LastName)
-		aliases := make([]string, 0, len(e.Aliases))
-		for _, a := range e.Aliases {
-			an := strings.TrimSpace(a.FirstName + " " + a.LastName)
-			if an != "" {
-				aliases = append(aliases, an)
-			}
-		}
-
-		var dob string
-		for _, d := range e.DateOfBirth {
-			dob = d.DateOfBirth
-			break
-		}
-
-		var nationality string
-		for _, n := range e.Nationalities {
-			nationality = n.Country
-			break
-		}
-
-		entries = append(entries, types.SanctionsEntry{
-			RefID:       fmt.Sprintf("%d", e.UID),
-			Name:        name,
-			Aliases:     aliases,
-			DOB:         dob,
-			Nationality: nationality,
-			Type:        entryType,
-		})
+	entries, err := parse(body)
+	if err != nil {
+		return nil, "", fmt.Errorf("%s: %w", list.Source, err)
 	}
-
+	if len(entries) == 0 {
+		return nil, "", fmt.Errorf("%s: parsed 0 entries from %d bytes at %s", list.Source, len(body), list.URL)
+	}
 	return entries, hash, nil
 }
 
-// fetch downloads a URL and returns the body bytes + SHA256 hex hash.
+// fetch downloads a URL and returns the body bytes and their SHA-256 hex digest.
 func (ing *Ingester) fetch(ctx context.Context, url string) ([]byte, string, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
@@ -117,34 +90,4 @@ func (ing *Ingester) fetch(ctx context.Context, url string) ([]byte, string, err
 
 	h := sha256.Sum256(body)
 	return body, fmt.Sprintf("%x", h), nil
-}
-
-// OFAC SDN XML structures.
-
-type sdnListXML struct {
-	XMLName xml.Name      `xml:"sdnList"`
-	Entries []sdnEntryXML `xml:"sdnEntry"`
-}
-
-type sdnEntryXML struct {
-	UID           int           `xml:"uid"`
-	FirstName     string        `xml:"firstName"`
-	LastName      string        `xml:"lastName"`
-	SDNType       string        `xml:"sdnType"`
-	Aliases       []sdnAliasXML `xml:"akaList>aka"`
-	DateOfBirth   []sdnDOBXML   `xml:"dateOfBirthList>dateOfBirthItem"`
-	Nationalities []sdnNatXML   `xml:"nationalityList>nationality"`
-}
-
-type sdnAliasXML struct {
-	FirstName string `xml:"firstName"`
-	LastName  string `xml:"lastName"`
-}
-
-type sdnDOBXML struct {
-	DateOfBirth string `xml:"dateOfBirth"`
-}
-
-type sdnNatXML struct {
-	Country string `xml:"country"`
 }
