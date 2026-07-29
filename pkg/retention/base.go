@@ -64,6 +64,12 @@ func (d durable) insert(r Record) error {
 	row.Id = r.ID
 	write(row, r)
 	if err := d.app.Save(row); err != nil {
+		// The identity is unique per org, and the index is what makes it so. Asking
+		// what is retained under it turns the refusal into the one the ledger acts
+		// on, without reading the database's own words for it.
+		if prior, taken := d.retained(r.Org, r.identity); taken == nil && prior.ID != r.ID {
+			return fmt.Errorf("%w: %s", ErrConflict, r.identity)
+		}
 		return fmt.Errorf("%w: retaining %s: %w", ErrStore, r.ID, err)
 	}
 	for _, p := range r.Parties {

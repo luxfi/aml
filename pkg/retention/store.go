@@ -25,6 +25,9 @@ import "time"
 //     everything or nothing.
 //   - read and retained report [ErrNotFound] for an absent record, so a caller can
 //     tell "not there" from "could not look".
+//   - insert reports [ErrConflict] when the identity is already taken. Two retries
+//     that both find nothing retained are stopped here whatever else happens, so
+//     one identity is one record even if the shelf is written to from two places.
 //   - Reads return whole records, copied. There is no operation that returns part
 //     of one, because the unit of disposal is the whole record and a shelf that
 //     could hand out a piece could hand out a record with a piece missing.
