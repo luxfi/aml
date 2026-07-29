@@ -351,6 +351,38 @@ func (h *Handler) ingestTransaction() func(e *core.RequestEvent) error {
 			}
 		}
 
+		// Record the transaction in history before it is judged against history.
+		//
+		// The order is the point. Every aggregate rule reads a window, and a
+		// transaction absent from the window it is evaluated against is judged on a
+		// history that stops one short of it — so the ninth deposit under a
+		// reporting limit is scored against eight, and the alert quotes a total that
+		// does not match the account. Structuring is exactly the typology that
+		// breaks: the transaction completing the pattern is the one excluded from
+		// seeing it.
+		//
+		// A write failure refuses the transaction rather than evaluating it against
+		// an incomplete history, because the alternative is a rule silently
+		// answering "no velocity" for a window it could not read.
+		if h.History != nil {
+			if err := h.History.Append(e.Request.Context(), orgID, history.Event{
+				ID:           tx.ID,
+				At:           tx.Timestamp,
+				USD:          tx.USD,
+				Currency:     tx.Currency,
+				Direction:    tx.Side,
+				User:         tx.UserID,
+				Account:      tx.AccountID,
+				Counterparty: tx.Counterparty,
+				Device:       tx.DeviceFingerprint,
+				Address:      tx.IPAddress,
+				Jurisdiction: entityJurisdiction(in.Entity, tx),
+				Symbol:       tx.Symbol,
+			}); err != nil {
+				return unavailable(e, "history append", err)
+			}
+		}
+
 		// The customer this transaction belongs to.
 		//
 		// Name is deliberately NOT defaulted from the identifier. A customer id is an
@@ -821,4 +853,15 @@ func (h *Handler) searchRelationships() func(e *core.RequestEvent) error {
 		}
 		return e.JSON(http.StatusOK, answer)
 	}
+}
+
+// entityJurisdiction is the jurisdiction a transaction is attributed to: the
+// customer's where it is known, the transaction's otherwise. It is stored on the
+// event so a jurisdiction rule reads what was true at the time rather than what
+// the customer record says today.
+func entityJurisdiction(ent types.Entity, tx types.Transaction) string {
+	if ent.Jurisdiction != "" {
+		return ent.Jurisdiction
+	}
+	return tx.CustomerJurisdiction
 }
