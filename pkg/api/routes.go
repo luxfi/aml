@@ -17,6 +17,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/hanzoai/base/core"
 
+	"github.com/luxfi/aml/pkg/anomaly"
 	"github.com/luxfi/aml/pkg/cases"
 	"github.com/luxfi/aml/pkg/engine"
 	"github.com/luxfi/aml/pkg/replay"
@@ -24,6 +25,7 @@ import (
 	"github.com/luxfi/aml/pkg/sanctions"
 	"github.com/luxfi/aml/pkg/token"
 	"github.com/luxfi/aml/pkg/types"
+	"github.com/luxfi/aml/pkg/velocity"
 )
 
 // Handler wires AML engine + case store + sanctions to HTTP routes.
@@ -43,6 +45,42 @@ type Handler struct {
 	// Keys tokenises direct identifiers before they are retained, and opens
 	// sealed records for the reads that are entitled to them.
 	Keys *token.Keyring
+	// Screening reports whether each sanctions list is fit to screen against.
+	// Without it /v1/aml/sanctions/sources cannot answer, and an empty list
+	// cannot be told apart from a clean party.
+	Screening *sanctions.Monitor
+
+	// Velocity holds the sliding aggregates every behavioural measure reads.
+	// Ingest is the only writer, so what an alert quotes and what the model
+	// scored are the same numbers.
+	Velocity *velocity.Store
+	// Anomaly scores whether a transaction is unusual for the entity, alongside
+	// the rules rather than instead of them. Nil runs on rules alone.
+	Anomaly *anomaly.Store
+	// Limit is the reporting limit a transaction is judged against, which is
+	// what makes a payment sitting just under it visible as structuring rather
+	// than as an ordinary payment. Zero falls back to reportLimit.
+	//
+	// It is one number because the aggregates are kept in one unit. The limit
+	// that actually applies depends on the jurisdiction and the kind of
+	// transaction, and resolving it per transaction needs an entity whose
+	// jurisdiction is known — see the entity resolver above, which does not
+	// have one yet.
+	Limit float64
+}
+
+// reportLimit is the fallback reporting limit, in the unit the aggregates are
+// kept in. EUR 10 000 for an occasional transaction under Regulation (EU)
+// 2024/1624 Art. 19(1)(b), GBP 12 000 under MLR 2017 reg. 27(2), USD 10 000 for a
+// currency transaction report — the same order of magnitude in each, which is why
+// one fallback is defensible and a per-jurisdiction table is still owed.
+const reportLimit = 10_000.0
+
+func (h *Handler) limit() float64 {
+	if h.Limit > 0 {
+		return h.Limit
+	}
+	return reportLimit
 }
 
 // DefaultMaxAlerts is the default maximum number of transaction IDs in the alert store.
@@ -183,10 +221,13 @@ func (h *Handler) Register(se *core.ServeEvent) {
 	se.Router.POST("/v1/aml/cases/{id}/resolve", h.resolveCase())
 	se.Router.GET("/v1/aml/rules", h.listRules())
 	se.Router.POST("/v1/aml/rules/test", h.testRule())
+	se.Router.GET("/v1/aml/anomaly", h.anomalyState())
+	se.Router.POST("/v1/aml/anomaly/test", h.anomalyTest())
 	se.Router.POST("/v1/aml/relationships", h.openRelationship())
 	se.Router.POST("/v1/aml/relationships/{id}/close", h.closeRelationship())
 	se.Router.POST("/v1/aml/relationships/search", h.searchRelationships())
 	se.Router.POST("/v1/aml/sanctions/search", h.searchSanctions())
+	se.Router.GET("/v1/aml/sanctions/sources", h.screeningSources())
 	se.Router.GET("/v1/aml/health", h.health())
 }
 
@@ -317,6 +358,24 @@ func (h *Handler) ingestTransaction() func(e *core.RequestEvent) error {
 		tx.UpdatedAt = now
 		if tx.Timestamp.IsZero() {
 			tx.Timestamp = now
+		}
+
+		// Normalise the value once, here, and overwrite whatever the caller sent.
+		// A client-supplied figure would let a payment declare itself small: the
+		// aggregates, the near-threshold counters and every ratio the model reads
+		// are all in this unit, so accepting one would hand the submitter control
+		// of what counts as just under a reporting limit.
+		tx.USD = engine.USD(tx.Notional, tx.Currency)
+
+		// Aggregate before evaluating. The rule plane and the model both read
+		// these windows, so a transaction has to be in them before it is judged
+		// against them — otherwise the ninth payment under a limit is scored
+		// against a history of eight and the alert quotes a number that does not
+		// match the account.
+		if h.Velocity != nil {
+			for _, k := range anomaly.Keys(tx) {
+				h.Velocity.Record(k, tx.Timestamp, tx.USD, h.limit())
+			}
 		}
 
 		// Resolve entity — for now use a minimal entity from the tx.
