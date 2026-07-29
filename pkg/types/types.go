@@ -94,25 +94,34 @@ const (
 
 // Transaction is an incoming transaction event for AML evaluation.
 type Transaction struct {
-	ID                string          `json:"id"`
-	OrgID             string          `json:"org_id"`
-	TenantID          string          `json:"tenant_id,omitempty"`
-	Source            string          `json:"source"`
-	UserID            string          `json:"user_id"`
-	AccountID         string          `json:"account_id,omitempty"`
-	Symbol            string          `json:"symbol,omitempty"`
-	AssetClass        string          `json:"asset_class,omitempty"`
-	Side              string          `json:"side,omitempty"`
-	Qty               float64         `json:"qty"`
-	Notional          float64         `json:"notional"`
-	Currency          string          `json:"currency"`
-	Counterparty      string          `json:"counterparty,omitempty"`
-	IPAddress         string          `json:"ip_address,omitempty"`
-	DeviceFingerprint string          `json:"device_fingerprint,omitempty"`
-	Timestamp         time.Time       `json:"timestamp"`
-	Raw               json.RawMessage `json:"raw,omitempty"`
-	CreatedAt         time.Time       `json:"created_at"`
-	UpdatedAt         time.Time       `json:"updated_at"`
+	ID           string  `json:"id"`
+	OrgID        string  `json:"org_id"`
+	TenantID     string  `json:"tenant_id,omitempty"`
+	Source       string  `json:"source"`
+	UserID       string  `json:"user_id"`
+	AccountID    string  `json:"account_id,omitempty"`
+	Symbol       string  `json:"symbol,omitempty"`
+	AssetClass   string  `json:"asset_class,omitempty"`
+	Side         string  `json:"side,omitempty"`
+	Qty          float64 `json:"qty"`
+	Notional     float64 `json:"notional"`
+	Currency     string  `json:"currency"`
+	Counterparty string  `json:"counterparty,omitempty"`
+	// Direction records whether value came in or went out. Without it the engine
+	// cannot see funds passing through an account, which is the layering signature.
+	Direction string `json:"direction,omitempty"`
+	// CustomerName and CustomerJurisdiction carry the customer record the engine
+	// screens and scopes rules by. The previous ingestion path synthesised a
+	// customer from the identifier alone, so every screening rule and every
+	// jurisdiction rule evaluated against an empty name and an empty country.
+	CustomerName         string          `json:"customer_name,omitempty"`
+	CustomerJurisdiction string          `json:"customer_jurisdiction,omitempty"`
+	IPAddress            string          `json:"ip_address,omitempty"`
+	DeviceFingerprint    string          `json:"device_fingerprint,omitempty"`
+	Timestamp            time.Time       `json:"timestamp"`
+	Raw                  json.RawMessage `json:"raw,omitempty"`
+	CreatedAt            time.Time       `json:"created_at"`
+	UpdatedAt            time.Time       `json:"updated_at"`
 }
 
 // Entity is a normalized actor (user, account, counterparty).
