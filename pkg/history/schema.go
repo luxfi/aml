@@ -5,37 +5,23 @@
 package history
 
 import (
-	"fmt"
-
 	"github.com/hanzoai/base/core"
+
+	"github.com/luxfi/aml/pkg/store"
 )
 
-// Ensure creates the transaction collection if it does not exist.
+// events is where transaction events are stored.
 //
-// This is the seam every aggregate rule stood on, and it was missing. Without the
-// collection, a window query fails, and a rule that cannot read history reaches no
-// verdict — so twelve of twenty rules faulted on every transaction and the engine
-// could report nothing about velocity, structuring, dormancy or deviation. It is
-// created here rather than in a migration file so that the schema the reader
-// queries and the schema that exists are written in one place: a migration that
-// drifts from these field names produces an empty window, and an empty window
-// reads as a customer with no history rather than as a broken deployment.
+// Nothing here is required except the identifiers a window is keyed by: a
+// transaction with no device is ordinary, but one with no organisation cannot be
+// scoped to a tenant and one with no timestamp cannot be placed in a window.
 //
-// It is idempotent, so it runs on every start and does nothing on an existing
-// install.
-func Ensure(app core.App) error {
-	if _, err := app.FindCollectionByNameOrId(Collection); err == nil {
-		return nil
-	}
-
-	c := core.NewBaseCollection(Collection)
-
-	// Every field a window reads. Nothing here is Required except the identifiers a
-	// window is keyed by: a transaction with no device is ordinary, but one with no
-	// organisation cannot be scoped to a tenant and one with no timestamp cannot be
-	// placed in a window.
-	c.Fields.Add(
-		&core.TextField{Name: fieldOrg, Required: true},
+// Windows are always read as (org, subject, time range), so the indexes follow the
+// query rather than the fields. Without them every velocity rule is a table scan
+// per rule per transaction, which is the cost model this design exists to avoid.
+var events = store.Kind{
+	Name: Collection,
+	Fields: []core.Field{
 		&core.TextField{Name: fieldTxID, Required: true},
 		&core.DateField{Name: fieldAt, Required: true},
 		&core.NumberField{Name: fieldUSD},
@@ -48,35 +34,28 @@ func Ensure(app core.App) error {
 		&core.TextField{Name: fieldAddress},
 		&core.TextField{Name: fieldJurisdiction},
 		&core.TextField{Name: fieldSymbol},
-	)
-
-	// Windows are always read as (org, subject, time range), so the indexes follow
-	// the query rather than the fields. Without them every velocity rule is a table
-	// scan per rule per transaction, which is the cost model this design exists to
-	// avoid.
-	c.Indexes = []string{
-		idx("org_at", fieldOrg, fieldAt),
-		idx("org_user_at", fieldOrg, fieldUser, fieldAt),
-		idx("org_account_at", fieldOrg, fieldAccount, fieldAt),
-		idx("org_counterparty_at", fieldOrg, fieldCounterparty, fieldAt),
-		idx("org_device_at", fieldOrg, fieldDevice, fieldAt),
-		idx("org_address_at", fieldOrg, fieldAddress, fieldAt),
-	}
-
-	if err := app.Save(c); err != nil {
-		return fmt.Errorf("history: creating collection %s: %w", Collection, err)
-	}
-	return nil
+	},
+	Indexes: []store.Index{
+		{Name: "org_at", Fields: []string{store.Org, fieldAt}},
+		{Name: "org_user_at", Fields: []string{store.Org, fieldUser, fieldAt}},
+		{Name: "org_account_at", Fields: []string{store.Org, fieldAccount, fieldAt}},
+		{Name: "org_counterparty_at", Fields: []string{store.Org, fieldCounterparty, fieldAt}},
+		{Name: "org_device_at", Fields: []string{store.Org, fieldDevice, fieldAt}},
+		{Name: "org_address_at", Fields: []string{store.Org, fieldAddress, fieldAt}},
+	},
 }
 
-// idx builds a CREATE INDEX statement over the collection's own table.
-func idx(name string, fields ...string) string {
-	cols := ""
-	for i, f := range fields {
-		if i > 0 {
-			cols += ", "
-		}
-		cols += "`" + f + "`"
-	}
-	return fmt.Sprintf("CREATE INDEX `idx_%s_%s` ON `%s` (%s)", Collection, name, Collection, cols)
-}
+// Ensure creates the transaction collection if it does not exist.
+//
+// This is the seam every aggregate rule stood on, and it was missing. Without the
+// collection, a window query fails, and a rule that cannot read history reaches no
+// verdict — so twelve of twenty rules faulted on every transaction and the engine
+// could report nothing about velocity, structuring, dormancy or deviation. The
+// collection is declared here rather than in a migration file so that the schema
+// the reader queries and the schema that exists are one declaration: a migration
+// that drifts from these field names produces an empty window, and an empty window
+// reads as a customer with no history rather than as a broken deployment.
+//
+// It is idempotent, so it runs on every start and does nothing on an existing
+// install.
+func Ensure(app core.App) error { return events.Ensure(app) }
