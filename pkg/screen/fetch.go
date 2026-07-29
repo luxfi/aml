@@ -56,21 +56,84 @@ type Result struct {
 // a publisher that designates nobody.
 func Fetch(ctx context.Context) []Result {
 	client := &http.Client{Timeout: 3 * time.Minute}
+	return fetch(ctx, func(ctx context.Context, url string) ([]byte, string, error) {
+		return get(ctx, client, url)
+	}, sleep)
+}
+
+// download fetches one list and returns its bytes and digest. It is a parameter of
+// fetch rather than a call into the network, so the retry behaviour that decides
+// whether a blip costs a day of screening can be tested without one.
+type download func(ctx context.Context, url string) (body []byte, digest string, err error)
+
+// attempts is how many times a publisher is asked before its list is recorded as
+// failed. The refresh runs daily, so without a retry a single lost packet costs a
+// whole day of screening against a list one designation out of date — and the
+// measured failures are exactly that kind: the EU file answered a TLS record
+// version error once and served 24.8 MB correctly on the next request, from the
+// same host, seconds later.
+const attempts = 3
+
+// backoff is the wait before retrying a publisher. It grows per attempt, because a
+// publisher that just failed under load is not helped by being asked again
+// immediately.
+const backoff = 5 * time.Second
+
+// fetch downloads and parses every list, retrying a publisher that fails.
+//
+// A failure for one publisher does not abandon the others, and every failure is
+// reported rather than returned as an empty list. Only transport is retried: a
+// parse failure is a schema disagreement and will fail identically on the next
+// attempt, so retrying it delays the refresh without changing the outcome.
+func fetch(ctx context.Context, fetchOne download, wait func(context.Context, time.Duration) error) []Result {
 	out := make([]Result, 0, len(sources))
+
 	for _, s := range sources {
-		body, digest, err := get(ctx, client, s.url)
-		if err != nil {
-			out = append(out, Result{Source: s.name, Err: err})
-			continue
+		var res Result
+		res.Source = s.name
+
+		for attempt := 1; attempt <= attempts; attempt++ {
+			body, digest, err := fetchOne(ctx, s.url)
+			if err != nil {
+				res.Err = fmt.Errorf("attempt %d of %d: %w", attempt, attempts, err)
+				// The context ending is the deployment shutting down or giving up, not
+				// the publisher failing, so there is nothing to retry into.
+				if ctx.Err() != nil {
+					break
+				}
+				if attempt < attempts {
+					if werr := wait(ctx, time.Duration(attempt)*backoff); werr != nil {
+						break
+					}
+					continue
+				}
+				break
+			}
+
+			res.Digest = digest
+			entries, perr := s.parse(body)
+			if perr != nil {
+				res.Err = perr
+				break
+			}
+			res.Entries, res.Err = entries, nil
+			break
 		}
-		entries, err := s.parse(body)
-		if err != nil {
-			out = append(out, Result{Source: s.name, Digest: digest, Err: err})
-			continue
-		}
-		out = append(out, Result{Source: s.name, Entries: entries, Digest: digest})
+		out = append(out, res)
 	}
 	return out
+}
+
+// sleep waits, or returns early if the context ends first.
+func sleep(ctx context.Context, d time.Duration) error {
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-t.C:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 func get(ctx context.Context, client *http.Client, url string) ([]byte, string, error) {
