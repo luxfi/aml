@@ -6,6 +6,7 @@ package engine
 import (
 	"fmt"
 	"math"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -137,7 +138,20 @@ func (e *Engine) Evaluate(tx types.Transaction, entity types.Entity) ([]types.Al
 		Entity: entity,
 	}
 
-	hits := e.evaluator.EvalAll(rules, ctx)
+	// Rules that matched and rules that could not run are different findings and
+	// are kept apart. A rule that errors has established nothing about this
+	// transaction, so it does not become a typology alert and does not enter the
+	// score — while still preventing a silent clearance, because a fault means
+	// the transaction was not fully assessed.
+	var hits, faults []types.RuleHit
+	for _, h := range e.evaluator.EvalAll(rules, ctx) {
+		switch {
+		case h.EvalErr != "":
+			faults = append(faults, h)
+		case h.Match:
+			hits = append(hits, h)
+		}
+	}
 
 	// The Scorer is consulted after the rules and its evidence joins theirs, so
 	// the statistical plane can only add to what the rules found. It can raise a
@@ -147,7 +161,7 @@ func (e *Engine) Evaluate(tx types.Transaction, entity types.Entity) ([]types.Al
 		hits = append(hits, hit)
 	}
 
-	if len(hits) == 0 {
+	if len(hits) == 0 && len(faults) == 0 {
 		return nil, 0, types.ActionAllow
 	}
 
@@ -172,8 +186,42 @@ func (e *Engine) Evaluate(tx types.Transaction, entity types.Entity) ([]types.Al
 		})
 	}
 
+	// One alert for the faults, naming them, rather than one per failed rule
+	// dressed as a typology match. It carries no score, because a rule that did
+	// not run is not evidence of risk, and it forces review, because a
+	// transaction assessed by only part of the rule set has not been cleared.
+	if len(faults) > 0 {
+		alerts = append(alerts, faultAlert(tx, faults, now))
+	}
+
 	action := resolveAction(alerts)
 	return alerts, score, action
+}
+
+// faultAlert reports rules that could not be evaluated against one transaction.
+func faultAlert(tx types.Transaction, faults []types.RuleHit, now time.Time) types.Alert {
+	names := make([]string, 0, len(faults))
+	causes := make([]types.Cause, 0, len(faults))
+	for _, f := range faults {
+		names = append(names, f.Rule.Name)
+		causes = append(causes, types.Cause{
+			Feature:   f.Rule.Name,
+			Indicator: f.EvalErr,
+			Severity:  f.Rule.Severity,
+		})
+	}
+	return types.Alert{
+		ID:          uuid.NewString(),
+		OrgID:       tx.OrgID,
+		TxID:        tx.ID,
+		RuleName:    fmt.Sprintf("%d rule(s) could not be evaluated: %s", len(faults), strings.Join(names, ", ")),
+		Severity:    types.SeverityHigh,
+		Score:       0,
+		Causes:      causes,
+		ActionTaken: types.ActionReview,
+		CreatedAt:   now,
+		UpdatedAt:   now,
+	}
 }
 
 // resolveAction picks the most demanding action from a set of alerts.
