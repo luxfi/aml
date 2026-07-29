@@ -105,52 +105,84 @@ func TestCheckEscalation_AlreadyClosed(t *testing.T) {
 	}
 }
 
-func TestAutoClose(t *testing.T) {
+// A case nobody has worked must be escalated, never closed.
+//
+// Closing asserts that somebody assessed the case and decided; inactivity asserts
+// the opposite, and the two must not produce the same state. Store.Resolve refuses
+// a closure with no assessment for exactly this reason — a dismissed alert is a
+// retained decision with its rationale (AMLR Art. 77(1)(b), JMLSG 6.32) — and the
+// old auto-close path wrote the same fields directly and walked around it. Eviction
+// then removed the closed case, so an alert that was raised and never reviewed left
+// no trace of having existed.
+func TestAStaleCaseIsEscalatedNotClosed(t *testing.T) {
 	s := NewStore()
-
-	// Low-severity case with old activity.
-	c := s.Create("org1", types.SeverityLow, nil, nil)
-	s.mu.Lock()
-	s.cases[c.ID].UpdatedAt = time.Now().UTC().Add(-60 * 24 * time.Hour) // 60 days old
-	s.mu.Unlock()
-
-	// Medium-severity case that should not be auto-closed.
-	c2 := s.Create("org1", types.SeverityMedium, nil, nil)
-	s.mu.Lock()
-	s.cases[c2.ID].UpdatedAt = time.Now().UTC().Add(-60 * 24 * time.Hour)
-	s.mu.Unlock()
-
-	config := DefaultTriageConfig()
-	closed := s.AutoClose(config)
-	if closed != 1 {
-		t.Errorf("closed = %d, want 1 (only low-severity)", closed)
+	stale := func(severity string) *types.Case {
+		c := s.Create("org1", severity, nil, nil)
+		s.mu.Lock()
+		s.cases[c.ID].UpdatedAt = time.Now().UTC().Add(-60 * 24 * time.Hour)
+		s.mu.Unlock()
+		return c
 	}
 
-	got := s.Get(c.ID)
-	if got.Status != types.CaseClosed {
-		t.Errorf("low-severity status = %q, want closed", got.Status)
-	}
-	if got.Resolution != "auto_closed_inactive" {
-		t.Errorf("resolution = %q, want auto_closed_inactive", got.Resolution)
+	low := stale(types.SeverityLow)
+	// A critical case nobody has touched is the more serious governance failure, not
+	// the less — the old path swept only low severity, which had it the wrong way up.
+	critical := stale(types.SeverityCritical)
+
+	if n := s.AutoEscalateStale(DefaultTriageConfig()); n != 2 {
+		t.Fatalf("escalated %d stale cases, want 2 — every severity, not only low", n)
 	}
 
-	got2 := s.Get(c2.ID)
-	if got2.Status == types.CaseClosed {
-		t.Error("medium-severity case should not be auto-closed")
+	for _, c := range []*types.Case{low, critical} {
+		got := s.Get(c.ID)
+		if got.Status == types.CaseClosed {
+			t.Errorf("a case nobody assessed was CLOSED, asserting a decision that was never made")
+		}
+		if got.Status != types.CaseEscalated {
+			t.Errorf("status = %q, want escalated", got.Status)
+		}
+		if got.Resolution != "" {
+			t.Errorf("resolution = %q — inactivity is not a resolution", got.Resolution)
+		}
+		if got.Assessment != "" {
+			t.Errorf("assessment = %q — no assessment was made", got.Assessment)
+		}
 	}
 }
 
-func TestAutoClose_RecentActivity(t *testing.T) {
+// Nothing on a timer may close a case, whatever it is called. Closing requires an
+// assessment and a person, and a cron has neither.
+func TestNoTimerPathCanCloseACase(t *testing.T) {
 	s := NewStore()
 	c := s.Create("org1", types.SeverityLow, nil, nil)
-	// UpdatedAt is now (fresh), so auto-close should skip it.
+	s.mu.Lock()
+	s.cases[c.ID].UpdatedAt = time.Now().UTC().Add(-365 * 24 * time.Hour)
+	s.mu.Unlock()
 
-	config := DefaultTriageConfig()
-	closed := s.AutoClose(config)
-	if closed != 0 {
-		t.Errorf("closed = %d, want 0 (recent activity)", closed)
+	s.AutoEscalateStale(DefaultTriageConfig())
+	s.TriageCheck("org1", []string{"analyst-1"}, DefaultTriageConfig())
+
+	if got := s.Get(c.ID); got.Status == types.CaseClosed {
+		t.Fatal("a triage cycle closed a case; only a person with an assessment may")
 	}
-	_ = c
+
+	// And the closure path still refuses without one.
+	if err := s.Resolve(c.ID, "cleared", "analyst-1", ""); err == nil {
+		t.Fatal("a case was closed with no retained assessment")
+	}
+}
+
+// A case somebody worked recently is left alone.
+func TestRecentActivityIsNotStale(t *testing.T) {
+	s := NewStore()
+	c := s.Create("org1", types.SeverityLow, nil, nil)
+
+	if n := s.AutoEscalateStale(DefaultTriageConfig()); n != 0 {
+		t.Errorf("escalated %d cases, want 0 — this one was just created", n)
+	}
+	if got := s.Get(c.ID); got.Status != types.CaseOpen {
+		t.Errorf("status = %q, want open", got.Status)
+	}
 }
 
 func TestTriageCheck_FullCycle(t *testing.T) {

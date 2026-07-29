@@ -11,8 +11,10 @@ import (
 type TriageConfig struct {
 	AutoAssignEnabled bool
 	EscalationSLA     map[string]time.Duration // severity -> max time before escalation
-	AutoCloseAfter    time.Duration            // auto-close low-severity if no activity
-	AssignmentMode    string                   // "round_robin", "least_loaded", "manual"
+	// StaleAfter is how long a case may sit unworked before it is escalated. A
+	// case is never closed on a timer: closing asserts a decision was made.
+	StaleAfter     time.Duration
+	AssignmentMode string // "round_robin", "least_loaded", "manual"
 }
 
 // DefaultTriageConfig returns production-safe SLA defaults.
@@ -25,7 +27,7 @@ func DefaultTriageConfig() TriageConfig {
 			types.SeverityMedium:   24 * time.Hour,
 			types.SeverityLow:      72 * time.Hour,
 		},
-		AutoCloseAfter: 30 * 24 * time.Hour, // 30 days
+		StaleAfter:     30 * 24 * time.Hour, // 30 days unworked is a governance failure, not a decision
 		AssignmentMode: "round_robin",
 	}
 }
@@ -118,16 +120,34 @@ func (s *Store) CheckEscalation(c *types.Case, config TriageConfig) bool {
 	return true
 }
 
-// AutoClose closes low-severity cases with no activity after the configured threshold.
-// Returns the number of cases closed.
-func (s *Store) AutoClose(config TriageConfig) int {
-	if config.AutoCloseAfter <= 0 {
+// AutoEscalateStale escalates cases nobody has worked after the configured
+// threshold, and returns how many it escalated.
+//
+// It used to CLOSE them, which is the defect this replaces. Closing a case asserts
+// that somebody assessed it and decided; inactivity asserts the opposite. The two
+// must not produce the same state, because a dismissed alert is a retained decision
+// with its rationale — Regulation (EU) 2024/1624 Art. 77(1)(b) requires the record
+// of the assessment whether or not it resulted in a report, and JMLSG 6.32 requires
+// the compliance officer to consider why alerts were not escalated. "Nobody looked
+// at it for thirty days" is not an assessment anybody can defend.
+//
+// It was also unreachable as a control. Store.Resolve refuses a closure with no
+// assessment; this path wrote the same fields directly and walked around that
+// invariant, and eviction then removed the closed case after its retention window —
+// so an alert that was raised, never reviewed, and silently closed left no trace of
+// having existed.
+//
+// Escalation is the honest outcome: an alert nobody has looked at is exactly what a
+// compliance officer needs to see, and escalating puts it in front of one instead of
+// deleting the question.
+func (s *Store) AutoEscalateStale(config TriageConfig) int {
+	if config.StaleAfter <= 0 {
 		return 0
 	}
 
 	now := time.Now().UTC()
-	threshold := now.Add(-config.AutoCloseAfter)
-	closed := 0
+	threshold := now.Add(-config.StaleAfter)
+	escalated := 0
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -136,36 +156,37 @@ func (s *Store) AutoClose(config TriageConfig) int {
 		if c.Status == types.CaseClosed || c.Status == types.CaseEscalated {
 			continue
 		}
-		if c.Severity != types.SeverityLow {
+		if !c.UpdatedAt.Before(threshold) {
 			continue
 		}
 
-		// Check last activity: use UpdatedAt as proxy.
-		if c.UpdatedAt.Before(threshold) {
-			c.Status = types.CaseClosed
-			c.Resolution = "auto_closed_inactive"
-			c.ClosedAt = &now
-			c.UpdatedAt = now
+		// Every severity, not only low. The original only swept low-severity cases,
+		// which reads as caution and is the wrong way round: a critical case nobody
+		// has touched is the more serious governance failure, not the less.
+		c.Status = types.CaseEscalated
+		c.UpdatedAt = now
 
-			s.events[c.ID] = append(s.events[c.ID], types.CaseEvent{
-				Kind:      types.EventStatusChange,
-				CaseID:    c.ID,
-				AuthorID:  "system",
-				Body:      "auto-closed: no activity for " + config.AutoCloseAfter.String(),
-				CreatedAt: now,
-			})
-			closed++
-		}
+		s.events[c.ID] = append(s.events[c.ID], types.CaseEvent{
+			Kind:      types.EventStatusChange,
+			CaseID:    c.ID,
+			AuthorID:  "system",
+			Body:      "escalated: no one has worked this case for " + config.StaleAfter.String(),
+			CreatedAt: now,
+		})
+		escalated++
 	}
 
-	return closed
+	return escalated
 }
 
-// TriageCheck runs the full triage cycle: auto-assign unassigned, escalate overdue, auto-close stale.
-// Intended to run every 5 minutes.
-func (s *Store) TriageCheck(orgID string, analysts []string, config TriageConfig) (assigned, escalated, autoClosed int) {
-	// Auto-close stale low-severity FIRST — before assign refreshes UpdatedAt.
-	autoClosed = s.AutoClose(config)
+// TriageCheck runs the full triage cycle: escalate cases nobody has worked, assign
+// the unassigned, escalate those past their SLA. Intended to run every few minutes.
+//
+// Nothing here closes a case. Closing requires an assessment and a person, and
+// neither is available to a cron.
+func (s *Store) TriageCheck(orgID string, analysts []string, config TriageConfig) (assigned, escalated, stale int) {
+	// Stale first, before assignment refreshes UpdatedAt and hides the staleness.
+	stale = s.AutoEscalateStale(config)
 
 	cases := s.List(orgID, "")
 	for _, c := range cases {
@@ -186,5 +207,5 @@ func (s *Store) TriageCheck(orgID string, analysts []string, config TriageConfig
 		}
 	}
 
-	return assigned, escalated, autoClosed
+	return assigned, escalated, stale
 }
