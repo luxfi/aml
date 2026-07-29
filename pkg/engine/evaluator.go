@@ -96,13 +96,13 @@ func (e *Evaluator) registerDefaults() {
 		// expr-lang passes the struct directly.
 		switch v := params[0].(type) {
 		case types.Transaction:
-			return notionalUSD(v.Notional, v.Currency), nil
+			return USD(v.Notional, v.Currency), nil
 		case *types.Transaction:
-			return notionalUSD(v.Notional, v.Currency), nil
+			return USD(v.Notional, v.Currency), nil
 		case map[string]interface{}:
 			notional, _ := v["Notional"].(float64)
 			currency, _ := v["Currency"].(string)
-			return notionalUSD(notional, currency), nil
+			return USD(notional, currency), nil
 		default:
 			return 0.0, fmt.Errorf("notional_usd: unexpected type %T", params[0])
 		}
@@ -120,9 +120,14 @@ var fxRates = map[string]float64{
 	"NOK": 0.094, "DKK": 0.14, "PLN": 0.25, "THB": 0.028,
 }
 
-// notionalUSD converts a notional amount to USD using approximate FX rates.
+// USD converts a notional amount to USD using approximate FX rates.
 // Unknown currencies return the raw notional value (conservative — assumes USD).
-func notionalUSD(notional float64, currency string) float64 {
+//
+// Exported because it is the one conversion in the engine and every caller has to
+// use the same one. A second table anywhere would mean two answers to what a
+// transaction is worth, and a threshold is only a threshold if the value it is
+// compared against was computed one way.
+func USD(notional float64, currency string) float64 {
 	if currency == "" || currency == "USD" {
 		return notional
 	}
@@ -233,12 +238,16 @@ func (e *Evaluator) EvalAll(rules []types.Rule, ctx types.EvalContext) []types.R
 
 		match, err := e.Eval(r, ctx)
 		if err != nil {
-			// RED-03: Fail closed on eval errors. A broken rule should trigger
-			// review, not silently allow the transaction through. The error is
-			// captured in the hit so analysts can see WHY the rule flagged.
+			// A rule that could not be evaluated is reported, so the transaction
+			// is never silently cleared by a rule that did not run. But it is
+			// reported as a fault and NOT as a match: a rule that failed has
+			// established nothing about this transaction, and a rule that fails
+			// once fails on every transaction — so recording the fault as a match
+			// alerts on all of them and empties an alert of its meaning.
+			// Evaluate separates the two.
 			hits = append(hits, types.RuleHit{
 				Rule:    r,
-				Match:   true,
+				Match:   false,
 				EvalErr: err.Error(),
 			})
 			continue

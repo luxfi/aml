@@ -175,7 +175,7 @@ func TestCausesReachTheAlert(t *testing.T) {
 		Feature: "subthreshold", Typology: "structuring",
 		Indicator: "transactions split to circumvent reporting limits",
 		Citation:  "EBA/GL/2021/02, Guideline 4.60(a)", Severity: types.SeverityHigh,
-		Unit: "share of transactions falling just below the reporting threshold",
+		Unit:     "share of transactions falling just below the reporting threshold",
 		Observed: 11, Baseline: 11, Without: 0.31, Share: 0.62,
 	}}
 	e := New(nil)
