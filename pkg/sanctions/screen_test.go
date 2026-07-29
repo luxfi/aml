@@ -472,3 +472,47 @@ func TestOFACBirthShapes(t *testing.T) {
 		t.Error("a date with no year must not parse")
 	}
 }
+
+func TestSingleNameFragmentDoesNotIdentifyAWholePerson(t *testing.T) {
+	// Both cases are real: screening 31,338 published designations produced exactly
+	// these two false positives, each a one-word list entry scoring above the
+	// threshold against an unrelated three-part name because it shared a prefix with
+	// the middle name.
+	for _, c := range []struct{ listed, queried string }{
+		{"Micha", "Jonathan Micklethwaite Harbourne"},
+		{"PERIA", "Priya Venkataraman Rao"},
+	} {
+		list := []Entry{subject(c.listed)}
+		if m := Screen(Query{Name: c.queried}, list, Threshold); len(m) != 0 {
+			t.Errorf("the fragment %q must not identify %q, scored %.4f",
+				c.listed, c.queried, m[0].Score)
+		}
+	}
+}
+
+func TestSingleNameStillMatchesSingleName(t *testing.T) {
+	// A mononym against a mononym is all the evidence there is, and a genuine
+	// transliteration of one scores below both of the false positives above — so the
+	// fragment rule must not reach this case.
+	for _, c := range []struct{ listed, queried string }{
+		{"Usama", "Osama"},
+		{"Mohammed", "Mohammad"},
+		{"Ivan", "Ivan"},
+	} {
+		list := []Entry{subject(c.listed)}
+		if m := Screen(Query{Name: c.queried}, list, Threshold); len(m) != 1 {
+			t.Errorf("%q must match the listed mononym %q, scored %.4f",
+				c.queried, c.listed, Similarity(c.queried, c.listed))
+		}
+	}
+}
+
+func TestSingleNameMatchesAFullNameOnlyWhenExact(t *testing.T) {
+	// An exact fragment is still evidence: a designated mononym that appears
+	// verbatim as one of a customer's names must be reported.
+	list := []Entry{subject("Ibrahim")}
+	if m := Screen(Query{Name: "Abdullah Ibrahim"}, list, Threshold); len(m) != 1 {
+		t.Fatalf("an exact single name must match a full name containing it, scored %.4f",
+			Similarity("Abdullah Ibrahim", "Ibrahim"))
+	}
+}

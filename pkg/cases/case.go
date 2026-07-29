@@ -166,6 +166,29 @@ func (s *Store) UpdateStatus(caseID, status, authorID string) error {
 	return nil
 }
 
+// AddEventFor appends to a case timeline after confirming the case belongs to the
+// organisation making the request.
+//
+// The organisation is checked rather than assumed. A case identifier is returned
+// to whoever submitted the transaction, so treating possession of the identifier
+// as authority to write on the case lets one tenant annotate another's
+// investigation.
+func (s *Store) AddEventFor(orgID, caseID string, evt types.CaseEvent) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	c, ok := s.cases[caseID]
+	if !ok || c.OrgID != orgID {
+		return ErrNotFound
+	}
+
+	evt.ID = uuid.NewString()
+	evt.CaseID = caseID
+	evt.CreatedAt = time.Now().UTC()
+	s.events[caseID] = append(s.events[caseID], evt)
+	return nil
+}
+
 // AddEvent appends a note, file, or other event to a case timeline.
 func (s *Store) AddEvent(caseID string, evt types.CaseEvent) error {
 	s.mu.Lock()

@@ -167,8 +167,34 @@ func Similarity(a, b string) float64 {
 		}
 		total += best
 	}
-	return total / float64(len(ta))
+	score := total / float64(len(ta))
+
+	// A single name compared against a name of several parts must match almost
+	// exactly.
+	//
+	// Comparing the shorter name against the longer is what lets a customer who
+	// omitted a patronymic still match, but read in the other direction it lets one
+	// short fragment stand in for a whole person: screening 31,338 real designations
+	// produced exactly two false positives, both of this shape — a one-word entry
+	// scoring 0.86 and 0.88 against an unrelated three-part name because it happened
+	// to share a prefix with the middle name. The fragment matched a name and left
+	// the rest of the person unaccounted for.
+	//
+	// The threshold cannot be raised generally to exclude them: a genuine
+	// transliteration of a single name, Osama against Usama, scores 0.87, below both
+	// false positives. What separates the cases is not the score but the asymmetry.
+	// One name against one name is all the evidence there is and is judged on the
+	// ordinary threshold; one name against three is a fragment, and a fragment
+	// identifies somebody only when it is exact.
+	if len(ta) == 1 && len(tb) > 1 && score < fragmentThreshold {
+		return 0
+	}
+	return score
 }
+
+// fragmentThreshold is how well a single-token name must match a name of several
+// parts before it counts as the same person.
+const fragmentThreshold = 0.95
 
 // byteRunes exists only so the mutation harness can substitute bytewise indexing
 // for rune indexing and demonstrate that the suite detects it.
