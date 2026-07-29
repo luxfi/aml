@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"math"
 	"math/rand/v2"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -331,19 +332,132 @@ func TestUnusablePointsAreRefused(t *testing.T) {
 		t.Fatal("a point inside the unit cube was refused")
 	}
 
-	// And judge must decline rather than learn when the gate refuses, counting
-	// the refusal so the silence is legible.
+	// And the gate must be enforced where it matters: a point the trees must not
+	// take is refused, is not learned from, and is counted.
 	st := newStream(t, Config{})
 	st.warm(2300)
 	before := st.s.State(org)
+
+	var bad Point
+	for i := range bad.X {
+		bad.X[i] = 0.5
+	}
+	bad.X[4] = math.NaN()
+	a := st.s.weigh(org, bad, "tx-unusable", start, true)
+	if a.Scored || a.Alert {
+		t.Fatalf("an unusable point was scored: %+v", a)
+	}
+	if a.Reason != ReasonUnusable {
+		t.Fatalf("reason = %q, want %q", a.Reason, ReasonUnusable)
+	}
+
+	after := st.s.State(org)
+	if after.Learned != before.Learned {
+		t.Fatalf("the model learned an unusable point: %d -> %d", before.Learned, after.Learned)
+	}
+	if after.Refused[ReasonUnusable] != before.Refused[ReasonUnusable]+1 {
+		t.Fatalf("refusal not counted: %d -> %d", before.Refused[ReasonUnusable], after.Refused[ReasonUnusable])
+	}
 	st.s.mu.RLock()
 	m := st.s.orgs[org]
 	st.s.mu.RUnlock()
 	m.mu.Lock()
-	m.refused[ReasonUnusable] += 0 // the counter exists before it is needed
-	m.mu.Unlock()
-	if _, held := before.Refused[ReasonUnusable]; !held {
-		t.Fatal("state does not report the unusable refusal at all")
+	defer m.mu.Unlock()
+	for i, tr := range m.trees {
+		if !tr.sound(st.s.cfg.Depth) {
+			t.Fatalf("tree %d holds unusable mass", i)
+		}
+	}
+}
+
+// The threshold has to hold the realised rate at or below the stated appetite,
+// which is a property of one arithmetic choice: the cut is the upper edge of the
+// bucket that exhausts the review budget, not the lower one. At the lower edge the
+// whole of that bucket is admitted and the model quietly reviews more than it was
+// authorised to. Pinned on the function rather than on a rate measured from a
+// stream, because a rate measured from a stream has noise to hide in.
+func TestThresholdCannotAdmitMoreThanTheAppetite(t *testing.T) {
+	hist := make([]float64, histBuckets)
+	hist[0] = 9000 // the ordinary mass
+	hist[97] = 200
+	hist[198] = 60
+	hist[249] = 30
+	hist[255] = 10
+	var total float64
+	for _, c := range hist {
+		total += c
+	}
+
+	for _, review := range []float64{0.0005, 0.001, 0.005, 0.01, 0.05, 0.2} {
+		c := cut(hist, review)
+		if c < 0 || c > 1 {
+			t.Fatalf("review %v produced a threshold of %v", review, c)
+		}
+		// Every bucket whose scores can exceed the cut is admitted.
+		var admitted float64
+		for i, mass := range hist {
+			if float64(i)/float64(histBuckets) >= c {
+				admitted += mass
+			}
+		}
+		if admitted > review*total {
+			t.Errorf("review %.4f admits %.0f of %.0f (%.4f), above the appetite",
+				review, admitted, total, admitted/total)
+		}
+	}
+
+	// An empty distribution must admit nothing rather than everything, and no
+	// score can exceed the threshold it returns.
+	if c := cut(make([]float64, histBuckets), 0.01); c < 1 {
+		t.Fatalf("an unobserved distribution produced threshold %v, which admits scores", c)
+	}
+}
+
+// The model must forget. It is a streaming detector and the reason for that is
+// concept drift: what a tenant's customers do changes, and a reference that
+// accumulated forever would keep scoring against behaviour that stopped years
+// ago — and, worse for a control, would let anyone who once established a pattern
+// keep it looking ordinary indefinitely.
+//
+// Points are handed in directly rather than generated from a stream, so the claim
+// is about the reference folding and nothing else.
+func TestModelForgetsWhatTheTenantStoppedDoing(t *testing.T) {
+	st := newStream(t, Config{})
+
+	corner := func(v float64) Point {
+		var p Point
+		for i := range p.X {
+			p.X[i] = 0.5
+		}
+		p.X[4], p.X[5] = v, v // the structuring pair
+		return p
+	}
+	was, now := corner(0.05), corner(0.95)
+
+	learn := func(p Point, n int) {
+		for i := 0; i < n; i++ {
+			st.s.weigh(org, p, fmt.Sprintf("l-%d", i), start, true)
+		}
+	}
+	look := func(p Point) float64 {
+		return st.s.weigh(org, p, "probe", start, false).Score
+	}
+
+	learn(was, 4000)
+	settled, novel := look(was), look(now)
+	if settled >= novel {
+		t.Fatalf("what the tenant does scores %.3f and what it does not scores %.3f", settled, novel)
+	}
+
+	// The population moves. What it moved to must become ordinary...
+	learn(now, 8000)
+	if got := look(now); got >= novel {
+		t.Fatalf("after 8,000 transactions the new pattern still scores %.3f, was %.3f", got, novel)
+	}
+	// ...and what it moved away from must stop being ordinary. This is the half a
+	// reference that never empties cannot do.
+	if got := look(was); got <= settled+0.2 {
+		t.Fatalf("the abandoned pattern still scores %.3f, having scored %.3f when it was the norm", got, settled)
 	}
 }
 
@@ -980,6 +1094,53 @@ func TestInspectDoesNotMutate(t *testing.T) {
 	}
 	if st.vel.Keys() != keys {
 		t.Fatal("Inspect wrote to the aggregate store")
+	}
+}
+
+func TestMemoryPerTenant(t *testing.T) {
+	const n = 200
+	vel := velocity.New(velocity.Config{})
+	s, err := New(Config{MaxOrgs: n + 10, Seed: 1}, vel)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtime.GC()
+	var a, b runtime.MemStats
+	runtime.ReadMemStats(&a)
+	for i := 0; i < n; i++ {
+		s.mu.Lock()
+		s.orgs[fmt.Sprintf("org-%d", i)] = s.plant(fmt.Sprintf("org-%d", i), uint64(i+1))
+		s.mu.Unlock()
+	}
+	runtime.GC()
+	runtime.ReadMemStats(&b)
+	per := float64(b.HeapAlloc-a.HeapAlloc) / n
+	nodes := 1<<(s.cfg.Depth+1) - 1
+	t.Logf("trees=%d depth=%d nodes/tree=%d -> %.0f B/tenant (%.0f KB), %d tenants at MaxOrgs=%d -> %.1f MB",
+		s.cfg.Trees, s.cfg.Depth, nodes, per, per/1024, 256, 256, per*256/(1024*1024))
+	if per > 600_000 {
+		t.Fatalf("%.0f B/tenant exceeds the documented bound", per)
+	}
+}
+
+// The tree work in isolation: one scoring pass over the forest, which is the cost
+// this package adds. Everything else Assess does is reading aggregates.
+func BenchmarkScore(b *testing.B) {
+	vel := velocity.New(velocity.Config{})
+	s, _ := New(Config{Seed: 1}, vel)
+	m := s.model("bench")
+	var p Point
+	for i := range p.X {
+		p.X[i] = 0.5
+	}
+	for i := 0; i < 4000; i++ {
+		m.learn(p.X[:], s.cfg)
+	}
+	p.X[4] = 0.97
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		m.score(p.X[:], s.cfg)
 	}
 }
 

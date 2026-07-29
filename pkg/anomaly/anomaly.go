@@ -270,7 +270,7 @@ func New(cfg Config, vel *velocity.Store) (*Store, error) {
 	for _, w := range vel.Windows() {
 		kept[w.Name] = true
 	}
-	for _, f := range Inventory() {
+	for _, f := range inventory {
 		if f.Window != "" && !kept[f.Window] {
 			return nil, fmt.Errorf("%w: feature %q reads %q", ErrWindows, f.Name, f.Window)
 		}
@@ -385,8 +385,8 @@ type Sampled struct {
 	Top   string    `json:"top"`
 }
 
+// judge reads the aggregates for one transaction, projects it, and weighs it.
 func (s *Store) judge(tx types.Transaction, learn bool) Assessment {
-	inv := Inventory()
 	if account(tx) == "" {
 		m := s.model(tx.OrgID)
 		m.mu.Lock()
@@ -399,9 +399,21 @@ func (s *Store) judge(tx types.Transaction, learn bool) Assessment {
 		pairObs(s.vel, tx),
 		deviceObs(s.vel, tx),
 	)
+	return s.weigh(tx.OrgID, p, tx.ID, tx.Timestamp, learn)
+}
 
+// weigh scores a point that has already been projected.
+//
+// Split from judge because projection reads the aggregate store and weighing does
+// not. Two things follow from the split, and both matter more than the tidiness:
+// what the trees will accept is decided in one place on a value that can be
+// handed in, so the gate can be exercised rather than reasoned about; and the
+// model's behaviour over a sequence of points is testable without a stream to
+// produce them.
+func (s *Store) weigh(orgID string, p Point, txID string, at time.Time, learn bool) Assessment {
+	inv := inventory
 	a := Assessment{Shadow: s.cfg.Shadow, Values: values(p, inv)}
-	m := s.model(tx.OrgID)
+	m := s.model(orgID)
 
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -449,8 +461,8 @@ func (s *Store) judge(tx types.Transaction, learn bool) Assessment {
 		a.Alert = !s.cfg.Shadow
 		return a
 	}
-	if learn && belowLine(tx.ID, s.cfg.Appetite.Sample) {
-		m.keep(Sampled{TxID: tx.ID, At: tx.Timestamp, Score: a.Score, Cut: m.cut, Top: inv[p.far(inv)].Name})
+	if learn && belowLine(txID, s.cfg.Appetite.Sample) {
+		m.keep(Sampled{TxID: txID, At: at, Score: a.Score, Cut: m.cut, Top: inv[p.far(inv)].Name})
 	}
 	return a
 }
@@ -785,15 +797,15 @@ func mix(seed uint64, orgID string) uint64 {
 // scoped to a tenant cannot learn another's volumes, alert rate or behaviour from
 // it.
 type State struct {
-	Config    Config          `json:"config"`
-	Inventory [Dims]Feature   `json:"inventory"`
-	Digest    string          `json:"digest"`
-	Org       string          `json:"org"`
-	Learned   int64           `json:"learned"`
-	Warm      bool            `json:"warm"`
-	Cut       float64         `json:"cut"`
-	Scored    int64           `json:"scored"`
-	Alerted   int64           `json:"alerted"`
+	Config    Config        `json:"config"`
+	Inventory [Dims]Feature `json:"inventory"`
+	Digest    string        `json:"digest"`
+	Org       string        `json:"org"`
+	Learned   int64         `json:"learned"`
+	Warm      bool          `json:"warm"`
+	Cut       float64       `json:"cut"`
+	Scored    int64         `json:"scored"`
+	Alerted   int64         `json:"alerted"`
 	// Realised is the share of scored transactions that alerted, against
 	// Config.Appetite.Review which is the share intended. The two being
 	// readable side by side is what makes the appetite a measured commitment
@@ -820,7 +832,7 @@ type State struct {
 
 // State reports the model for one tenant.
 func (s *Store) State(orgID string) State {
-	inv := Inventory()
+	inv := inventory
 	st := State{
 		Config: s.Config(), Inventory: inv, Digest: s.Digest(), Org: orgID,
 		Cut: 1, Refused: map[string]int64{}, Blind: map[string]int64{},
@@ -863,7 +875,7 @@ func (s *Store) Digest() string {
 	h := sha256.New()
 	fmt.Fprintf(h, "v%d|%d|%d|%d|%g|", snapshotVersion, Dims, s.cfg.Trees, s.cfg.Depth, s.cfg.Blend)
 	fmt.Fprintf(h, "%d|", s.cfg.Window)
-	for _, f := range Inventory() {
+	for _, f := range inventory {
 		fmt.Fprintf(h, "%s:%s:%g|", f.Name, f.Window, f.Neutral)
 	}
 	return hex.EncodeToString(h.Sum(nil))

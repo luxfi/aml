@@ -122,18 +122,18 @@ const (
 
 // Transaction is an incoming transaction event for AML evaluation.
 type Transaction struct {
-	ID                string          `json:"id"`
-	OrgID             string          `json:"org_id"`
-	TenantID          string          `json:"tenant_id,omitempty"`
-	Source            string          `json:"source"`
-	UserID            string          `json:"user_id"`
-	AccountID         string          `json:"account_id,omitempty"`
-	Symbol            string          `json:"symbol,omitempty"`
-	AssetClass        string          `json:"asset_class,omitempty"`
-	Side              string          `json:"side,omitempty"`
-	Qty               float64         `json:"qty"`
-	Notional          float64         `json:"notional"`
-	Currency          string          `json:"currency"`
+	ID         string  `json:"id"`
+	OrgID      string  `json:"org_id"`
+	TenantID   string  `json:"tenant_id,omitempty"`
+	Source     string  `json:"source"`
+	UserID     string  `json:"user_id"`
+	AccountID  string  `json:"account_id,omitempty"`
+	Symbol     string  `json:"symbol,omitempty"`
+	AssetClass string  `json:"asset_class,omitempty"`
+	Side       string  `json:"side,omitempty"`
+	Qty        float64 `json:"qty"`
+	Notional   float64 `json:"notional"`
+	Currency   string  `json:"currency"`
 	// USD is Notional converted at ingest, and it is set by the engine on the
 	// way in — a value supplied by a client is overwritten.
 	//
@@ -143,7 +143,7 @@ type Transaction struct {
 	// differently on two days. And every aggregate and every ratio computed
 	// downstream is then in one unit, so no comparison carries a silent
 	// assumption about which currency it is in.
-	USD float64 `json:"usd"`
+	USD               float64         `json:"usd"`
 	Counterparty      string          `json:"counterparty,omitempty"`
 	IPAddress         string          `json:"ip_address,omitempty"`
 	DeviceFingerprint string          `json:"device_fingerprint,omitempty"`
@@ -201,13 +201,13 @@ type Alert struct {
 	ScoreBreakdown map[string]float64 `json:"score_breakdown,omitempty"`
 	// Causes carries the per-feature explanation when a model raised this
 	// alert. Empty for a rule alert, whose expression is its explanation.
-	Causes      []Cause `json:"causes,omitempty"`
-	ActionTaken string  `json:"action_taken"`
-	ReviewedBy     string             `json:"reviewed_by,omitempty"`
-	ReviewedAt     *time.Time         `json:"reviewed_at,omitempty"`
-	Decision       string             `json:"decision,omitempty"`
-	CreatedAt      time.Time          `json:"created_at"`
-	UpdatedAt      time.Time          `json:"updated_at"`
+	Causes      []Cause    `json:"causes,omitempty"`
+	ActionTaken string     `json:"action_taken"`
+	ReviewedBy  string     `json:"reviewed_by,omitempty"`
+	ReviewedAt  *time.Time `json:"reviewed_at,omitempty"`
+	Decision    string     `json:"decision,omitempty"`
+	CreatedAt   time.Time  `json:"created_at"`
+	UpdatedAt   time.Time  `json:"updated_at"`
 }
 
 // Case is a human review case.
@@ -225,9 +225,9 @@ type Case struct {
 	Resolution string     `json:"resolution,omitempty"`
 	// Assessment is the retained Art. 69(2) decision that closed the case — the
 	// information considered, the result and the reasons. A closed case has one.
-	Assessment string `json:"assessment,omitempty"`
-	CreatedAt  time.Time  `json:"created_at"`
-	UpdatedAt  time.Time  `json:"updated_at"`
+	Assessment string    `json:"assessment,omitempty"`
+	CreatedAt  time.Time `json:"created_at"`
+	UpdatedAt  time.Time `json:"updated_at"`
 }
 
 // CaseEvent is a case timeline entry.
