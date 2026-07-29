@@ -62,9 +62,33 @@ export interface SanctionsResult {
   score: number
 }
 
+// A replay of a candidate rule over history. The counts are what the rule would
+// have raised; the proportions are absent rather than zero when nothing in the
+// replayed period was judged.
+export interface RuleOutcome {
+  rule: string
+  alerts: number
+  txs?: string[]
+  observed: number
+  judged: number
+  productive: number
+  unproductive: number
+  false_positive_proportion?: number
+  intelligence_value?: number
+}
+
 export interface RuleTestResult {
-  match: boolean
-  dsl: string
+  events: number
+  from?: string
+  to?: string
+  candidate: RuleOutcome
+  incumbent?: RuleOutcome
+  delta?: {
+    added?: string[]
+    dropped?: string[]
+    kept?: string[]
+    counts: { added: number; dropped: number; kept: number }
+  }
 }
 
 async function json<T>(url: string, init?: RequestInit): Promise<T> {
@@ -85,15 +109,14 @@ export function listRules(): Promise<Rule[]> {
   return json('/v1/aml/rules')
 }
 
-export function testRule(dsl: string): Promise<RuleTestResult> {
+// testRule replays a candidate against the org's retained transactions. Omitting
+// the sample is what asks for real history; incumbent names the rule this one
+// would replace, so the report carries the difference.
+export function testRule(dsl: string, incumbent?: string): Promise<RuleTestResult> {
   return json('/v1/aml/rules/test', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      dsl,
-      tx: { id: 'test', notional: 15000, currency: 'USD', qty: 1 },
-      entity: { id: 'test', name: 'Test User', entity_type: 'user' },
-    }),
+    body: JSON.stringify({ dsl, incumbent }),
   })
 }
 

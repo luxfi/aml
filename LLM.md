@@ -70,8 +70,18 @@ pkg/
   cases/
     case.go                -- Case store (create, update status, assign, resolve, events)
     errors.go              -- Sentinel errors
+  retention/
+    record.go              -- Record, the three Art. 77(3) clocks, expiry arithmetic
+    ledger.go              -- Retain/Close/Extend, party index, purpose-gated reads,
+                              five-year lookback, proven disposal
+    cron.go                -- Daily disposal at 03:30 UTC
+  token/token.go           -- Per-org HKDF key schedule; deterministic pseudonyms
+                              for index keys, AES-256-GCM seal for record bodies
+  replay/replay.go         -- Rule sandbox: replays a candidate over real history
+                              through the engine's own evaluator, writes nothing
   webhook/webhook.go       -- Signed delivery (HMAC-SHA256) with retry + dead-letter
   api/routes.go            -- /v1/aml/* HTTP routes + SanctionsStore on Base
+  api/records.go           -- The one place retention, token and replay are joined
 ```
 
 ## API Endpoints
@@ -83,11 +93,70 @@ pkg/
 | GET | /v1/aml/cases | List cases (filter by status) |
 | POST | /v1/aml/cases/{id}/events | Add case event (note, status change) |
 | GET | /v1/aml/rules | List all rules |
-| POST | /v1/aml/rules/test | Dry-run a DSL expression |
+| POST | /v1/aml/rules/test | Replay a candidate rule over history (dry run) |
+| POST | /v1/aml/cases/{id}/resolve | Close a case against a retained assessment |
+| POST | /v1/aml/relationships | Open a business relationship |
+| POST | /v1/aml/relationships/{id}/close | End one, starting the retention clocks |
+| POST | /v1/aml/relationships/search | Art. 78 five-year lookback by party |
 | POST | /v1/aml/sanctions/search | Search sanctions lists by name |
-| GET | /v1/aml/health | Health check |
+| GET | /v1/aml/health | Health check, 503 when records cannot be kept |
 
-All endpoints require `X-Org-Id` header.
+Every route resolves its tenant through `Handler.Identity`. The deployment wires
+`api.TrustedProxyHeader("X-Org-Id")`, which is sound only because the gateway
+authenticates the caller, sets the header from the verified JWT owner claim,
+strips any client-supplied copy, and is the only route to this service.
+
+## Records, tokenisation, and the sandbox
+
+Three obligations, three packages, one join in `pkg/api/records.go`.
+
+**Retention (`pkg/retention`)** — HIP-0518 §9. Five years from the end of the
+relationship, from the occasional transaction, or **from the date of refusal**
+(AMLR Art. 77(3)); a blocked transaction is therefore retained as a refusal with
+the rules that refused it, running from its own clock. A record retained inside a
+relationship has *no* expiry until `Close` cascades the clock to it. Extensions
+are case-by-case, capped at five further years, refused without a reason and a
+decider. Reads take a `Purpose` from a closed set, because retained personal data
+may be processed only to prevent ML/TF (AMLD4 Art. 41(2)).
+
+*Deletion on expiry against no redaction* — the unit of disposal is the whole
+record, never a field. Nothing in the package removes, masks or rewrites part of a
+retained record; reads hand out deep copies so a reader cannot either. At expiry
+the record is destroyed in full with every index entry that referenced it, and
+`Dispose` verifies its own post-conditions before reporting a count — a run that
+cannot prove what it destroyed reports the error and nothing else. It also refuses
+a date the caller's clock has not reached, so a clock lie cannot bring destruction
+forward.
+
+*The five-year lookback* (Art. 78) is answered from a per-party index, not a scan.
+`Answer.Examined` is the evidence: it counts one party's records and does not grow
+with the ledger.
+
+**Tokenisation (`pkg/token`)** — one root from KMS, per-org keys by HKDF with the
+org as salt, per-domain keys by HKDF info. Two operations: a deterministic
+pseudonym, which is what the ledger indexes and correlates on, and an AES-256-GCM
+seal bound to the org and the record slot, which is what holds the record body. It
+is deliberately **not** one-way: a hash-only design can neither reconstruct a
+transaction (MLR reg. 40(2)(b)) nor re-screen a customer base against a new
+designation (EBA/GL/2024/15 §4.1.4), so it would fail the obligations it is
+protecting. Correlation is per org and never across orgs — the same customer in
+two orgs is two unrelated keys, so a cross-tenant join is not computable.
+
+**The sandbox (`pkg/replay`)** — JMLSG 5.7.18 requires new typologies to be tested
+before live activation, and FCG 3.2.5A requires a retirement to be justified
+against the outgoing rule's performance. `/v1/aml/rules/test` replays a candidate
+over the org's retained transactions through *the engine's own evaluator*, and
+reports how many alerts it would raise, on what, and the added/dropped/kept
+difference against the rule it would replace. An empty history is refused rather
+than reported as zero alerts, and the false-positive proportion and
+intelligence-value are absent rather than zero when nothing was judged. It reaches
+the engine through a one-method interface and history through another, so it has
+nothing it could write to.
+
+`AML_TOKEN_KEY` carries the KMS-held root — 32 bytes or more, hex encoded. There
+is no default. Without it an instance reports itself unfit on `/v1/aml/health` and
+refuses to ingest, because a transaction that cannot be recorded must not be
+processed.
 
 ## Embedded Admin UI
 
@@ -163,10 +232,27 @@ Webhook events: `aml.flagged`, `aml.cleared`, `kyc.approved`, `trade.executed`.
 - ML scoring via Hanzo Zen gateway (ScorerPlugin interface ready)
 - Hanzo Tasks durable workflows (sanctions-refresh, case-automation, backtest)
 - Base realtime subscription for live transaction monitoring
-- Backtest/batch evaluation against historical data
-- SAR draft generation
 - Full OFAC/UN/EU/HMT list refresh automation
-- Base collection persistence (current: in-memory stores for v1 engine)
+- **Base collection persistence** (current: in-memory stores, the retention ledger
+  included). A retention ledger that does not survive a restart is a
+  record-keeping breach, so this is the first thing to close, and it is what makes
+  the five-year lookback and the disposal cron mean anything in production.
+- Per-org KMS key material. `token.Source` already takes the org, so this is a
+  different Source and not a different design; today one root is derived per org
+  by HKDF, which means no cross-org correlation but one blast radius.
+- Exposing `Ledger.Extend` over HTTP. The cap and the refusals are implemented and
+  tested; there is no route, because the decider's identity would be
+  client-asserted (see below).
+- Tokenising the operational transaction store. `pkg/engine/basestore.go` still
+  writes `user_id`, `counterparty` and `ip_address` in the clear for its aggregate
+  queries; the retention ledger holds pseudonyms and sealed bodies, so the two
+  planes do not agree yet.
+- Attribution. Every decider (`by` on a resolution) is client-asserted: the
+  service has a tenant identity but no user identity, so "who dismissed this
+  alert" is not authenticated.
+- `cases.AutoClose` closes low-severity cases on inactivity without a retained
+  assessment — the one path that closes a case without a recorded decision. Needs
+  a compliance decision: escalate instead of closing, or record a system rationale.
 
 ## Dependency pinning
 
