@@ -17,18 +17,18 @@ import (
 // Ledger holds an org's retained records. It is the obligations and nothing else —
 // which clock starts when, how far a closure cascades, what a read is allowed to
 // be for, what a disposal has to prove — and the records themselves are in a
-// [store]. So each obligation is written once and holds wherever the records are
+// [shelf]. So each obligation is written once and holds wherever the records are
 // kept.
-type Ledger struct{ store store }
+type Ledger struct{ shelf shelf }
 
 // New returns a ledger that keeps records in memory, for exercising the
 // obligations without a database. What is in it does not survive a restart, so it
 // is not what an instance serves from.
-func New() *Ledger { return &Ledger{store: newMemory()} }
+func New() *Ledger { return &Ledger{shelf: newMemory()} }
 
 // NewBase returns a ledger that keeps records in Base collections, which do
 // survive a restart. [Ensure] has to have run first.
-func NewBase(app core.App) *Ledger { return &Ledger{store: durable{app: app}} }
+func NewBase(app core.App) *Ledger { return &Ledger{shelf: durable{app: app}} }
 
 // Retain writes a record and returns its id.
 //
@@ -58,7 +58,7 @@ func (l *Ledger) Retain(r Record) (string, error) {
 	}
 
 	var id string
-	err := l.store.tx(func(s store) error {
+	err := l.shelf.tx(func(s shelf) error {
 		switch r.Trigger {
 		case TriggerRefusal, TriggerOccasional:
 			if r.Relationship != "" {
@@ -136,7 +136,7 @@ func (l *Ledger) Close(org, id string, at time.Time) (int, error) {
 	}
 
 	started := 0
-	err := l.store.tx(func(s store) error {
+	err := l.shelf.tx(func(s shelf) error {
 		started = 0
 		rel, err := s.read(org, id)
 		if err != nil || rel.Class != ClassRelationship {
@@ -192,7 +192,7 @@ func (l *Ledger) Extend(org, id string, by time.Duration, reason, who string) er
 		return fmt.Errorf("%w: needs a positive period, a reason and a decider", ErrExtension)
 	}
 
-	return l.store.tx(func(s store) error {
+	return l.shelf.tx(func(s shelf) error {
 		r, err := s.read(org, id)
 		if err != nil {
 			return fmt.Errorf("%w: %s", ErrNotFound, id)
@@ -222,7 +222,7 @@ func (l *Ledger) Get(p Purpose, org, id string) (Record, error) {
 	if org == "" {
 		return Record{}, ErrOrg
 	}
-	return l.store.read(org, id)
+	return l.shelf.read(org, id)
 }
 
 // Each visits an org's records of one class, oldest event first, for a permitted
@@ -235,7 +235,7 @@ func (l *Ledger) Each(p Purpose, org string, c Class, visit func(Record) error) 
 	if org == "" {
 		return ErrOrg
 	}
-	return l.store.each(org, c, visit)
+	return l.shelf.each(org, c, visit)
 }
 
 // Answer answers AMLR Art. 78: whether a business relationship with a named
@@ -284,7 +284,7 @@ func (l *Ledger) Lookback(p Purpose, org, party string, now time.Time) (Answer, 
 		To:   now,
 	}
 
-	found, err := l.store.party(org, party)
+	found, err := l.shelf.party(org, party)
 	if err != nil {
 		return Answer{}, err
 	}
@@ -350,7 +350,7 @@ func (l *Ledger) Dispose(now time.Time) (Disposal, error) {
 		return Disposal{}, err
 	}
 
-	held, err := l.store.count()
+	held, err := l.shelf.count()
 	if err != nil {
 		return Disposal{}, err
 	}
@@ -359,7 +359,7 @@ func (l *Ledger) Dispose(now time.Time) (Disposal, error) {
 	var disposed []Record
 	previous := ""
 	for {
-		doomed, err := l.store.expired(now, batch)
+		doomed, err := l.shelf.expired(now, batch)
 		if err != nil {
 			return Disposal{}, err
 		}
@@ -371,7 +371,7 @@ func (l *Ledger) Dispose(now time.Time) (Disposal, error) {
 		}
 		previous = doomed[0].ID
 
-		if err := l.store.tx(func(s store) error { return s.erase(doomed) }); err != nil {
+		if err := l.shelf.tx(func(s shelf) error { return s.erase(doomed) }); err != nil {
 			return Disposal{}, err
 		}
 		disposed = append(disposed, doomed...)
@@ -394,10 +394,10 @@ func (l *Ledger) Dispose(now time.Time) (Disposal, error) {
 // is exactly the run that hides this bug.
 func (l *Ledger) prove(disposed []Record, now time.Time) error {
 	for _, r := range disposed {
-		if _, err := l.store.read(r.Org, r.ID); !errors.Is(err, ErrNotFound) {
+		if _, err := l.shelf.read(r.Org, r.ID); !errors.Is(err, ErrNotFound) {
 			return fmt.Errorf("%w: %s survived disposal", ErrDisposal, r.ID)
 		}
-		retained, err := l.store.inside(r.Org, r.ID)
+		retained, err := l.shelf.inside(r.Org, r.ID)
 		if err != nil {
 			return err
 		}
@@ -405,7 +405,7 @@ func (l *Ledger) prove(disposed []Record, now time.Time) error {
 			return fmt.Errorf("%w: %s still indexes %d records retained inside it", ErrDisposal, r.ID, len(retained))
 		}
 		for _, p := range r.Parties {
-			found, err := l.store.party(r.Org, p)
+			found, err := l.shelf.party(r.Org, p)
 			if err != nil {
 				return err
 			}
@@ -415,18 +415,28 @@ func (l *Ledger) prove(disposed []Record, now time.Time) error {
 		}
 	}
 
-	// Nothing expired is left anywhere. This is what catches a record the run
-	// never reached, including one reachable only through an index entry that
-	// should have gone with something else.
-	left, err := l.store.expired(now, 1)
+	// Nothing expired is left anywhere.
+	left, err := l.shelf.expired(now, 1)
 	if err != nil {
 		return err
 	}
 	if len(left) > 0 {
 		return fmt.Errorf("%w: %s is expired and was not disposed", ErrDisposal, left[0].ID)
 	}
+
+	// And no index entry outlived the record it named. An entry that did would keep
+	// a destroyed record findable as evidence of a relationship, and it is the state
+	// a disposal job leaves behind when it counts its own delete statements instead
+	// of looking.
+	orphans, err := l.shelf.orphans(1)
+	if err != nil {
+		return err
+	}
+	if len(orphans) > 0 {
+		return fmt.Errorf("%w: the party index names %s, which is not there", ErrDisposal, orphans[0])
+	}
 	return nil
 }
 
 // Len is how many records the ledger holds, in every org.
-func (l *Ledger) Len() (int, error) { return l.store.count() }
+func (l *Ledger) Len() (int, error) { return l.shelf.count() }

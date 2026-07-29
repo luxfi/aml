@@ -24,7 +24,7 @@ import (
 // different app over the same data — see tx.
 type durable struct{ app core.App }
 
-func (d durable) tx(fn func(store) error) error {
+func (d durable) tx(fn func(shelf) error) error {
 	return d.app.RunInTransaction(func(txApp core.App) error {
 		return fn(durable{app: txApp})
 	})
@@ -198,6 +198,67 @@ func (d durable) expired(now time.Time, limit int) ([]Record, error) {
 		return nil, fmt.Errorf("%w: %w", ErrStore, err)
 	}
 	return all(rows)
+}
+
+// orphans walks the party index a page at a time and asks, once per page, which of
+// the records it names are there. Two queries per page rather than one per entry,
+// and no page of it is bigger than a disposal batch, so proving the index holds
+// costs the same shape of work whether the ledger has a thousand records or five
+// years of them.
+func (d durable) orphans(limit int) ([]string, error) {
+	var out []string
+	after := ""
+	for {
+		index, err := parties.Across(d.app, "id > {:after}", "id", batch, dbx.Params{"after": after})
+		if err != nil {
+			return nil, fmt.Errorf("%w: %w", ErrStore, err)
+		}
+		if len(index) == 0 {
+			return out, nil
+		}
+
+		named := make([]string, 0, len(index))
+		for _, entry := range index {
+			named = append(named, entry.GetString(fieldRecord))
+		}
+		filter, params := oneOf("id", named)
+		rows, err := records.Across(d.app, filter, "", 0, params)
+		if err != nil {
+			return nil, fmt.Errorf("%w: %w", ErrStore, err)
+		}
+		there := make(map[string]bool, len(rows))
+		for _, row := range rows {
+			there[row.Id] = true
+		}
+
+		for _, id := range named {
+			if !there[id] {
+				out = append(out, id)
+				if limit > 0 && len(out) >= limit {
+					return out, nil
+				}
+			}
+		}
+		after = index[len(index)-1].Id
+	}
+}
+
+// oneOf asks for any of a set of values in one query. The values are bound, not
+// written into the filter: a value that reaches the filter as text can change the
+// shape of the query, and the direction that matters here is the one where it
+// matches nothing and a corrupt index reads as a sound one.
+func oneOf(field string, values []string) (string, dbx.Params) {
+	filter := ""
+	params := dbx.Params{}
+	for i, v := range values {
+		name := fmt.Sprintf("%s%d", field, i)
+		if i > 0 {
+			filter += " || "
+		}
+		filter += field + " = {:" + name + "}"
+		params[name] = v
+	}
+	return filter, params
 }
 
 func (d durable) count() (int, error) {
