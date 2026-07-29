@@ -101,6 +101,12 @@ func main() {
 
 	app.OnServe().Bind(&hook.Handler[*core.ServeEvent]{
 		Func: func(se *core.ServeEvent) error {
+			// The transaction collection has to exist before any rule reads a
+			// window. Without it every aggregate rule reaches no verdict, which is
+			// how twelve of twenty rules came to fault on every transaction.
+			if err := history.Ensure(app); err != nil {
+				return fmt.Errorf("refusing to start, the transaction record cannot be created: %w", err)
+			}
 			events := history.NewBase(app)
 			rates := reference.RatesFromEnv()
 
