@@ -110,6 +110,13 @@ func IAMIdentity(jwks Keysets) Identity {
 		// original host is a claim, and this decides which issuer is trusted.
 		id := brand.ForHost(r.Host)
 		issuer := brand.IssuerFor(id)
+		// An empty expectation does not loosen the issuer check, it removes it:
+		// golang-jwt validates `iss` only when one is stated (validator.go, `if
+		// v.expectedIss != ""`). A brand row without an issuer would therefore admit
+		// every brand's tokens on that host, so it admits none.
+		if issuer == "" {
+			return "", fmt.Errorf("brand %s states no issuer, so nothing is trusted to have signed this", id)
+		}
 
 		raw, err := bearer(r)
 		if err != nil {
