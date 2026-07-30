@@ -14,8 +14,9 @@ Real-time AML/CFT transaction monitoring engine. Pure Go, single binary, embedde
 - **Scoring**: Weight-of-evidence (pure Go math)
 - **Sanctions**: Jaro-Winkler + token-based fuzzy name matching
 - **HTTP**: Hanzo Base router (net/http)
-- **Auth**: IAM access token — the `owner` claim of a bearer JWT the request's own brand issued (`api.IAMIdentity`); or, behind an authenticating gateway, the header it writes from that same claim (`api.TrustedProxyHeader`)
-- **White-label**: brand per request Host (`pkg/brand`, mirroring HIP-0111) — one `amld` serves lux.network, hanzo.ai, zoo.ngo, pars.network
+- **Auth**: IAM access token verified in-process (`api.IAMIdentity`) — the brand of the request's own Host decides the issuer, `aud` must be this deployment's IAM clientId, `tokenType` must be `access-token`, and the `owner` claim names the tenant. `api.TrustedProxyHeader` remains for a deployment that can prove a gateway is its only route in
+- **Tenant**: `<brand>/<org>` — the brand qualifies the org, in the store index and in the tokenisation vault's HKDF salt alike
+- **White-label**: brand per request Host (`pkg/brand`, mirroring HIP-0111) — one `amld` serves lux.network, hanzo.ai, zoo.ngo, pars.network. A Host no brand claims is refused, never defaulted
 
 ## Build & Run
 
@@ -93,9 +94,14 @@ pkg/
   api/routes.go            -- /v1/aml/* HTTP routes + SanctionsStore on Base
   api/records.go           -- The one place retention, token and replay are joined
   api/anomaly.go           -- Model state for governance + candidate scoring
-  api/iam.go               -- Identity from an IAM token: brand of the Host pins the
-                              issuer, `owner` claim is the tenant, JWKS with a
-                              bounded cache
+  api/tenant.go            -- The Identity seam and the tenant key: <brand>/<org>,
+                              minted in one place and checked at the boundary
+  api/iam.go               -- Identity from an IAM token: Host pins the issuer, aud
+                              pins the application, tokenType refuses an id_token,
+                              `owner` must be an org the caller belongs to
+  api/jwks.go              -- Published signing keys: RSA/EC/ML-DSA-65, per-issuer
+                              single-flight cache, refresh + staleness bounds
+  api/mldsa.go             -- ML-DSA-65 (FIPS 204) JWT verification
   api/brand.go             -- GET /v1/aml/config: the brand identity of this Host
   brand/brand.go           -- Brand id and request Host -> issuer + domains
                               (HIP-0111; the same registry as hanzoai/cloud brand)
@@ -180,17 +186,30 @@ scores, learns and reports what it *would* have alerted on, changing nothing.
 | GET | /v1/aml/health | Health check, 503 when records cannot be kept |
 | GET | /v1/aml/config | Brand identity of the request's Host: brand, display name, issuer, domain |
 
-Every route resolves its tenant through `Handler.Identity`, and `/v1/aml/config`
-is the one exception: it names the issuer a caller needs in order to obtain a
-token, so requiring one would be a lock whose key is behind it.
+Every route resolves its tenant through `Handler.Identity`. `/v1/aml/config` and
+`/v1/aml/rules` are the exceptions: the first names the issuer a caller needs in
+order to obtain a token, so requiring one would be a lock whose key is behind it,
+and the second is the deployment's rule catalog rather than a tenant's data.
 
-Two identities, one seam. `api.IAMIdentity(api.JWKS(ttl, stale))` takes the tenant
-from the `owner` claim of a bearer token, verified against the JWKS of the issuer
-belonging to the request's own Host — so a Lux token does not authenticate on a
-Zoo host even where one in-cluster IAM publishes both brands' signing certificates.
-`api.TrustedProxyHeader("X-Org-Id")` takes it from the header a gateway writes from
-that same claim, which is sound only where the gateway authenticates the caller,
-strips any client-supplied copy, and is the only route to this service.
+Two identities, one seam, one tenant key.
+`api.IAMIdentity(api.JWKS(ttl, stale), clientId)` is what `amld` runs: it verifies
+the bearer itself, and four things must hold before a token names a tenant.
+
+| Check | Why |
+|---|---|
+| signature under a key the brand of THIS Host publishes | a Lux token does not authenticate on a Zoo host, even where one in-cluster IAM publishes both brands' signing certificates. A Host no brand claims refuses |
+| `aud` contains `AML_CLIENT_ID` | IAM stamps aud = the app's clientId, so without the pin a token minted for a marketing site — or any other tenant's app on the same issuer — is a credential here (RFC 9068 §4) |
+| `tokenType == "access-token"` | an id_token is issued to a browser, carries the same `iss` and `aud`, and is not an API credential |
+| `owner` ∈ `orgs`, when `orgs` is present | IAM stamps the APP's org as `owner`, so a shared or org-choice application would make all of its users one tenant. A machine token has no membership set: its org is its application's, and the application is pinned by `aud` |
+
+`api.TrustedProxyHeader("X-Org-Id")` takes the ORG from the header a gateway writes
+from that same claim — sound only where the gateway authenticates the caller, strips
+any client-supplied copy, and is the only route to this service. It takes the BRAND
+from the Host either way, so both identities produce the same key.
+
+The AML application must be dedicated to one financial institution: not
+`IsShared`, no `OrgChoiceMode`. IAM enforces same-org login for such an app
+(`internal/oidc/login.go`), which is what makes `owner` the caller's own org.
 
 ## White-label
 
@@ -199,11 +218,22 @@ its OIDC issuer and the domains it serves on. It is a copy of the fleet's canoni
 registry (HIP-0111, `hanzoai/cloud` `brand/brand.go`) kept as a leaf, so one
 `amld` answers as Lux on lux.network, as Zoo on zoo.ngo and zoo.cloud, as Hanzo on
 hanzo.ai, and as Pars on pars.network — brand, console identity and trusted issuer
-all from the Host. An unrecognised Host falls back to Hanzo.
+all from the Host. A Host no brand claims resolves to NO brand, and there is no
+resolver that answers otherwise: the auth path is a caller that must not be handed
+a default, or one brand's issuer authenticates every request arriving on a pod IP,
+an in-cluster service name, localhost or a misrouted vhost.
 
-Org names are unique within an issuer, not across issuers. One deployment serving
-more than one brand from one record plane therefore needs its store scoped by
-brand as well as by org; a deployment per brand needs nothing further.
+Org names are unique within an issuer, not across issuers, so the tenant is the
+KEY `<brand>/<org>` and never the bare org. It is minted in one place
+(`pkg/api/tenant.go`, `qualify`) and is the same value that indexes alerts, cases
+and retained records, scopes a history row, and salts the tokenisation vault. The
+salt is the sharp end: keyed on the bare org, two brands' institutions of the same
+name derive the SAME keys, so one brand's customer names tokenise to the other's
+pseudonyms and its sealed records open under the other's tenant.
+
+The isolation boundary is the deployment: each brand runs its own store, issuer and
+ingress host. Brand-qualifying the key is what makes that boundary something other
+than the only thing standing between two institutions.
 
 ## Records, tokenisation, and the sandbox
 
@@ -256,6 +286,16 @@ nothing it could write to.
 is no default. Without it an instance reports itself unfit on `/v1/aml/health` and
 refuses to ingest, because a transaction that cannot be recorded must not be
 processed.
+
+## Environment
+
+| Variable | Effect |
+|---|---|
+| `AML_CLIENT_ID` | This deployment's IAM application clientId, pinned as the token audience. **No default: `amld` refuses to start without it**, because an instance that cannot check which application a token was minted for cannot identify a caller |
+| `AML_TOKEN_KEY` | KMS-held tokenisation root, hex, ≥32 bytes. No default |
+| `AML_DEFAULT_ORG` | Label carried by the rule catalog. The catalog is the deployment's, not a tenant's |
+| `AML_BUSINESS_ZONE` | Zone business-day and business-hour rules are answered in. Default UTC |
+| `AML_ANOMALY` | `live` leaves shadow mode. Anything else scores without contributing |
 
 ## Embedded Admin UI
 
