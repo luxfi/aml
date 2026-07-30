@@ -148,3 +148,32 @@ jobs:
             echo "manifest not visible yet (attempt ${i}/6) — retrying"; sleep 5
           done
           echo "::error::$img not pullable after push"; exit 1
+
+      - name: Mirror to oci.hanzo.ai (the sovereign copy)
+        # ghcr.io/luxfi is canonical; oci.hanzo.ai holds our own copy so a deploy
+        # never depends on a third party staying reachable — the same reason the
+        # rest of this stack self-hosts. It authenticates against Hanzo IAM
+        # (realm iam.hanzo.ai/v1/iam/registry/token), a different credential from
+        # ghcr, so it is provisioned separately as OCI_USER / OCI_TOKEN.
+        #
+        # This is best-effort and LOUD, never silent: if the IAM credential is
+        # not yet provisioned the step warns and the release still succeeds with
+        # the canonical ghcr image, rather than failing the whole release over a
+        # copy. A skipped mirror is announced so nobody reads its absence as
+        # "the sovereign copy is current".
+        if: ${{ secrets.OCI_USER != '' && secrets.OCI_TOKEN != '' }}
+        run: |
+          set -euo pipefail
+          echo "${{ secrets.OCI_TOKEN }}" | docker login oci.hanzo.ai \
+            -u "${{ secrets.OCI_USER }}" --password-stdin
+          while IFS= read -r t; do
+            [ -z "$t" ] && continue
+            dst="oci.hanzo.ai/${t#*/}"
+            docker tag "$t" "$dst"
+            docker push "$dst"
+          done <<< "${{ steps.meta.outputs.tags }}"
+          echo "sovereign copy mirrored to oci.hanzo.ai/luxfi/aml"
+
+      - name: Note when the sovereign copy was skipped
+        if: ${{ secrets.OCI_USER == '' || secrets.OCI_TOKEN == '' }}
+        run: echo "::warning::oci.hanzo.ai copy SKIPPED — OCI_USER/OCI_TOKEN not provisioned on this org. Canonical ghcr.io/luxfi/aml image is published; provision the IAM registry credential to enable the sovereign copy."
