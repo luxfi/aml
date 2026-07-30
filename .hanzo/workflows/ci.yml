@@ -68,19 +68,29 @@ jobs:
         # test run, not an extra one.
         run: go test -race -count=1 ./...
 
-      - name: Build the daemon with the embedded operator surface
+      - name: Build the daemon
+        # No embedui tag here: the embedded operator surface needs ui/dist, which
+        # is built in the Dockerfile's UI stage, not committed. CI proves the Go
+        # code compiles and runs; the release build proves the embedded UI.
         run: |
-          CGO_ENABLED=0 go build -trimpath -tags embedui -o /tmp/amld ./cmd/amld
+          CGO_ENABLED=0 go build -trimpath -o /tmp/amld ./cmd/amld
           test -x /tmp/amld
 
       - name: It serves, and it refuses what it should
         # Two facts worth a check on every commit, because both have regressed
         # before: the process comes up and answers, and an unauthenticated
         # request is refused rather than served somebody's tenant data.
+        #
+        # AML_CLIENT_ID is required — the daemon refuses to start without it,
+        # because it is the audience every token is pinned to and a plane that
+        # cannot check the audience authenticates any first-party token. A real
+        # bearer is a brand-issued IAM token CI cannot mint, so the smoke checks
+        # what needs no token: it serves, and an unauthenticated read is refused.
         run: |
           set -euo pipefail
           dir=$(mktemp -d)
           AML_TENANT_HEADER=X-Org-Id \
+          AML_CLIENT_ID=aml-ci-smoke \
           AML_TOKEN_KEY=$(head -c 32 /dev/urandom | xxd -p -c 64) \
             /tmp/amld serve --dir "$dir" --http 127.0.0.1:8791 --dev=false &
           pid=$!
