@@ -73,7 +73,7 @@ func TestUpdateStatus(t *testing.T) {
 	s := NewStore()
 	c := s.Create("org1", types.SeverityHigh, nil, nil)
 
-	err := s.UpdateStatus(c.ID, types.CaseInReview, "user1")
+	err := s.UpdateStatus(c.OrgID, c.ID, types.CaseInReview, "user1")
 	if err != nil {
 		t.Fatalf("UpdateStatus error: %v", err)
 	}
@@ -94,7 +94,7 @@ func TestUpdateStatus(t *testing.T) {
 
 func TestUpdateStatusNotFound(t *testing.T) {
 	s := NewStore()
-	err := s.UpdateStatus("bad-id", types.CaseClosed, "user1")
+	err := s.UpdateStatus("org1", "bad-id", types.CaseClosed, "user1")
 	if err != ErrNotFound {
 		t.Errorf("expected ErrNotFound, got %v", err)
 	}
@@ -104,7 +104,7 @@ func TestAddEvent(t *testing.T) {
 	s := NewStore()
 	c := s.Create("org1", types.SeverityLow, nil, nil)
 
-	err := s.AddEvent(c.ID, types.CaseEvent{
+	err := s.AddEvent(c.OrgID, c.ID, types.CaseEvent{
 		AuthorID: "user1",
 		Kind:     types.EventNote,
 		Body:     "test note",
@@ -124,7 +124,7 @@ func TestAddEvent(t *testing.T) {
 
 func TestAddEventNotFound(t *testing.T) {
 	s := NewStore()
-	err := s.AddEvent("bad-id", types.CaseEvent{})
+	err := s.AddEvent("org1", "bad-id", types.CaseEvent{})
 	if err != ErrNotFound {
 		t.Errorf("expected ErrNotFound, got %v", err)
 	}
@@ -149,7 +149,7 @@ func TestResolve(t *testing.T) {
 	s := NewStore()
 	c := s.Create("org1", types.SeverityHigh, nil, nil)
 
-	err := s.Resolve(c.ID, types.ResolutionSARFiled, "user1", "assessment-1")
+	err := s.Resolve(c.OrgID, c.ID, types.ResolutionSARFiled, "user1", "assessment-1")
 	if err != nil {
 		t.Fatalf("Resolve error: %v", err)
 	}
@@ -186,7 +186,7 @@ func TestCaseStoreEviction(t *testing.T) {
 	// Create and immediately close 15 cases.
 	for i := 0; i < 15; i++ {
 		c := s.Create("org1", types.SeverityLow, nil, nil)
-		s.Resolve(c.ID, types.ResolutionCleared, "system", "assessment-1")
+		s.Resolve(c.OrgID, c.ID, types.ResolutionCleared, "system", "assessment-1")
 	}
 
 	// Wait for closed cases to become stale.
@@ -210,7 +210,7 @@ func TestCaseStoreEvictExpiredDirect(t *testing.T) {
 	for i := 0; i < 5; i++ {
 		c := s.Create("org1", types.SeverityLow, nil, nil)
 		if i < 3 {
-			s.Resolve(c.ID, types.ResolutionCleared, "system", "assessment-1")
+			s.Resolve(c.OrgID, c.ID, types.ResolutionCleared, "system", "assessment-1")
 		} else {
 			openIDs = append(openIDs, c.ID)
 		}
@@ -240,7 +240,7 @@ func TestResolveRefusesWithoutARetainedAssessment(t *testing.T) {
 	s := NewStore()
 	c := s.Create("org1", types.SeverityHigh, []string{"alert-1"}, []string{"user-1"})
 
-	if err := s.Resolve(c.ID, types.ResolutionFalsePositive, "mlro", ""); !errors.Is(err, ErrNoAssessment) {
+	if err := s.Resolve(c.OrgID, c.ID, types.ResolutionFalsePositive, "mlro", ""); !errors.Is(err, ErrNoAssessment) {
 		t.Fatalf("err = %v, want ErrNoAssessment", err)
 	}
 	got := s.Get(c.ID)
@@ -251,7 +251,7 @@ func TestResolveRefusesWithoutARetainedAssessment(t *testing.T) {
 		t.Error("the case carries a closing date it did not earn")
 	}
 
-	if err := s.Resolve(c.ID, types.ResolutionFalsePositive, "mlro", "assessment-1"); err != nil {
+	if err := s.Resolve(c.OrgID, c.ID, types.ResolutionFalsePositive, "mlro", "assessment-1"); err != nil {
 		t.Fatalf("Resolve: %v", err)
 	}
 	got = s.Get(c.ID)
@@ -265,5 +265,27 @@ func TestResolveRefusesWithoutARetainedAssessment(t *testing.T) {
 	events := s.Events(c.ID)
 	if len(events) == 0 || !strings.Contains(events[len(events)-1].Body, "assessment-1") {
 		t.Errorf("the closing event does not name the assessment: %+v", events)
+	}
+}
+
+// A case mutator refuses a caller from a different tenant, even with the exact
+// case id. This is the LOW-2 close: there is one org-checked way to write a case,
+// so possession of the id is not authority over the case.
+func TestCaseMutatorsRefuseAnotherTenant(t *testing.T) {
+	s := NewStore()
+	c := s.Create("lux/acme", types.SeverityHigh, nil, nil)
+
+	if err := s.AddEvent("zoo/acme", c.ID, types.CaseEvent{Kind: types.EventNote, Body: "x"}); !errors.Is(err, ErrNotFound) {
+		t.Errorf("AddEvent from another tenant: err=%v, want ErrNotFound", err)
+	}
+	if err := s.UpdateStatus("zoo/acme", c.ID, types.CaseClosed, "attacker"); !errors.Is(err, ErrNotFound) {
+		t.Errorf("UpdateStatus from another tenant: err=%v, want ErrNotFound", err)
+	}
+	if err := s.Resolve("zoo/acme", c.ID, "cleared", "attacker", "assessment-1"); !errors.Is(err, ErrNotFound) {
+		t.Errorf("Resolve from another tenant: err=%v, want ErrNotFound", err)
+	}
+	// The owning tenant still works.
+	if err := s.AddEvent("lux/acme", c.ID, types.CaseEvent{Kind: types.EventNote, Body: "ok"}); err != nil {
+		t.Errorf("owning tenant refused: %v", err)
 	}
 }

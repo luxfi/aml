@@ -270,6 +270,17 @@ func decodeKeys(body []byte) (Keyset, error) {
 			log.Printf("[aml] jwks: unsupported key kid=%q kty=%q alg=%q crv=%q: %v", k.Kid, k.Kty, k.Alg, k.Crv, err)
 			continue
 		}
+		// A duplicate kid is kept first-wins and announced, not overwritten
+		// silently. Two keys under one kid means a token naming that kid verifies
+		// against only one of them; a silent last-wins would refuse a token the
+		// other key signed while logging nothing — the quiet partial lockout this
+		// package's "left out loudly" principle exists to prevent. The upstream IAM
+		// dedupes by cert name, so this is a guard against a malformed set, and it
+		// says so when it fires.
+		if _, dup := out[k.Kid]; dup {
+			log.Printf("[aml] jwks: duplicate kid=%q — keeping the first, ignoring the rest", k.Kid)
+			continue
+		}
 		out[k.Kid] = key
 	}
 	if len(out) == 0 {
