@@ -90,14 +90,19 @@ jobs:
           provenance: false
           tags: ${{ steps.meta.outputs.tags }}
 
-      - name: Smoke — it serves, it refuses, and it does not clear a benign payment by accident
+      - name: Smoke — it serves and it refuses
         # An image that builds but cannot answer deploys and half-works. Beyond
-        # liveness this checks the two behaviours that have actually regressed in
-        # this engine: an unauthenticated read must be refused rather than
-        # served, and an ordinary payment must come back allowed rather than
-        # carrying a saturated score — a monitoring system that alerts on
-        # everything ranks nothing and is indistinguishable from one that alerts
-        # on nothing.
+        # liveness this checks the behaviour that has actually regressed in this
+        # engine: an unauthenticated read must be refused, not served somebody's
+        # tenant data.
+        #
+        # AML_CLIENT_ID is required — the daemon refuses to start without the
+        # audience it pins every token to. Ingesting a transaction now needs a
+        # brand-issued IAM bearer, which this smoke cannot mint, so it exercises
+        # the two facts that need no token: the process serves /v1/aml/health, and
+        # an unauthenticated read of /v1/aml/cases is refused with 401. The
+        # benign-payment-clears check lives in the engine's own tests, where a
+        # signed token can be constructed.
         run: |
           set -euo pipefail
           img="${{ steps.meta.outputs.probe }}"
@@ -105,6 +110,7 @@ jobs:
 
           cid=$(docker run -d \
             -e AML_TENANT_HEADER=X-Org-Id \
+            -e AML_CLIENT_ID=aml-release-smoke \
             -e AML_TOKEN_KEY="$(head -c 32 /dev/urandom | xxd -p -c 64)" \
             -p 127.0.0.1:8799:8090 "$img")
           trap 'docker logs "$cid" | tail -60; docker rm -f "$cid" >/dev/null 2>&1 || true' EXIT
@@ -119,14 +125,7 @@ jobs:
           code=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8799/v1/aml/cases)
           [ "$code" = "401" ] || { echo "::error::unauthenticated read returned $code, want 401"; exit 1; }
 
-          body=$(curl -s -X POST http://127.0.0.1:8799/v1/aml/transactions \
-            -H 'X-Org-Id: smoke' -H 'Content-Type: application/json' \
-            -d '{"id":"smoke-1","source":"api","user_id":"u1","account_id":"a1","qty":1,"notional":100,"currency":"USD","asset_class":"fiat"}')
-          echo "ingest: $body"
-          echo "$body" | grep -q '"action":"allow"' \
-            || { echo "::error::a benign \$100 payment was not allowed: $body"; exit 1; }
-
-          echo "serves, refuses, and clears a benign payment"
+          echo "serves, and refuses an unauthenticated read"
 
       - name: Push
         run: |
