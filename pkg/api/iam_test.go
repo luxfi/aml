@@ -343,10 +343,22 @@ func TestAudienceIsThisApplication(t *testing.T) {
 
 	// With no audience configured nothing authenticates, including a token that is
 	// otherwise perfect. An unpinned deployment would accept every token its issuer
-	// ever minted, so it accepts none.
+	// ever minted, so it accepts none — and it says so without asking the issuer for
+	// keys, because a deployment that cannot identify anybody must not spend a
+	// network round trip per request finding that out. Refusing at the top is what
+	// makes this independent of how the JWT library happens to treat an empty
+	// expected audience.
 	for _, unpinned := range []string{"", "   "} {
-		if tenant, err := IAMIdentity(published, unpinned)(bearing("api.hanzo.ai", rs256(t, base()))); err == nil {
+		var asked atomic.Int64
+		counted := func(issuer string) (Keyset, error) {
+			asked.Add(1)
+			return published(issuer)
+		}
+		if tenant, err := IAMIdentity(counted, unpinned)(bearing("api.hanzo.ai", rs256(t, base()))); err == nil {
 			t.Errorf("with audience %q configured, a token authenticated as %q", unpinned, tenant)
+		}
+		if n := asked.Load(); n != 0 {
+			t.Errorf("with audience %q configured, a request cost %d issuer fetches, want 0", unpinned, n)
 		}
 	}
 }
