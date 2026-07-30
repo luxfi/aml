@@ -66,29 +66,27 @@ jobs:
             echo "version=sha-${GITHUB_SHA:0:7}" >> "$GITHUB_OUTPUT"
           fi
 
-      - uses: docker/setup-buildx-action@v3
-        with:
-          driver: docker-container
-          driver-opts: network=host
-
       - uses: docker/login-action@v3
         with:
           registry: ghcr.io
           username: ${{ secrets.GHCR_USER }}
           password: ${{ secrets.GHCR_TOKEN }}
 
-      - name: Build (load for smoke, not yet pushed)
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          file: Dockerfile
-          platforms: linux/amd64
-          build-args: |
-            VERSION=${{ steps.meta.outputs.version }}
-          load: true
-          push: false
-          provenance: false
-          tags: ${{ steps.meta.outputs.tags }}
+      - name: Build (plain docker, loaded for smoke, not yet pushed)
+        # Plain `docker build` against the runner's own daemon, NOT
+        # setup-buildx-action with the docker-container driver. The container
+        # driver nests a buildkit container inside the runner's DinD, which fails
+        # at setup here (the pure-Go test job on the same runner passes; only the
+        # buildx-container build failed, producing no step log). The daemon builds
+        # a single linux/amd64 image, which is all this publishes, so the extra
+        # nesting bought nothing but a failure mode.
+        run: |
+          set -euo pipefail
+          first=$(printf '%s\n' "${{ steps.meta.outputs.tags }}" | head -1)
+          args=""
+          while IFS= read -r t; do [ -n "$t" ] && args="$args -t $t"; done <<< "${{ steps.meta.outputs.tags }}"
+          docker build --build-arg VERSION=${{ steps.meta.outputs.version }} $args -f Dockerfile .
+          echo "built $first"
 
       - name: Smoke — it serves and it refuses
         # An image that builds but cannot answer deploys and half-works. Beyond
