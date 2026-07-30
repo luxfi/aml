@@ -43,20 +43,39 @@ func TestHostResolvesToItsBrand(t *testing.T) {
 	}
 }
 
-// A Host no brand claims resolves to nothing, so the caller chooses; ForHost is
-// the caller that chooses the default. The failure this prevents is a surface on
-// an unknown host quietly presenting some brand's issuer as its own.
-func TestUnknownHostFallsBackToDefault(t *testing.T) {
-	for _, host := range []string{"", "example.com", "aml.internal", "localhost", "notlux.network", "lux.network.evil.com"} {
+// A Host no brand claims resolves to NO brand, and there is no resolver that
+// answers otherwise. This is the RED-2 root cause held open: while a defaulting
+// resolver existed, the auth path used it and hanzo.id authenticated callers on
+// every host nobody claimed — a pod IP, an in-cluster service name, localhost, an
+// empty Host, and a lookalike domain under an attacker's registrable suffix.
+//
+// The hosts below are exactly those, so a fallback reintroduced anywhere in this
+// package fails here rather than in production.
+func TestUnknownHostNamesNoBrand(t *testing.T) {
+	for _, host := range []string{
+		"", "example.com", "aml.internal", "localhost", "localhost:8090",
+		"10.42.0.7:8090", "aml.aml.svc.cluster.local", "127.0.0.1",
+		"notlux.network", "lux.network.evil.com", "a.zoo.ngo.attacker.example",
+	} {
 		if got, ok := ForHostOK(host); ok {
 			t.Errorf("ForHostOK(%q) = %q, true; want no match", host, got)
 		}
-		if got := ForHost(host); got != Default {
-			t.Errorf("ForHost(%q) = %q, want %q", host, got, Default)
+	}
+}
+
+// An id no brand claims resolves to no Info. A lookup that answered with some
+// brand would put that brand's issuer behind an id the request never named.
+func TestUnknownIdNamesNoBrand(t *testing.T) {
+	for _, id := range []string{"", "  ", "nobody", "hanzo.ai", "lux/acme"} {
+		if got, ok := For(id); ok {
+			t.Errorf("For(%q) = %+v, true; want no match", id, got)
 		}
 	}
-	if Default != "hanzo" {
-		t.Errorf("Default = %q, want hanzo", Default)
+	// A known id resolves whatever case and padding it arrives in.
+	for _, id := range []string{"lux", "LUX", " Lux "} {
+		if got, ok := For(id); !ok || got.ID != "lux" {
+			t.Errorf("For(%q) = %+v, %v; want the lux brand", id, got, ok)
+		}
 	}
 }
 
@@ -135,33 +154,16 @@ func TestIssuersAreTheOnesIAMStamps(t *testing.T) {
 		"pars":     "https://pars.id",
 		"bootnode": "https://id.bootno.de",
 	} {
-		if got := IssuerFor(id); got != want {
-			t.Errorf("IssuerFor(%q) = %q, want %q", id, got, want)
+		got, ok := For(id)
+		if !ok || got.IAMIssuer != want {
+			t.Errorf("For(%q).IAMIssuer = %q, %v; want %q, true", id, got.IAMIssuer, ok, want)
 		}
-	}
-}
-
-// An unknown or oddly-spelled brand id resolves to the default rather than to a
-// zero Info: an empty issuer would be an issuer no token can match, which reads
-// as "every caller is refused" instead of "this id was wrong".
-func TestUnknownIDFallsBackToDefault(t *testing.T) {
-	for _, id := range []string{"", "nope", "  ", "LUX", " lux "} {
-		got := For(id)
-		if got.IAMIssuer == "" || got.Domain == "" {
-			t.Errorf("For(%q) = %+v, want a populated Info", id, got)
-		}
-	}
-	if For(" LUX ").ID != "lux" {
-		t.Error("For is not case- and space-insensitive")
-	}
-	if For("nope").ID != Default {
-		t.Errorf("For(unknown) = %q, want %q", For("nope").ID, Default)
 	}
 }
 
 func TestDisplayIsDerivedFromTheID(t *testing.T) {
 	for id, want := range map[string]string{
-		"lux": "Lux", "hanzo": "Hanzo", "zoo": "Zoo", "bootnode": "Bootnode", "": "Hanzo",
+		"lux": "Lux", "hanzo": "Hanzo", "zoo": "Zoo", "bootnode": "Bootnode", "": "",
 	} {
 		if got := Display(id); got != want {
 			t.Errorf("Display(%q) = %q, want %q", id, got, want)

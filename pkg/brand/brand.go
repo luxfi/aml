@@ -59,21 +59,19 @@ var brands = map[string]Info{
 	"bootnode": {ID: "bootnode", IAMIssuer: "https://id.bootno.de", Domain: "bootno.de"},
 }
 
-// Default is the brand for a Host that matches none.
-const Default = "hanzo"
-
-// For returns a brand id's Info, falling back to the default brand for an
-// unknown id. Lookup is case-insensitive.
-func For(id string) Info {
-	if b, ok := brands[strings.ToLower(strings.TrimSpace(id))]; ok {
-		return b
-	}
-	return brands[Default]
-}
-
-// IssuerFor returns the OIDC issuer for a brand id.
-func IssuerFor(id string) string {
-	return For(id).IAMIssuer
+// For returns a brand id's Info. Lookup is case-insensitive. ok is false for an
+// id no brand claims.
+//
+// There is deliberately no default. A resolver that answers with some brand for
+// an input that named none is the shape of the hole this package had: the auth
+// path asked which issuer to trust, was handed the fallback brand for a Host
+// nobody claimed, and so hanzo.id authenticated callers on a pod IP, a
+// *.svc.cluster.local name, localhost and any misrouted vhost. Every caller here
+// has to say what it does when the request named no brand, and for the auth path
+// the only answer is to refuse.
+func For(id string) (Info, bool) {
+	b, ok := brands[strings.ToLower(strings.TrimSpace(id))]
+	return b, ok
 }
 
 // ForHostOK resolves a request Host to a brand id: a Host at or under one of a
@@ -106,20 +104,12 @@ func ForHostOK(host string) (string, bool) {
 	return best, best != ""
 }
 
-// ForHost is ForHostOK with the default brand for an unmatched Host.
-func ForHost(host string) string {
-	if b, ok := ForHostOK(host); ok {
-		return b
-	}
-	return Default
-}
-
 // Display is a brand id's human name: the id with an upper-cased first letter.
 // Derived from the id so there is no second list to keep in step with the
-// registry.
+// registry. An empty id has no name, because no brand has an empty id.
 func Display(id string) string {
 	if id == "" {
-		id = Default
+		return ""
 	}
 	return strings.ToUpper(id[:1]) + id[1:]
 }

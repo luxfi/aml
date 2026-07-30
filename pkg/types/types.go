@@ -1,5 +1,13 @@
 // Package types defines the canonical domain types for the AML engine.
 // These types are the single source of truth for all AML operations.
+//
+// Every OrgID here holds the tenant KEY, not an org name: `<brand>/<org>`, the
+// brand whose issuer vouched for the caller qualifying the customer organisation
+// it acts for. It is minted in one place (pkg/api, tenant.go qualify) and is the
+// same value that indexes the store, scopes a history row and salts the
+// tokenisation vault. Writing a bare org into one of these fields puts two brands'
+// institutions of the same name into one tenant — one set of records, and one
+// vault, which decrypts across the two.
 package types
 
 import (
@@ -102,7 +110,6 @@ const (
 type Transaction struct {
 	ID           string  `json:"id"`
 	OrgID        string  `json:"org_id"`
-	TenantID     string  `json:"tenant_id,omitempty"`
 	Source       string  `json:"source"`
 	UserID       string  `json:"user_id"`
 	AccountID    string  `json:"account_id,omitempty"`

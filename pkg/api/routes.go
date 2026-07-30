@@ -7,10 +7,8 @@ package api
 import (
 	"encoding/json"
 	"errors"
-	"fmt"
 	"log"
 	"net/http"
-	"strings"
 	"sync"
 	"time"
 
@@ -186,56 +184,8 @@ func (h *Handler) Register(se *core.ServeEvent) {
 	se.Router.POST("/v1/aml/sanctions/search", h.searchSanctions())
 	se.Router.GET("/v1/aml/sanctions/sources", h.screeningSources())
 	se.Router.GET("/v1/aml/catalog", h.catalog())
+	se.Router.GET("/v1/aml/config", h.brandConfig())
 	se.Router.GET("/v1/aml/health", h.health())
-}
-
-// Identity resolves the tenant a request is authenticated to act on, or returns
-// an error if it is not authenticated.
-//
-// It is a seam rather than an implementation because this package must not be the
-// second place that decides what a valid credential is. The deployment supplies
-// one, and every route asks it the same question.
-type Identity func(*http.Request) (org string, err error)
-
-// ErrNoIdentity is returned when no Identity is configured.
-var ErrNoIdentity = errors.New("no identity configured, so no request can be attributed to a tenant")
-
-// TrustedProxyHeader resolves the tenant from a header written by an
-// authenticating proxy.
-//
-// This is only sound where the proxy authenticates the caller, sets this header
-// from the verified token, strips any client-supplied copy of it, and is the sole
-// route to this service. Where the service is directly reachable, the header is
-// an unauthenticated assertion and anyone can name any tenant — so this
-// constructor exists to make that assumption something a deployment states out
-// loud rather than something a reader has to infer from a comment.
-func TrustedProxyHeader(name string) Identity {
-	return func(r *http.Request) (string, error) {
-		if id := strings.TrimSpace(r.Header.Get(name)); id != "" {
-			return id, nil
-		}
-		return "", fmt.Errorf("header %s is absent, so the caller named no tenant", name)
-	}
-}
-
-// tenant returns the authenticated tenant for a request.
-//
-// With no Identity configured it refuses. A compliance product that falls back to
-// trusting a client-supplied tenant header is worse than one that will not serve:
-// the fallback answers every request with another tenant's records and looks
-// healthy doing it.
-func (h *Handler) tenant(e *core.RequestEvent) (string, error) {
-	if h.Identity == nil {
-		return "", ErrNoIdentity
-	}
-	org, err := h.Identity(e.Request)
-	if err != nil {
-		return "", err
-	}
-	if strings.TrimSpace(org) == "" {
-		return "", errors.New("identity resolved an empty tenant")
-	}
-	return org, nil
 }
 
 // refuse answers an unauthenticated request. The reason is logged for the
@@ -477,25 +427,37 @@ func (h *Handler) listCases() func(e *core.RequestEvent) error {
 	}
 }
 
-// caseOf resolves a case within the caller's org. A case id is not a secret, so
-// the org is what decides whether the caller may see it.
+// errNoCase is a case the caller may not see, whether because it does not exist or
+// because it belongs to another tenant. One error for both, because the answer to
+// the caller is the same: a case id is not a secret, so distinguishing them would
+// let a caller enumerate another tenant's cases by their ids.
+var errNoCase = errors.New("no such case")
+
+// caseOf resolves a case within the caller's tenant. It reports the reason it
+// could not and writes nothing: an answer is a response, and returning one from
+// here as if it were an error is how an unauthenticated POST to a case route came
+// to dereference a nil case — refuse() answers the request and then returns nil,
+// so the caller saw no error and carried on with nothing.
 func (h *Handler) caseOf(e *core.RequestEvent) (*types.Case, string, error) {
-	orgID, err := h.tenant(e)
+	tenant, err := h.tenant(e)
 	if err != nil {
-		return nil, "", refuse(e, err)
+		return nil, "", err
 	}
 	c := h.Cases.Get(e.Request.PathValue("id"))
-	if c == nil || c.OrgID != orgID {
-		return nil, "", fail(e, http.StatusNotFound, "no such case")
+	if c == nil || c.OrgID != tenant {
+		return nil, "", errNoCase
 	}
-	return c, orgID, nil
+	return c, tenant, nil
 }
 
 func (h *Handler) addCaseEvent() func(e *core.RequestEvent) error {
 	return func(e *core.RequestEvent) error {
 		c, _, err := h.caseOf(e)
-		if err != nil {
-			return err
+		switch {
+		case errors.Is(err, errNoCase):
+			return fail(e, http.StatusNotFound, "no such case")
+		case err != nil:
+			return refuse(e, err)
 		}
 
 		var evt types.CaseEvent
@@ -527,8 +489,11 @@ type resolution struct {
 func (h *Handler) resolveCase() func(e *core.RequestEvent) error {
 	return func(e *core.RequestEvent) error {
 		c, orgID, err := h.caseOf(e)
-		if err != nil {
-			return err
+		switch {
+		case errors.Is(err, errNoCase):
+			return fail(e, http.StatusNotFound, "no such case")
+		case err != nil:
+			return refuse(e, err)
 		}
 
 		var in resolution
