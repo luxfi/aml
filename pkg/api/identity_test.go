@@ -61,7 +61,7 @@ func TestWithoutIdentityEveryRouteRefuses(t *testing.T) {
 // somebody else's org.
 func TestForgedTenantHeaderIsRefused(t *testing.T) {
 	alerts := NewAlertStore()
-	alerts.Add("tx-1", []types.Alert{{ID: "a1", OrgID: "victim"}})
+	alerts.Add("tx-1", []types.Alert{{ID: "a1", OrgID: "hanzo/victim"}})
 
 	// An Identity that authenticates nobody — the shape of an unauthenticated
 	// request reaching a service that requires one.
@@ -88,13 +88,13 @@ func TestForgedTenantHeaderIsRefused(t *testing.T) {
 // transaction id of another tenant's. A transaction id is not a secret.
 func TestAuthenticatedTenantCannotReadAnotherTenant(t *testing.T) {
 	alerts := NewAlertStore()
-	alerts.Add("tx-1", []types.Alert{{ID: "victim-alert", OrgID: "victim"}})
-	alerts.Add("tx-1", []types.Alert{{ID: "attacker-alert", OrgID: "attacker"}})
+	alerts.Add("tx-1", []types.Alert{{ID: "victim-alert", OrgID: "hanzo/victim"}})
+	alerts.Add("tx-1", []types.Alert{{ID: "attacker-alert", OrgID: "hanzo/attacker"}})
 
 	// Authenticated as "attacker", asking for a transaction it shares an id with.
 	h := &Handler{
 		Alerts:   alerts,
-		Identity: func(*http.Request) (string, error) { return "attacker", nil },
+		Identity: func(*http.Request) (string, error) { return "hanzo/attacker", nil },
 	}
 
 	e, rec := event(http.MethodGet, "/v1/aml/transactions/tx-1/alerts",
@@ -118,44 +118,103 @@ func TestAuthenticatedTenantCannotReadAnotherTenant(t *testing.T) {
 // The identity, not the header, decides the tenant. If the header could override
 // it, authenticating would not bound anything.
 func TestHeaderDoesNotOverrideIdentity(t *testing.T) {
-	h := &Handler{Identity: func(*http.Request) (string, error) { return "real", nil }}
+	h := &Handler{Identity: func(*http.Request) (string, error) { return "hanzo/real", nil }}
 	e, _ := event(http.MethodGet, "/v1/aml/x", map[string]string{"X-Org-Id": "spoofed"})
 
 	got, err := h.tenant(e)
 	if err != nil {
 		t.Fatalf("tenant: %v", err)
 	}
-	if got != "real" {
-		t.Fatalf("tenant = %q, want %q — the header must not decide the tenant", got, "real")
+	if got != "hanzo/real" {
+		t.Fatalf("tenant = %q, want %q — the header must not decide the tenant", got, "hanzo/real")
 	}
 }
 
-// An Identity that resolves to an empty tenant is a failure, not a tenant whose
-// name happens to be empty: an empty org would scope every read to nothing, or
-// to everything, depending on the store.
-func TestEmptyTenantIsRefused(t *testing.T) {
-	h := &Handler{Identity: func(*http.Request) (string, error) { return "   ", nil }}
+// An Identity that resolves to anything but a brand-qualified tenant is a failure,
+// not a tenant whose name happens to be odd. An empty org would scope every read to
+// nothing, or to everything, depending on the store; a bare org would put two
+// brands' institutions of the same name in one tenant and one vault.
+//
+// This is the boundary the value crosses into the store index, the history column
+// and the vault salt, and it is checked here rather than trusted from the Identity,
+// because the Identity is supplied by the deployment.
+func TestUnqualifiedTenantIsRefused(t *testing.T) {
+	for _, resolved := range []string{
+		"",              // nothing at all
+		"   ",           // whitespace
+		"acme",          // a bare org: the RED-1 shape
+		"/acme",         // no brand
+		"hanzo/",        // no org
+		"nobody/acme",   // a brand no registry row claims
+		"hanzo/a/b",     // an org carrying the separator
+		"hanzo / acme",  // padding around the separator
+		" hanzo/acme",   // padding at the front
+		"HANZO/acme",    // a brand id that is not canonical
+		"hanzo/acme/",   // a trailing separator
+		"hanzo\\acme",   // the wrong separator
+		"hanzo:acme",    // another wrong separator
+		"hanzo/ acme  ", // padding around the org
+	} {
+		h := &Handler{Identity: func(*http.Request) (string, error) { return resolved, nil }}
+		e, _ := event(http.MethodGet, "/v1/aml/x", nil)
+		if got, err := h.tenant(e); err == nil {
+			t.Errorf("an identity resolving %q was accepted as tenant %q", resolved, got)
+		}
+	}
+	// And the canonical form is accepted, so the rows above fail for their own
+	// reason and not because everything fails.
+	h := &Handler{Identity: func(*http.Request) (string, error) { return "hanzo/acme", nil }}
 	e, _ := event(http.MethodGet, "/v1/aml/x", nil)
-	if _, err := h.tenant(e); err == nil {
-		t.Fatal("an empty tenant was accepted")
+	if got, err := h.tenant(e); err != nil || got != "hanzo/acme" {
+		t.Fatalf("tenant = %q, %v; want hanzo/acme", got, err)
 	}
 }
 
-func TestTrustedProxyHeaderRequiresTheHeader(t *testing.T) {
+// The proxy header names the ORG. The brand comes from the request's own Host, so
+// the two Identity implementations produce the same key and a deployment cannot
+// take the brand from a header a client can write.
+func TestTrustedProxyHeaderQualifiesWithTheHost(t *testing.T) {
 	id := TrustedProxyHeader("X-Org-Id")
 
-	if _, err := id(httptest.NewRequest(http.MethodGet, "/", nil)); err == nil {
-		t.Fatal("absent header resolved to a tenant")
+	proxied := func(host, org string) *http.Request {
+		r := httptest.NewRequest(http.MethodGet, "/", nil)
+		r.Host = host
+		if org != "" {
+			r.Header.Set("X-Org-Id", org)
+		}
+		return r
 	}
 
-	req := httptest.NewRequest(http.MethodGet, "/", nil)
-	req.Header.Set("X-Org-Id", " acme ")
-	got, err := id(req)
-	if err != nil {
-		t.Fatalf("present header: %v", err)
+	for _, tc := range []struct{ host, org, want string }{
+		{"api.hanzo.ai", " acme ", "hanzo/acme"},
+		{"api.lux.network", "acme", "lux/acme"},
+		{"console.zoo.cloud", "acme", "zoo/acme"},
+	} {
+		got, err := id(proxied(tc.host, tc.org))
+		if err != nil {
+			t.Fatalf("%s: %v", tc.host, err)
+		}
+		if got != tc.want {
+			t.Errorf("%s + %q = %q, want %q", tc.host, tc.org, got, tc.want)
+		}
 	}
-	if got != "acme" {
-		t.Fatalf("tenant = %q, want %q", got, "acme")
+
+	// No header is no tenant; and no brand on the Host is no tenant space to put an
+	// org in, however trusted the header is. An in-cluster caller that reaches this
+	// service directly arrives on exactly those hosts.
+	for _, tc := range []struct{ name, host, org string }{
+		{"no header", "api.hanzo.ai", ""},
+		{"blank header", "api.hanzo.ai", "   "},
+		{"an org carrying the separator", "api.hanzo.ai", "lux/acme"},
+		{"a pod IP", "10.42.0.7:8090", "acme"},
+		{"a service name", "aml.aml.svc.cluster.local", "acme"},
+		{"localhost", "localhost:8090", "acme"},
+		{"no host at all", "", "acme"},
+		{"a lookalike domain", "a.zoo.ngo.attacker.example", "acme"},
+	} {
+		if got, err := id(proxied(tc.host, tc.org)); err == nil {
+			t.Errorf("%s resolved to tenant %q", tc.name, got)
+		}
 	}
 }
 

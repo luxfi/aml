@@ -8,6 +8,7 @@ require (
 	github.com/google/uuid v1.6.0
 	github.com/hanzoai/base v1.5.8
 	github.com/hanzoai/dbx v1.16.0
+	github.com/luxfi/crypto v1.20.2
 	github.com/spf13/cobra v1.10.2
 	golang.org/x/text v0.38.0
 )
@@ -60,7 +61,6 @@ require (
 	github.com/luxfi/constants v1.6.2 // indirect
 	github.com/luxfi/container v0.2.1 // indirect
 	github.com/luxfi/corona v0.10.4 // indirect
-	github.com/luxfi/crypto v1.20.2 // indirect
 	github.com/luxfi/dkg v0.3.5 // indirect
 	github.com/luxfi/fhe v1.8.8 // indirect
 	github.com/luxfi/geth v1.20.1 // indirect

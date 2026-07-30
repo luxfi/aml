@@ -5,6 +5,7 @@
 package api
 
 import (
+	"log"
 	"net/http"
 
 	"github.com/hanzoai/base/core"
@@ -26,9 +27,20 @@ import (
 // them, so requiring one would be a lock whose key is behind it. What it discloses
 // is a brand's published identity — its issuer and domain are in DNS — so there is
 // nothing here to withhold.
+//
+// A Host no brand claims gets no answer, through the same resolution the auth path
+// uses (brand.ForHostOK). Answering with a default brand would make this route lie
+// about the one thing it exists to state: it would send a caller to hanzo.id for a
+// token that the auth path on that same host must then refuse, because there an
+// unclaimed Host names no issuer to trust. One resolution, one answer, both paths.
 func (h *Handler) brandConfig() func(*core.RequestEvent) error {
 	return func(e *core.RequestEvent) error {
-		b := brand.For(brand.ForHost(e.Request.Host))
+		id, ok := brand.ForHostOK(e.Request.Host)
+		if !ok {
+			log.Printf("[aml] config asked on %q, which no brand claims", e.Request.Host)
+			return fail(e, http.StatusNotFound, "no brand serves this host")
+		}
+		b, _ := brand.For(id)
 		return e.JSON(http.StatusOK, map[string]string{
 			"brand":   b.ID,
 			"display": brand.Display(b.ID),

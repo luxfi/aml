@@ -7,10 +7,8 @@ package api
 import (
 	"crypto/rand"
 	"crypto/rsa"
-	"encoding/base64"
 	"encoding/json"
 	"fmt"
-	"math/big"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -21,8 +19,9 @@ import (
 
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/hanzoai/base/core"
+	"github.com/hanzoai/base/tools/router"
 
-	"github.com/luxfi/aml/pkg/brand"
+	"github.com/luxfi/aml/pkg/cases"
 	"github.com/luxfi/aml/pkg/types"
 )
 
@@ -36,20 +35,53 @@ var key = sync.OnceValue(func() *rsa.PrivateKey {
 	return k
 })
 
-// mint signs a token with kid "iam" and the given claims, defaulting the expiry to
-// an hour out so a test only states the claim it is about.
-func mint(t *testing.T, signer *rsa.PrivateKey, c jwt.MapClaims) string {
+// aud is the clientId of the AML application these tests are the resource server
+// for — the value IAM stamps as `aud` on a token minted for it.
+const aud = "aml-lux"
+
+// mint signs a token with kid "iam" and the given claims. What a real IAM token
+// always carries is defaulted — an hour's expiry, this application's audience and
+// tokenType "access-token" — so a row states only the claim it is about. A claim
+// set to nil is omitted, which is how a row says "without this claim".
+func mint(t *testing.T, signer any, method jwt.SigningMethod, c jwt.MapClaims) string {
 	t.Helper()
-	if _, ok := c["exp"]; !ok {
-		c["exp"] = time.Now().Add(time.Hour).Unix()
+	for k, v := range map[string]any{
+		"exp":       time.Now().Add(time.Hour).Unix(),
+		"aud":       aud,
+		"tokenType": accessToken,
+	} {
+		if _, ok := c[k]; !ok {
+			c[k] = v
+		}
 	}
-	tok := jwt.NewWithClaims(jwt.SigningMethodRS256, c)
+	for k, v := range c {
+		if v == nil {
+			delete(c, k)
+		}
+	}
+	tok := jwt.NewWithClaims(method, c)
 	tok.Header["kid"] = "iam"
 	raw, err := tok.SignedString(signer)
 	if err != nil {
 		t.Fatalf("sign: %v", err)
 	}
 	return raw
+}
+
+// rs256 signs with the shared RSA key, which is what every brand's issuer publishes
+// in these tests.
+func rs256(t *testing.T, c jwt.MapClaims) string {
+	t.Helper()
+	return mint(t, key(), jwt.SigningMethodRS256, c)
+}
+
+// orgs is the membership set claim, in the shape IAM emits it (schema.OrgRef).
+func orgs(names ...string) []any {
+	out := make([]any, 0, len(names))
+	for _, n := range names {
+		out = append(out, map[string]any{"org": n, "role": "member"})
+	}
+	return out
 }
 
 // published is the keyset every brand issuer publishes in these tests: ONE key,
@@ -64,6 +96,10 @@ func mint(t *testing.T, signer *rsa.PrivateKey, c jwt.MapClaims) string {
 func published(issuer string) (Keyset, error) {
 	return Keyset{"iam": &key().PublicKey}, nil
 }
+
+// identity is the Identity under test: this application's audience over the shared
+// keyset.
+func identity() Identity { return IAMIdentity(published, aud) }
 
 // request builds an event addressed to a specific Host, optionally bearing a token.
 func request(method, target, host, token string) (*core.RequestEvent, *httptest.ResponseRecorder) {
@@ -99,7 +135,7 @@ type config struct {
 // authenticate on another brand's host. Without the second half the first half is
 // decoration — the surface would say "Zoo" while admitting Lux's tenants.
 func TestWhiteLabelByHost(t *testing.T) {
-	h := &Handler{Identity: IAMIdentity(published), Alerts: NewAlertStore()}
+	h := &Handler{Identity: identity(), Alerts: NewAlertStore()}
 
 	for _, tc := range []config{
 		{"lux", "Lux", "https://lux.id", "lux.network"},
@@ -137,38 +173,42 @@ func TestWhiteLabelByHost(t *testing.T) {
 		t.Errorf("console.zoo.cloud = %+v, want the zoo brand", zoo)
 	}
 
-	// An unrecognised Host falls back to the default brand rather than to no brand.
-	e, rec = request(http.MethodGet, "/v1/aml/config", "aml.internal", "")
-	if err := h.brandConfig()(e); err != nil {
-		t.Fatalf("transport error: %v", err)
-	}
-	var fallback config
-	if err := json.Unmarshal(rec.Body.Bytes(), &fallback); err != nil {
-		t.Fatal(err)
-	}
-	if fallback.Brand != brand.Default || fallback.Issuer != brand.IssuerFor(brand.Default) {
-		t.Errorf("unknown host = %+v, want the %s brand", fallback, brand.Default)
+	// A Host no brand claims gets no brand and no issuer to go and get a token from.
+	// Naming one here would name an issuer that the auth path on this same host must
+	// refuse — the route would be telling the caller to do something that cannot
+	// work — and would publish one brand's identity on a surface that is not its.
+	for _, host := range []string{"aml.internal", "10.42.0.7:8090", "localhost:8090", ""} {
+		e, rec := request(http.MethodGet, "/v1/aml/config", host, "")
+		if err := h.brandConfig()(e); err != nil {
+			t.Fatalf("%s: transport error: %v", host, err)
+		}
+		if rec.Code != http.StatusNotFound {
+			t.Errorf("config on %q: status %d, want 404; body=%s", host, rec.Code, rec.Body.String())
+		}
+		if contains(rec.Body.String(), "hanzo") {
+			t.Errorf("config on %q named a brand: %s", host, rec.Body.String())
+		}
 	}
 
 	// A Lux-issued token: its own host authenticates it, every other brand's host
 	// refuses it, and the signature is valid in both cases.
-	lux := mint(t, key(), jwt.MapClaims{"iss": "https://lux.id", "owner": "lux-tenant", "sub": "u-1"})
-	org, err := h.Identity(bearing("api.lux.network", lux))
+	lux := rs256(t, jwt.MapClaims{"iss": "https://lux.id", "owner": "acme", "sub": "u-1"})
+	tenant, err := h.Identity(bearing("api.lux.network", lux))
 	if err != nil {
 		t.Fatalf("a Lux token on a Lux host was refused: %v", err)
 	}
-	if org != "lux-tenant" {
-		t.Errorf("org = %q, want lux-tenant", org)
+	if tenant != "lux/acme" {
+		t.Errorf("tenant = %q, want lux/acme", tenant)
 	}
 	for _, host := range []string{"api.zoo.ngo", "console.zoo.cloud", "api.hanzo.ai", "aml.pars.network", "aml.internal"} {
-		if org, err := h.Identity(bearing(host, lux)); err == nil {
-			t.Errorf("a Lux token authenticated as %q on %s — brand tenancy is not enforced", org, host)
+		if tenant, err := h.Identity(bearing(host, lux)); err == nil {
+			t.Errorf("a Lux token authenticated as %q on %s — brand tenancy is not enforced", tenant, host)
 		}
 	}
 
 	// And the refusal reaches the route, not only the seam: the same token that
 	// reads its own tenant's alerts on a Lux host gets 401 on a Zoo host.
-	h.Alerts.Add("tx-1", []types.Alert{{ID: "lux-alert", OrgID: "lux-tenant"}})
+	h.Alerts.Add("tx-1", []types.Alert{{ID: "lux-alert", OrgID: "lux/acme"}})
 	for _, tc := range []struct {
 		host string
 		code int
@@ -187,17 +227,207 @@ func TestWhiteLabelByHost(t *testing.T) {
 	}
 }
 
-// The tenant is the `owner` claim of a verified token — the same claim the gateway
-// reads to set X-Org-Id, taken first-hand here instead of trusting the header.
-func TestIAMIdentityYieldsTheOwnerAsTenant(t *testing.T) {
-	id := IAMIdentity(published)
-	tok := mint(t, key(), jwt.MapClaims{"iss": "https://hanzo.id", "owner": "acme-org", "sub": "u-1", "isAdmin": true})
-	org, err := id(bearing("api.hanzo.ai", tok))
-	if err != nil {
-		t.Fatalf("refused a valid token: %v", err)
+// The tenant is the brand of the Host qualifying the `owner` claim of a verified
+// token — the same claim the gateway reads to set X-Org-Id, taken first-hand here
+// instead of trusting the header, and qualified so that one org name under two
+// brands is two tenants.
+func TestIAMIdentityYieldsTheQualifiedTenant(t *testing.T) {
+	id := identity()
+	for _, tc := range []struct{ host, issuer, org, want string }{
+		{"api.hanzo.ai", "https://hanzo.id", "acme", "hanzo/acme"},
+		{"api.lux.network", "https://lux.id", "acme", "lux/acme"},
+		{"api.zoo.ngo", "https://zoolabs.id", "acme", "zoo/acme"},
+		{"console.zoo.cloud", "https://zoolabs.id", "acme", "zoo/acme"},
+	} {
+		tok := rs256(t, jwt.MapClaims{"iss": tc.issuer, "owner": tc.org, "sub": "u-1", "isAdmin": true})
+		got, err := id(bearing(tc.host, tok))
+		if err != nil {
+			t.Fatalf("%s: refused a valid token: %v", tc.host, err)
+		}
+		if got != tc.want {
+			t.Errorf("%s: tenant = %q, want %q", tc.host, got, tc.want)
+		}
 	}
-	if org != "acme-org" {
-		t.Fatalf("org = %q, want acme-org", org)
+}
+
+// A Host no brand claims must refuse, whatever the token says.
+//
+// Every row here is a Host this process really is reached on: the pod IP that any
+// in-cluster caller can dial, the Service DNS name, localhost through a
+// port-forward, an absent Host, and lookalike domains under somebody else's
+// registrable suffix. While the brand resolver defaulted, each of them was
+// authenticated by the default brand's issuer — a hanzo.id token opened this
+// service on all of them, and the white-label pin was inert everywhere the ingress
+// had not put the brand's own name in the Host.
+func TestIAMIdentityRefusesAnUnnamedHost(t *testing.T) {
+	id := identity()
+	// A token that is beyond reproach everywhere else: current, correctly audienced,
+	// an access token, signed by the published key, from a first-party issuer.
+	tok := rs256(t, jwt.MapClaims{"iss": "https://hanzo.id", "owner": "acme", "sub": "u-1"})
+
+	for _, host := range []string{
+		"10.42.0.7:8090",
+		"aml.aml.svc.cluster.local",
+		"aml.svc.cluster.local:8090",
+		"localhost",
+		"localhost:8090",
+		"127.0.0.1:8090",
+		"",
+		"a.zoo.ngo.attacker.example",
+		"hanzo.ai.attacker.example",
+		"aml.internal",
+	} {
+		if tenant, err := id(bearing(host, tok)); err == nil {
+			t.Errorf("a hanzo.id token authenticated as %q on %q", tenant, host)
+		}
+	}
+
+	// The same token on the brand's own Host is accepted, so the rows above fail for
+	// the Host and not because the token was bad.
+	if _, err := id(bearing("api.hanzo.ai", tok)); err != nil {
+		t.Fatalf("the same token on api.hanzo.ai was refused: %v", err)
+	}
+}
+
+// The audience is this application, and the token is an access token.
+//
+// IAM stamps aud = the app's clientId, and every first-party token on an issuer is
+// signed by the same keys and carries the same `iss`. The audience is the only
+// thing that says which application a token was minted FOR, and RFC 9068 §4 makes
+// checking it the resource server's own job — nobody else can. Without it a token
+// issued to a marketing site, or to any other tenant's application on the same
+// issuer, is a credential for a compliance record plane.
+func TestAudienceIsThisApplication(t *testing.T) {
+	id := identity()
+	hanzo := "https://hanzo.id"
+	base := func() jwt.MapClaims {
+		return jwt.MapClaims{"iss": hanzo, "owner": "acme", "sub": "u-1"}
+	}
+	with := func(k string, v any) jwt.MapClaims {
+		c := base()
+		c[k] = v
+		return c
+	}
+
+	for _, tc := range []struct{ name, token string }{
+		{"a token for a marketing site", rs256(t, with("aud", "marketing-site"))},
+		{"a token for another tenant's app on this issuer", rs256(t, with("aud", "acme-portal"))},
+		{"a token with no audience at all", rs256(t, with("aud", nil))},
+		{"an audience that merely contains ours", rs256(t, with("aud", aud+"-staging"))},
+		{"an audience ours is a prefix of", rs256(t, with("aud", "x-"+aud))},
+		{"an empty audience", rs256(t, with("aud", ""))},
+		// IAM scopes a SHARED application's audience to the org (audienceFor:
+		// clientId + "-org-" + org), so a shared application's token cannot satisfy a
+		// pin on a dedicated application's clientId. Here the audience itself refuses
+		// the deployment shape whose tenant claim would be wrong.
+		{"a shared application's org-scoped audience", rs256(t, with("aud", aud+"-org-hanzo"))},
+
+		// tokenType: an id_token is issued to a browser for the browser's own
+		// consumption, carries the same iss and the same aud, and is not a credential
+		// for an API. IAM says which kind it minted, so this is refusable and refused.
+		{"an id_token", rs256(t, with("tokenType", "id-token"))},
+		{"no tokenType at all", rs256(t, with("tokenType", nil))},
+		{"an unrecognised tokenType", rs256(t, with("tokenType", "refresh-token"))},
+		{"an empty tokenType", rs256(t, with("tokenType", ""))},
+	} {
+		if tenant, err := id(bearing("api.hanzo.ai", tc.token)); err == nil {
+			t.Errorf("%s authenticated as %q", tc.name, tenant)
+		}
+	}
+
+	// An audience list containing ours is accepted: `aud` is a set, and the question
+	// RFC 9068 asks is whether this resource server is in it.
+	if _, err := id(bearing("api.hanzo.ai", rs256(t, with("aud", []string{"other", aud})))); err != nil {
+		t.Errorf("an audience list naming this application was refused: %v", err)
+	}
+
+	// With no audience configured nothing authenticates, including a token that is
+	// otherwise perfect. An unpinned deployment would accept every token its issuer
+	// ever minted, so it accepts none.
+	for _, unpinned := range []string{"", "   "} {
+		if tenant, err := IAMIdentity(published, unpinned)(bearing("api.hanzo.ai", rs256(t, base()))); err == nil {
+			t.Errorf("with audience %q configured, a token authenticated as %q", unpinned, tenant)
+		}
+	}
+}
+
+// The tenant is an org the caller actually belongs to.
+//
+// IAM's `owner` claim is the APP's org, not the user's (internal/oidc/jwt.go Sign:
+// Owner: app.Organization). For the shape this engine supports — one dedicated
+// application per financial institution — IAM refuses a login from outside the
+// app's org (login.go: user.Owner != app.Organization && !app.IsShared &&
+// app.OrgChoiceMode == "" → refused), so `owner` IS the caller's org and the two
+// always agree.
+//
+// A SHARED or org-choice application breaks that: users of any org may authenticate
+// to it, and every one of their tokens carries the APP owner's org as `owner`. Taken
+// on faith that makes all of them one tenant, and one institution's analyst reads
+// another's records. IAM also emits the caller's own membership set, so the claim is
+// checkable rather than trusted: an owner the caller is not a member of refuses.
+// It is the same predicate the fleet uses to authorize an org switch (X-Org-Id ∈
+// orgs).
+func TestTenantIsAnOrgTheCallerBelongsTo(t *testing.T) {
+	id := identity()
+	hanzo := "https://hanzo.id"
+
+	for _, tc := range []struct {
+		name  string
+		token string
+		want  string
+	}{
+		{
+			"a member of the org the token acts for",
+			rs256(t, jwt.MapClaims{"iss": hanzo, "owner": "acme", "orgs": orgs("acme")}),
+			"hanzo/acme",
+		},
+		{
+			// An analyst whose home org is not the institution but who is a member of
+			// it. The home org is orgs[0] and is deliberately NOT what scopes the read:
+			// the token says which institution it acts for, and the membership set says
+			// whether it may.
+			"a member whose home org is another",
+			rs256(t, jwt.MapClaims{"iss": hanzo, "owner": "acme", "orgs": orgs("consultancy", "acme")}),
+			"hanzo/acme",
+		},
+		{
+			// client_credentials: no user, so no membership set — IAM passes nil orgs
+			// and the claim is omitted. The org is the org of the application, and
+			// which application it is has already been pinned by the audience.
+			"a machine token with no membership set",
+			rs256(t, jwt.MapClaims{"iss": hanzo, "owner": "acme", "sub": "acme/robot"}),
+			"hanzo/acme",
+		},
+	} {
+		got, err := id(bearing("api.hanzo.ai", tc.token))
+		if err != nil {
+			t.Errorf("%s was refused: %v", tc.name, err)
+			continue
+		}
+		if got != tc.want {
+			t.Errorf("%s: tenant = %q, want %q", tc.name, got, tc.want)
+		}
+	}
+
+	for _, tc := range []struct{ name, token string }{
+		{
+			// The shared-application case: the app is owned by `hanzo`, the caller is a
+			// member of `zoo-tenant` alone, and IAM stamped the app's org as the owner.
+			"a shared application's token, whose owner the caller is not in",
+			rs256(t, jwt.MapClaims{"iss": hanzo, "owner": "hanzo", "orgs": orgs("zoo-tenant")}),
+		},
+		{
+			"an owner that only looks like a member org",
+			rs256(t, jwt.MapClaims{"iss": hanzo, "owner": "acme-holdings", "orgs": orgs("acme")}),
+		},
+		{
+			"a membership set that names no org",
+			rs256(t, jwt.MapClaims{"iss": hanzo, "owner": "acme", "orgs": []any{map[string]any{"role": "member"}}}),
+		},
+	} {
+		if tenant, err := id(bearing("api.hanzo.ai", tc.token)); err == nil {
+			t.Errorf("%s authenticated as %q", tc.name, tenant)
+		}
 	}
 }
 
@@ -208,38 +438,19 @@ func TestIAMIdentityRefusesEveryDoubt(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	id := IAMIdentity(published)
+	id := identity()
 	hanzo := "https://hanzo.id"
 
 	// A token signed with a key the issuer does not publish. Same claims, valid
 	// shape, no provenance.
-	forged := mint(t, stranger, jwt.MapClaims{"iss": hanzo, "owner": "acme-org"})
+	forged := mint(t, stranger, jwt.SigningMethodRS256, jwt.MapClaims{"iss": hanzo, "owner": "acme"})
 
 	// Symmetric signing over the public modulus: the algorithm-confusion attack,
 	// which succeeds wherever the verifier takes the token's word for the family.
-	confused := func() string {
-		tok := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
-			"iss": hanzo, "owner": "acme-org", "exp": time.Now().Add(time.Hour).Unix(),
-		})
-		tok.Header["kid"] = "iam"
-		raw, err := tok.SignedString(key().PublicKey.N.Bytes())
-		if err != nil {
-			t.Fatalf("sign: %v", err)
-		}
-		return raw
-	}()
+	confused := mint(t, key().PublicKey.N.Bytes(), jwt.SigningMethodHS256, jwt.MapClaims{"iss": hanzo, "owner": "acme"})
 
 	// A token with no `alg` at all: "none" carries no signature to check.
-	unsigned := func() string {
-		tok := jwt.NewWithClaims(jwt.SigningMethodNone, jwt.MapClaims{
-			"iss": hanzo, "owner": "acme-org", "exp": time.Now().Add(time.Hour).Unix(),
-		})
-		raw, err := tok.SignedString(jwt.UnsafeAllowNoneSignatureType)
-		if err != nil {
-			t.Fatalf("sign: %v", err)
-		}
-		return raw
-	}()
+	unsigned := mint(t, jwt.UnsafeAllowNoneSignatureType, jwt.SigningMethodNone, jwt.MapClaims{"iss": hanzo, "owner": "acme"})
 
 	for _, tc := range []struct {
 		name  string
@@ -247,29 +458,30 @@ func TestIAMIdentityRefusesEveryDoubt(t *testing.T) {
 		token string
 	}{
 		{"no token at all", "api.hanzo.ai", ""},
-		{"another brand's issuer", "api.hanzo.ai", mint(t, key(), jwt.MapClaims{"iss": "https://lux.id", "owner": "acme-org"})},
-		{"no issuer", "api.hanzo.ai", mint(t, key(), jwt.MapClaims{"owner": "acme-org"})},
-		{"an issuer no brand claims", "api.hanzo.ai", mint(t, key(), jwt.MapClaims{"iss": "https://evil.example", "owner": "acme-org"})},
-		{"the issuer as a prefix of ours", "api.hanzo.ai", mint(t, key(), jwt.MapClaims{"iss": "https://hanzo.id.evil.example", "owner": "acme-org"})},
+		{"another brand's issuer", "api.hanzo.ai", rs256(t, jwt.MapClaims{"iss": "https://lux.id", "owner": "acme"})},
+		{"no issuer", "api.hanzo.ai", rs256(t, jwt.MapClaims{"owner": "acme"})},
+		{"an issuer no brand claims", "api.hanzo.ai", rs256(t, jwt.MapClaims{"iss": "https://evil.example", "owner": "acme"})},
+		{"the issuer as a prefix of ours", "api.hanzo.ai", rs256(t, jwt.MapClaims{"iss": "https://hanzo.id.evil.example", "owner": "acme"})},
 		{"a signature from an unpublished key", "api.hanzo.ai", forged},
 		{"a symmetric signature over the modulus", "api.hanzo.ai", confused},
 		{"no signature", "api.hanzo.ai", unsigned},
-		{"expired", "api.hanzo.ai", mint(t, key(), jwt.MapClaims{"iss": hanzo, "owner": "acme-org", "exp": time.Now().Add(-time.Hour).Unix()})},
-		{"no expiry", "api.hanzo.ai", mint(t, key(), jwt.MapClaims{"iss": hanzo, "owner": "acme-org", "exp": nil})},
-		{"not yet valid", "api.hanzo.ai", mint(t, key(), jwt.MapClaims{"iss": hanzo, "owner": "acme-org", "nbf": time.Now().Add(time.Hour).Unix()})},
-		{"no owner", "api.hanzo.ai", mint(t, key(), jwt.MapClaims{"iss": hanzo, "sub": "u-1"})},
-		{"an empty owner", "api.hanzo.ai", mint(t, key(), jwt.MapClaims{"iss": hanzo, "owner": ""})},
-		{"a blank owner", "api.hanzo.ai", mint(t, key(), jwt.MapClaims{"iss": hanzo, "owner": "   "})},
+		{"expired", "api.hanzo.ai", rs256(t, jwt.MapClaims{"iss": hanzo, "owner": "acme", "exp": time.Now().Add(-time.Hour).Unix()})},
+		{"no expiry", "api.hanzo.ai", rs256(t, jwt.MapClaims{"iss": hanzo, "owner": "acme", "exp": nil})},
+		{"not yet valid", "api.hanzo.ai", rs256(t, jwt.MapClaims{"iss": hanzo, "owner": "acme", "nbf": time.Now().Add(time.Hour).Unix()})},
+		{"no owner", "api.hanzo.ai", rs256(t, jwt.MapClaims{"iss": hanzo, "sub": "u-1"})},
+		{"an empty owner", "api.hanzo.ai", rs256(t, jwt.MapClaims{"iss": hanzo, "owner": ""})},
+		{"a blank owner", "api.hanzo.ai", rs256(t, jwt.MapClaims{"iss": hanzo, "owner": "   "})},
+		{"an owner carrying the tenant separator", "api.hanzo.ai", rs256(t, jwt.MapClaims{"iss": hanzo, "owner": "zoo/acme"})},
 		{"not a token", "api.hanzo.ai", "not.a.token"},
 	} {
-		if org, err := id(bearing(tc.host, tc.token)); err == nil {
-			t.Errorf("%s authenticated as %q", tc.name, org)
+		if tenant, err := id(bearing(tc.host, tc.token)); err == nil {
+			t.Errorf("%s authenticated as %q", tc.name, tenant)
 		}
 	}
 
 	// A credential presented anywhere but the Authorization header is not a
 	// credential here.
-	valid := mint(t, key(), jwt.MapClaims{"iss": hanzo, "owner": "acme-org"})
+	valid := rs256(t, jwt.MapClaims{"iss": hanzo, "owner": "acme"})
 	for _, r := range []*http.Request{
 		func() *http.Request {
 			r := httptest.NewRequest(http.MethodGet, "/v1/aml/cases?access_token="+valid, nil)
@@ -296,16 +508,62 @@ func TestIAMIdentityRefusesEveryDoubt(t *testing.T) {
 			return r
 		}(),
 	} {
-		if org, err := id(r); err == nil {
-			t.Errorf("a token outside the bearer header authenticated as %q", org)
+		if tenant, err := id(r); err == nil {
+			t.Errorf("a token outside the bearer header authenticated as %q", tenant)
 		}
+	}
+}
+
+// A bearer that is not a token must not cost a request to the issuer.
+//
+// Resolving a keyset can be a network round trip. An unauthenticated caller who can
+// make the auth path take one per request — by choosing a Host and putting any word
+// at all in the Authorization header — has a lever on this process that costs them
+// nothing. So the shape is checked first, and only something that could be a signed
+// token is worth asking an issuer about.
+func TestGarbageBearerCostsNoIssuerFetch(t *testing.T) {
+	var asked atomic.Int64
+	counted := func(issuer string) (Keyset, error) {
+		asked.Add(1)
+		return published(issuer)
+	}
+	id := IAMIdentity(counted, aud)
+
+	for _, garbage := range []string{
+		"x",
+		"not-a-token",
+		"a.b",
+		"a.b.c.d",
+		"..",
+		"a..c",
+		"!!!.e30.sig",                            // a header that is not base64url
+		"e30.e30.sig",                            // a header that is {} — no alg
+		"eyJhIjoxfQ.e30.sig",                     // JSON without an alg
+		"YQ.e30.sig",                             // a header that is not JSON
+		strings.Repeat("A", maxToken+1) + ".b.c", // longer than any token
+	} {
+		if tenant, err := id(bearing("api.hanzo.ai", garbage)); err == nil {
+			t.Errorf("%q authenticated as %q", garbage, tenant)
+		}
+	}
+	if n := asked.Load(); n != 0 {
+		t.Errorf("garbage bearers cost %d issuer fetches, want 0", n)
+	}
+
+	// A well-formed token does reach the keys, so the filter is a filter and not a
+	// second refusal quietly standing in for the parse.
+	if _, err := id(bearing("api.hanzo.ai", rs256(t, jwt.MapClaims{"iss": "https://hanzo.id", "owner": "acme"}))); err != nil {
+		t.Fatalf("a real token was refused: %v", err)
+	}
+	if n := asked.Load(); n != 1 {
+		t.Errorf("a real token cost %d issuer fetches, want 1", n)
 	}
 }
 
 // With no way to reach an issuer's keys there is no way to check a signature, so
 // there is no tenant. The same holds for an issuer that publishes an empty set.
 func TestIAMIdentityRefusesWithoutKeys(t *testing.T) {
-	tok := mint(t, key(), jwt.MapClaims{"iss": "https://hanzo.id", "owner": "acme-org"})
+	tok := rs256(t, jwt.MapClaims{"iss": "https://hanzo.id", "owner": "acme"})
 	for _, tc := range []struct {
 		name string
 		jwks Keysets
@@ -314,8 +572,8 @@ func TestIAMIdentityRefusesWithoutKeys(t *testing.T) {
 		{"unreachable issuer", func(string) (Keyset, error) { return nil, fmt.Errorf("dial: refused") }},
 		{"an empty keyset", func(string) (Keyset, error) { return Keyset{}, nil }},
 	} {
-		if org, err := IAMIdentity(tc.jwks)(bearing("api.hanzo.ai", tok)); err == nil {
-			t.Errorf("%s authenticated as %q", tc.name, org)
+		if tenant, err := IAMIdentity(tc.jwks, aud)(bearing("api.hanzo.ai", tok)); err == nil {
+			t.Errorf("%s authenticated as %q", tc.name, tenant)
 		}
 	}
 }
@@ -331,9 +589,9 @@ func TestRotationKeepsLiveTokensValid(t *testing.T) {
 	both := func(string) (Keyset, error) {
 		return Keyset{"iam": &key().PublicKey, "iam-next": &next.PublicKey}, nil
 	}
-	id := IAMIdentity(both)
+	id := IAMIdentity(both, aud)
 
-	old := mint(t, key(), jwt.MapClaims{"iss": "https://hanzo.id", "owner": "acme-org"})
+	old := rs256(t, jwt.MapClaims{"iss": "https://hanzo.id", "owner": "acme"})
 	if _, err := id(bearing("api.hanzo.ai", old)); err != nil {
 		t.Errorf("a token from the previous key was refused during rotation: %v", err)
 	}
@@ -342,7 +600,8 @@ func TestRotationKeepsLiveTokensValid(t *testing.T) {
 	// the signature is checked against every key the issuer publishes, and this one
 	// holds under the new key.
 	unlabelled := jwt.NewWithClaims(jwt.SigningMethodRS256, jwt.MapClaims{
-		"iss": "https://hanzo.id", "owner": "acme-org", "exp": time.Now().Add(time.Hour).Unix(),
+		"iss": "https://hanzo.id", "owner": "acme", "aud": aud, "tokenType": accessToken,
+		"exp": time.Now().Add(time.Hour).Unix(),
 	})
 	unlabelled.Header["kid"] = "a-kid-nobody-published"
 	raw, err := unlabelled.SignedString(next)
@@ -355,9 +614,9 @@ func TestRotationKeepsLiveTokensValid(t *testing.T) {
 
 	// Naming one published key while being signed by another is a key substitution.
 	// The kid binds: that key must be the one that verifies it.
-	substituted := mint(t, next, jwt.MapClaims{"iss": "https://hanzo.id", "owner": "acme-org"}) // kid "iam", signed by next
-	if org, err := id(bearing("api.hanzo.ai", substituted)); err == nil {
-		t.Errorf("a token labelled kid=iam but signed by another key authenticated as %q", org)
+	substituted := mint(t, next, jwt.SigningMethodRS256, jwt.MapClaims{"iss": "https://hanzo.id", "owner": "acme"}) // kid "iam", signed by next
+	if tenant, err := id(bearing("api.hanzo.ai", substituted)); err == nil {
+		t.Errorf("a token labelled kid=iam but signed by another key authenticated as %q", tenant)
 	}
 }
 
@@ -365,15 +624,15 @@ func TestRotationKeepsLiveTokensValid(t *testing.T) {
 // alerts. The tenant is whatever the token says and nothing else says otherwise.
 func TestTenantsDoNotBleedUnderIAMIdentity(t *testing.T) {
 	alerts := NewAlertStore()
-	alerts.Add("tx-1", []types.Alert{{ID: "first-alert", OrgID: "first"}})
-	alerts.Add("tx-1", []types.Alert{{ID: "second-alert", OrgID: "second"}})
-	h := &Handler{Alerts: alerts, Identity: IAMIdentity(published)}
+	alerts.Add("tx-1", []types.Alert{{ID: "first-alert", OrgID: "hanzo/first"}})
+	alerts.Add("tx-1", []types.Alert{{ID: "second-alert", OrgID: "hanzo/second"}})
+	h := &Handler{Alerts: alerts, Identity: identity()}
 
 	for _, tc := range []struct{ org, mine, theirs string }{
 		{"first", "first-alert", "second-alert"},
 		{"second", "second-alert", "first-alert"},
 	} {
-		tok := mint(t, key(), jwt.MapClaims{"iss": "https://hanzo.id", "owner": tc.org})
+		tok := rs256(t, jwt.MapClaims{"iss": "https://hanzo.id", "owner": tc.org})
 		e, rec := request(http.MethodGet, "/v1/aml/transactions/tx-1/alerts", "api.hanzo.ai", tok)
 		e.Request.SetPathValue("id", "tx-1")
 		if err := h.getAlerts()(e); err != nil {
@@ -392,124 +651,78 @@ func TestTenantsDoNotBleedUnderIAMIdentity(t *testing.T) {
 	}
 }
 
-// jwksDoc is an issuer's published key set, as IAM serves it.
-func jwksDoc(keys map[string]*rsa.PublicKey) string {
-	var out []string
-	for kid, k := range keys {
-		out = append(out, fmt.Sprintf(`{"kty":"RSA","use":"sig","alg":"RS256","kid":%q,"n":%q,"e":%q}`,
-			kid,
-			base64.RawURLEncoding.EncodeToString(k.N.Bytes()),
-			base64.RawURLEncoding.EncodeToString(big.NewInt(int64(k.E)).Bytes())))
+// A route nobody registered protects nothing, however well it is written: the
+// documentation said GET /v1/aml/config was live while Register did not mention it,
+// so the only thing serving it was a test calling the handler directly.
+//
+// This drives the real router — Register, BuildMux, an HTTP request — so a route is
+// only accounted for here if the daemon would actually serve it.
+func TestEveryRouteIsServed(t *testing.T) {
+	h := &Handler{
+		Identity: identity(),
+		Alerts:   NewAlertStore(),
+		Cases:    cases.NewStore(),
+		Engine:   testEngine(nil),
 	}
-	return `{"keys":[` + strings.Join(out, ",") + `]}`
-}
-
-// JWKS reads a real key set off an issuer over HTTP, from the issuer's own path,
-// and a token signed by the key it published verifies against it.
-func TestJWKSReadsTheIssuersKeys(t *testing.T) {
-	var mu sync.Mutex
-	var asked []string
-	iam := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		mu.Lock()
-		asked = append(asked, r.URL.Path)
-		mu.Unlock()
-		fmt.Fprint(w, jwksDoc(map[string]*rsa.PublicKey{"iam": &key().PublicKey}))
-	}))
-	defer iam.Close()
-
-	set, err := JWKS(time.Minute, time.Hour)(iam.URL)
+	se := &core.ServeEvent{Router: router.NewRouter(func(w http.ResponseWriter, r *http.Request) (*core.RequestEvent, router.EventCleanupFunc) {
+		e := new(core.RequestEvent)
+		e.Request, e.Response = r, w
+		return e, nil
+	})}
+	h.Register(se)
+	mux, err := se.Router.BuildMux()
 	if err != nil {
-		t.Fatalf("JWKS: %v", err)
-	}
-	mu.Lock()
-	defer mu.Unlock()
-	if len(asked) != 1 || asked[0] != jwksPath {
-		t.Fatalf("asked %v, want one GET of %s", asked, jwksPath)
-	}
-	if got := set["iam"]; got == nil || got.N.Cmp(key().PublicKey.N) != 0 || got.E != key().PublicKey.E {
-		t.Fatalf("decoded key does not match the published one: %+v", got)
+		t.Fatalf("BuildMux: %v", err)
 	}
 
-	// The decoded key is a verification key, not just a struct that parsed.
-	tok := mint(t, key(), jwt.MapClaims{"iss": iam.URL, "owner": "acme-org"})
-	parsed, err := jwt.ParseWithClaims(tok, &claims{}, set.verify, jwt.WithValidMethods(methods), jwt.WithIssuer(iam.URL))
-	if err != nil || !parsed.Valid {
-		t.Fatalf("a token signed by the published key did not verify: %v", err)
-	}
-}
-
-// A keyset is held past its refresh while the issuer is unreachable — a blip must
-// not refuse every caller — but only up to the staleness bound, past which the
-// keys are not something this instance can still confirm and it refuses instead.
-func TestJWKSHoldsStaleKeysOnlyWithinTheBound(t *testing.T) {
-	var up atomic.Bool
-	up.Store(true)
-	iam := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if !up.Load() {
-			w.WriteHeader(http.StatusInternalServerError)
-			return
-		}
-		fmt.Fprint(w, jwksDoc(map[string]*rsa.PublicKey{"iam": &key().PublicKey}))
-	}))
-	defer iam.Close()
-
-	now := time.Now()
-	c := &cache{
-		ttl: time.Minute, stale: 10 * time.Minute,
-		sets: map[string]issuerKeys{}, client: iam.Client(),
-		now: func() time.Time { return now },
-	}
-	if _, err := c.get(iam.URL); err != nil {
-		t.Fatalf("first fetch: %v", err)
-	}
-
-	up.Store(false)
-	now = now.Add(5 * time.Minute) // past the refresh, inside the bound
-	if _, err := c.get(iam.URL); err != nil {
-		t.Fatalf("a stale keyset inside the bound was not served: %v", err)
-	}
-	now = now.Add(10 * time.Minute) // past the bound
-	if _, err := c.get(iam.URL); err == nil {
-		t.Fatal("keys the issuer has not confirmed for longer than the bound were still served")
-	}
-
-	// Once the issuer answers again, so does the cache.
-	up.Store(true)
-	if _, err := c.get(iam.URL); err != nil {
-		t.Fatalf("recovery: %v", err)
-	}
-}
-
-// What a published key must be to count as one. Each row is a key that cannot
-// establish who is calling, so it must not be loaded at all: loading it would
-// leave a verifier that accepts a signature it should not.
-func TestKeysThatAreNotEvidenceAreNotLoaded(t *testing.T) {
-	weak, err := rsa.GenerateKey(rand.Reader, 1024)
-	if err != nil {
-		t.Fatal(err)
-	}
-	good := base64.RawURLEncoding.EncodeToString(key().PublicKey.N.Bytes())
-
-	for _, tc := range []struct{ name, doc string }{
-		{"a modulus too short to be evidence", jwksDoc(map[string]*rsa.PublicKey{"weak": &weak.PublicKey})},
-		{"an empty set", `{"keys":[]}`},
-		{"not a key set", `{"keys":"nope"}`},
-		{"an encryption key", `{"keys":[{"kty":"RSA","use":"enc","kid":"e","n":"` + good + `","e":"AQAB"}]}`},
-		{"another key type", `{"keys":[{"kty":"oct","use":"sig","kid":"h","k":"c2VjcmV0"}]}`},
-		{"a modulus that is not base64url", `{"keys":[{"kty":"RSA","use":"sig","kid":"x","n":"!!!","e":"AQAB"}]}`},
-		{"an exponent too large to be one", `{"keys":[{"kty":"RSA","use":"sig","kid":"x","n":"` + good + `","e":"` + strings.Repeat("AQAB", 4) + `"}]}`},
+	// Unauthenticated, so a tenant-scoped route answers 401 — which is proof it is
+	// served, since a route nobody registered answers 404.
+	for _, tc := range []struct {
+		method, path string
+		code         int
+	}{
+		{http.MethodPost, "/v1/aml/transactions", http.StatusUnauthorized},
+		{http.MethodGet, "/v1/aml/transactions/tx-1/alerts", http.StatusUnauthorized},
+		{http.MethodGet, "/v1/aml/cases", http.StatusUnauthorized},
+		{http.MethodPost, "/v1/aml/cases/c-1/events", http.StatusUnauthorized},
+		{http.MethodPost, "/v1/aml/cases/c-1/resolve", http.StatusUnauthorized},
+		{http.MethodPost, "/v1/aml/rules/test", http.StatusUnauthorized},
+		{http.MethodPost, "/v1/aml/relationships", http.StatusUnauthorized},
+		{http.MethodPost, "/v1/aml/relationships/r-1/close", http.StatusUnauthorized},
+		{http.MethodPost, "/v1/aml/relationships/search", http.StatusUnauthorized},
+		{http.MethodGet, "/v1/aml/anomaly", http.StatusUnauthorized},
+		{http.MethodPost, "/v1/aml/anomaly/test", http.StatusUnauthorized},
+		// The rule catalog is the deployment's, not a tenant's, and the brand config
+		// is what a caller reads BEFORE it has a token. Both answer unauthenticated,
+		// which is also why they are the two rows that prove a 401 above means the
+		// tenancy check and not a route that answers 401 whatever happens.
+		{http.MethodGet, "/v1/aml/rules", http.StatusOK},
+		{http.MethodGet, "/v1/aml/config", http.StatusOK},
 	} {
-		if set, err := decodeKeys([]byte(tc.doc)); err == nil {
-			t.Errorf("%s was loaded as a signing key: %+v", tc.name, set)
+		req := httptest.NewRequest(tc.method, tc.path, strings.NewReader("{}"))
+		req.Host = "api.hanzo.ai"
+		rec := httptest.NewRecorder()
+		mux.ServeHTTP(rec, req)
+		if rec.Code == http.StatusNotFound {
+			t.Errorf("%s %s is not served", tc.method, tc.path)
+			continue
+		}
+		if rec.Code != tc.code {
+			t.Errorf("%s %s: status %d, want %d; body=%s", tc.method, tc.path, rec.Code, tc.code, rec.Body.String())
 		}
 	}
 
-	// Padded base64url is accepted: RFC 7517 omits the padding but implementations
-	// send it, and refusing them would refuse a working issuer.
-	padded := fmt.Sprintf(`{"keys":[{"kty":"RSA","use":"sig","kid":"iam","n":%q,"e":%q}]}`,
-		base64.StdEncoding.EncodeToString(key().PublicKey.N.Bytes()),
-		"AQAB=")
-	if set, err := decodeKeys([]byte(strings.ReplaceAll(strings.ReplaceAll(padded, "+", "-"), "/", "_"))); err != nil || set["iam"] == nil {
-		t.Errorf("a padded key set was refused: %v", err)
+	// The config route serves the brand of the Host it was asked on, through the
+	// router rather than by calling the handler.
+	req := httptest.NewRequest(http.MethodGet, "/v1/aml/config", nil)
+	req.Host = "api.lux.network"
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	var got config
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatalf("config body %q: %v", rec.Body.String(), err)
+	}
+	if got.Brand != "lux" || got.Issuer != "https://lux.id" {
+		t.Errorf("config on api.lux.network = %+v, want the lux brand", got)
 	}
 }

@@ -831,8 +831,9 @@ func TestKeyMaterialIsNotALiteral(t *testing.T) {
 
 // testEngine builds an engine over providers a test can satisfy, and installs the
 // rules through SetRules so the test exercises the same admission the daemon does.
-// acme is the tenant every request in these tests is authenticated as.
-const acme = "acme"
+// acme is the tenant every request in these tests is authenticated as: the org
+// `acme` on the Hanzo brand, in the qualified form every store key is in.
+const acme = "hanzo/acme"
 
 func testEngine(rules []types.Rule) *engine.Engine {
 	eng := engine.New(engine.Providers{Rate: reference.Rates{USDPer: map[string]float64{}}, Zone: time.UTC})

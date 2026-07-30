@@ -4,8 +4,9 @@
 
 package api
 
-// The IAM Identity: the tenant of a request is the org named by an access token
-// that the brand of the request's own Host issued.
+// The IAM Identity: the tenant of a request is the brand of the request's own
+// Host, qualifying the org named by an access token that this AML application
+// obtained from that brand's issuer.
 //
 // This is the second implementation of the Identity seam and the one a directly
 // reachable deployment must use. TrustedProxyHeader is sound only where an
@@ -13,33 +14,43 @@ package api
 // header; where that does not hold, the header is an unauthenticated assertion and
 // any caller can name any tenant. Here the org arrives inside a signature.
 //
-// Brand pinning is the white-label half. The Host decides which issuer may
-// authenticate the caller, so a Lux-issued token presented on a Zoo host is
-// refused even though both issuers are first-party and, in-cluster, may publish
-// their signing certificates in one JWKS. Without that pin, tenancy across brands
-// is decoration: one valid token from any brand would open every brand's surface.
-// This is stricter than the fleet edge (hanzoai/cloud auth_identity.go), which
-// trusts the union of brand issuers because one binary serves every brand's apps;
-// an AML record plane answers for one brand at a time, so it pins.
+// Four things have to hold before a token names a tenant, and they are four
+// because each one alone is satisfied by a token that must not be served:
 //
-// What the pin does not settle: an org name is unique within an issuer, not across
-// issuers, and the tenant returned here is the org name. A deployment serving more
-// than one brand out of ONE record plane therefore has to scope that plane by
-// brand as well as by org — otherwise two brands' orgs of the same name are one
-// tenant. A deployment per brand needs nothing further, and that is the shape this
-// runs in today.
+//   - The signature verifies under a key the brand of THIS Host publishes. Which
+//     brand is decided by the Host, so a Lux-issued token presented on a Zoo host
+//     is refused even though both issuers are first-party and, in-cluster, may
+//     publish their signing certificates in one JWKS. A Host no brand claims names
+//     no issuer, and refuses: this is the auth path, and it is the one caller that
+//     must not be handed a default.
+//   - The audience is THIS application. IAM stamps aud = the app's clientId
+//     (internal/oidc/jwt.go, audienceFor), so with no pin any first-party token
+//     from the same issuer authenticates here — one minted for a marketing site,
+//     for another tenant's app, for anything at all on hanzo.id. RFC 9068 §4 makes
+//     this the resource server's own check, and nobody else can make it.
+//   - It is an access token. IAM stamps tokenType, so an id_token — issued to a
+//     browser for the browser's own consumption, not a credential for an API, and
+//     carrying the same iss and the same aud — is refusable, and is refused.
+//   - The org it names is one the caller belongs to. IAM's `owner` claim is the
+//     APP's org (jwt.go Sign: Owner: app.Organization), and its `orgs` claim is the
+//     caller's own membership set. For the deployment shape this engine supports —
+//     one IAM application per financial institution, neither shared nor org-choice
+//     — IAM itself refuses a login from outside the app's org (internal/oidc/
+//     login.go), so the two always agree. Where they do not agree the application
+//     is shared, and every one of its users would otherwise be handed the app
+//     owner's tenant.
+//
+// A record plane is stricter here than the fleet edge (hanzoai/cloud
+// auth_identity.go), which trusts the union of brand issuers because one binary
+// serves every brand's apps. This answers for one brand at a time, so it pins.
 
 import (
-	"crypto/rsa"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
-	"math/big"
 	"net/http"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/golang-jwt/jwt/v5"
@@ -47,74 +58,99 @@ import (
 	"github.com/luxfi/aml/pkg/brand"
 )
 
-// jwksPath is where a Hanzo IAM issuer publishes its signing keys, relative to
-// the issuer itself. The issuer is authoritative for its own keys, so this is the
-// only place they are ever read from.
-const jwksPath = "/v1/iam/.well-known/jwks"
-
 // skew is the clock difference tolerated on exp and nbf. It matches the fleet
 // edge validator, so a token that is live at the gateway is live here and a
 // caller cannot be authenticated by one layer and refused by the other.
 const skew = 2 * time.Minute
 
-// signing methods accepted. IAM signs RS256; the wider RSA families are listed
-// because a rotation to a stronger hash must not need a release here. Anything
-// else — HS256 in particular, the algorithm-confusion attack that would have the
-// verifier treat a public modulus as a shared secret — has no key in a JWKS and
-// is refused before a signature is ever checked.
-var methods = []string{"RS256", "RS384", "RS512", "PS256", "PS384", "PS512"}
-
-// minModulus is the smallest RSA modulus whose signature counts as evidence. An
-// issuer publishing a shorter key cannot be told apart from a JWKS that was
-// tampered with in transit, and a signature under a forgeable key proves nothing
-// about who is calling.
-const minModulus = 2048
-
-// Keyset is an issuer's public signing keys, addressed by JWK `kid`.
-type Keyset map[string]*rsa.PublicKey
-
-// Keysets resolves an issuer to the keyset it signs with.
-//
-// It is a seam so that the validator holds no network: a deployment passes JWKS,
-// a test passes the key it signed with, and both exercise the same validation.
-// (Distinct from Handler.Keys, which is the tokenisation keyring — that holds
-// secrets, this holds published verification keys.)
-type Keysets func(issuer string) (Keyset, error)
+// accessToken is the tokenType IAM stamps on a token that authorises API calls.
+// Its sibling is "id-token"; anything else is refused rather than assumed, because
+// the claim exists precisely so that a bearer of one kind cannot be spent as
+// another.
+const accessToken = "access-token"
 
 // claims is the part of an IAM access token this engine reads.
-//
-// `owner` is the fleet's org claim — IAM states which org a token acts for, and
-// every layer that scopes data reads that one claim (the gateway sets X-Org-Id
-// from it, which is what TrustedProxyHeader was consuming second-hand). It is the
-// tenant, and a token that names no owner is attributable to nobody.
 type claims struct {
 	jwt.RegisteredClaims
+	// Owner is the org the token acts for — IAM's tenant claim, which every layer
+	// that scopes data reads (the gateway sets X-Org-Id from it, which is what
+	// TrustedProxyHeader consumes second-hand).
 	Owner string `json:"owner"`
+	// TokenType distinguishes an access token from an id_token.
+	TokenType string `json:"tokenType"`
+	// Orgs is the caller's membership set, home org first — present on every token
+	// minted for a user, absent on a machine token (IAM store.MemberOrgRefs always
+	// emits the user's home org; client_credentials passes nil, so the claim is
+	// omitted entirely). It is what makes `owner` checkable rather than trusted.
+	Orgs []orgRef `json:"orgs"`
 }
 
-// IAMIdentity resolves the tenant from a bearer token issued by the brand that
-// owns the request's Host.
+// orgRef is one membership in the shape IAM emits it (schema.OrgRef).
+type orgRef struct {
+	Org string `json:"org"`
+}
+
+// member reports whether the caller's membership set names org.
 //
-// It refuses on every uncertainty: no token, a token from another brand's issuer,
-// a signature no published key verifies, a missing or passed expiry, a keyset that
-// cannot be reached, or a token naming no owner. A compliance control that
-// authenticates when it is unsure is worse than one that will not serve, because
-// it answers with another tenant's records and looks healthy doing it.
-func IAMIdentity(jwks Keysets) Identity {
+// A token with no membership set is a machine token: it authenticated as an
+// application rather than as a person, so the org it acts for is the org of that
+// application, and which application it is has already been pinned by the
+// audience. There is nothing further to check and nothing to fall back to.
+func (c *claims) member(org string) bool {
+	if len(c.Orgs) == 0 {
+		return true
+	}
+	for _, o := range c.Orgs {
+		if strings.TrimSpace(o.Org) == org {
+			return true
+		}
+	}
+	return false
+}
+
+// IAMIdentity resolves the tenant from an access token this application obtained
+// from the issuer of the brand that owns the request's Host.
+//
+// audience is this AML application's IAM clientId — the value IAM stamps as `aud`.
+// It is required, and an instance without it authenticates nobody: with no audience
+// there is no pin, and every token that issuer ever minted for any application
+// would be a credential here. One deployment serves one brand's institutions and
+// therefore has one application, so this is one value.
+//
+// It refuses on every uncertainty: no token, a Host no brand claims, a token from
+// another brand's issuer, a token for another application, an id_token, a signature
+// no published key verifies, a missing or passed expiry, a keyset that cannot be
+// reached, a token naming no owner, or an owner the caller is not a member of. A
+// compliance control that authenticates when it is unsure is worse than one that
+// will not serve, because it answers with another tenant's records and looks
+// healthy doing it.
+func IAMIdentity(jwks Keysets, audience string) Identity {
 	return func(r *http.Request) (string, error) {
 		if jwks == nil {
 			return "", errors.New("no keyset source configured, so no token can be verified")
 		}
+		if strings.TrimSpace(audience) == "" {
+			return "", errors.New("no audience configured, so any application's token would be a credential here")
+		}
 
 		// The Host, not a forwarding header: an intermediary's claim about the
 		// original host is a claim, and this decides which issuer is trusted.
-		id := brand.ForHost(r.Host)
-		issuer := brand.IssuerFor(id)
+		//
+		// A Host no brand claims refuses. Requests reach this process on a pod IP, an
+		// in-cluster service name, localhost through a port-forward, and vhosts that
+		// were misrouted; on each of those the caller named no brand, so no issuer's
+		// signature means anything. Defaulting here is what made one brand's issuer
+		// the authenticator of record for all of them.
+		id, ok := brand.ForHostOK(r.Host)
+		if !ok {
+			return "", fmt.Errorf("host %q names no brand, so nothing is trusted to have signed this", r.Host)
+		}
+		b, _ := brand.For(id)
 		// An empty expectation does not loosen the issuer check, it removes it:
 		// golang-jwt validates `iss` only when one is stated (validator.go, `if
 		// v.expectedIss != ""`). A brand row without an issuer would therefore admit
 		// every brand's tokens on that host, so it admits none.
-		if issuer == "" {
+		if b.IAMIssuer == "" {
 			return "", fmt.Errorf("brand %s states no issuer, so nothing is trusted to have signed this", id)
 		}
 
@@ -122,55 +158,47 @@ func IAMIdentity(jwks Keysets) Identity {
 		if err != nil {
 			return "", err
 		}
-		set, err := jwks(issuer)
+		// Shape before keys. Resolving a keyset can cost a request to the issuer, and
+		// an unauthenticated caller must not be able to spend one by putting a word in
+		// the Authorization header.
+		if err := compact(raw); err != nil {
+			return "", err
+		}
+
+		set, err := jwks(b.IAMIssuer)
 		if err != nil {
-			return "", fmt.Errorf("keys for issuer %s: %w", issuer, err)
+			return "", fmt.Errorf("keys for issuer %s: %w", b.IAMIssuer, err)
 		}
 		if len(set) == 0 {
-			return "", fmt.Errorf("issuer %s published no signing key", issuer)
+			return "", fmt.Errorf("issuer %s published no signing key", b.IAMIssuer)
 		}
 
 		var c claims
 		if _, err := jwt.ParseWithClaims(raw, &c, set.verify,
 			jwt.WithValidMethods(methods),
-			jwt.WithIssuer(issuer),
+			jwt.WithIssuer(b.IAMIssuer),
+			jwt.WithAudience(audience),
 			jwt.WithExpirationRequired(),
 			jwt.WithLeeway(skew),
 		); err != nil {
 			return "", fmt.Errorf("token on a %s host: %w", id, err)
 		}
 
+		if c.TokenType != accessToken {
+			return "", fmt.Errorf("token is a %q and not an %s", c.TokenType, accessToken)
+		}
 		owner := strings.TrimSpace(c.Owner)
 		if owner == "" {
 			return "", errors.New("token names no owner, so it acts for no tenant")
 		}
-		return owner, nil
-	}
-}
-
-// verify supplies the keys a token's signature may be checked against: the one its
-// `kid` names, and nothing else. A token that names a published key must be signed
-// by that key — pointing at one key while being signed by another is a key
-// substitution, not a rotation, and there is no reading of it that is legitimate.
-//
-// A token naming no `kid`, or naming one this issuer does not publish, is checked
-// against every key the issuer does publish. That is what keeps a token minted
-// either side of a rotation working: the label may be stale, but the signature is
-// the evidence and it still has to hold under a key the issuer stands behind.
-func (k Keyset) verify(t *jwt.Token) (any, error) {
-	if kid, _ := t.Header["kid"].(string); kid != "" {
-		if key, ok := k[kid]; ok {
-			return jwt.VerificationKeySet{Keys: []jwt.VerificationKey{key}}, nil
+		if !c.member(owner) {
+			// The application minted a token naming an org its caller is not in, which
+			// is what a shared or org-choice application does. Serving it would make
+			// every one of that application's users one tenant: the app owner's.
+			return "", fmt.Errorf("token acts for org %q, which the caller is not a member of", owner)
 		}
+		return qualify(id, owner)
 	}
-	out := make([]jwt.VerificationKey, 0, len(k))
-	for _, key := range k {
-		out = append(out, key)
-	}
-	if len(out) == 0 {
-		return nil, errors.New("no signing key to verify against")
-	}
-	return jwt.VerificationKeySet{Keys: out}, nil
 }
 
 // bearer returns the token from the Authorization header. Bearer is the only
@@ -188,133 +216,45 @@ func bearer(r *http.Request) (string, error) {
 	return "", errors.New("no bearer token presented")
 }
 
-// JWKS resolves each issuer's keyset from its own /v1/iam/.well-known/jwks,
-// holding it for ttl.
+// maxToken bounds the credential this will look at at all. An IAM access token is
+// a kilobyte or two, and an ML-DSA-65 signature alone is 3309 bytes, so this is
+// generous for the post-quantum shape while refusing a megabyte of base64 before
+// anything tries to decode it.
+const maxToken = 16 << 10
+
+// compact reports whether a bearer is a JWS at all: three non-empty base64url
+// segments whose first decodes to a JSON header naming an algorithm.
 //
-// Keys are served past ttl while the issuer is unreachable, because a momentary
-// blip must not refuse every caller at once. That grace is bounded by stale: past
-// it the keys are no longer something this instance can confirm, and it refuses
-// rather than authenticating against a set it can no longer see. The fleet edge
-// holds a stale set indefinitely for availability; a record plane would rather
-// stop answering than admit a caller on evidence it cannot check.
-func JWKS(ttl, stale time.Duration) Keysets {
-	if ttl <= 0 {
-		ttl = 15 * time.Minute
+// It is a filter, not a check. Which algorithms are acceptable, which key signs
+// them and what the claims say are all decided once, by the parse. The only reason
+// this exists is that reaching the parse can cost a request to the issuer, and an
+// unauthenticated caller should not be able to spend one: "Bearer x" is refused
+// here, for free.
+func compact(raw string) error {
+	if len(raw) > maxToken {
+		return fmt.Errorf("bearer is %d bytes, which is not a token", len(raw))
 	}
-	if stale < ttl {
-		stale = ttl
+	parts := strings.Split(raw, ".")
+	if len(parts) != 3 {
+		return errors.New("bearer is not a compact JWS")
 	}
-	c := &cache{
-		ttl:    ttl,
-		stale:  stale,
-		sets:   map[string]issuerKeys{},
-		client: &http.Client{Timeout: 10 * time.Second},
-		now:    time.Now,
+	for _, p := range parts {
+		if p == "" {
+			return errors.New("bearer has an empty segment")
+		}
 	}
-	return c.get
-}
-
-type issuerKeys struct {
-	keys      Keyset
-	fetchedAt time.Time
-}
-
-type cache struct {
-	mu     sync.Mutex
-	sets   map[string]issuerKeys
-	ttl    time.Duration
-	stale  time.Duration
-	client *http.Client
-	// now is the clock, so the staleness bound is testable without waiting for it.
-	now func() time.Time
-}
-
-func (c *cache) get(issuer string) (Keyset, error) {
-	// One issuer's fetch is held under the same lock as the map: a burst of
-	// requests to a cold cache should ask the issuer once, not once each.
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	have, cached := c.sets[issuer]
-	age := c.now().Sub(have.fetchedAt)
-	if cached && age < c.ttl {
-		return have.keys, nil
-	}
-
-	keys, err := c.fetch(issuer)
+	head, err := base64.RawURLEncoding.DecodeString(parts[0])
 	if err != nil {
-		if cached && age < c.stale {
-			return have.keys, nil
-		}
-		return nil, err
+		return errors.New("bearer header is not base64url")
 	}
-	c.sets[issuer] = issuerKeys{keys: keys, fetchedAt: c.now()}
-	return keys, nil
-}
-
-func (c *cache) fetch(issuer string) (Keyset, error) {
-	resp, err := c.client.Get(strings.TrimSuffix(issuer, "/") + jwksPath)
-	if err != nil {
-		return nil, fmt.Errorf("fetch: %w", err)
+	var h struct {
+		Alg string `json:"alg"`
 	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("status %d", resp.StatusCode)
+	if err := json.Unmarshal(head, &h); err != nil {
+		return errors.New("bearer header is not JSON")
 	}
-	// Bounded read: an issuer's key set is a few kilobytes, and an unbounded read
-	// makes the size of the answer the caller's problem.
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-	if err != nil {
-		return nil, fmt.Errorf("read: %w", err)
+	if h.Alg == "" {
+		return errors.New("bearer header names no algorithm")
 	}
-	return decodeKeys(body)
-}
-
-// decodeKeys reads the RSA signing keys out of a JWKS document. A key of another
-// type, or one published for encryption rather than signing, or one whose modulus
-// is too short to be evidence, is left out — so it cannot verify anything — while
-// the rest of the set still loads.
-func decodeKeys(body []byte) (Keyset, error) {
-	var doc struct {
-		Keys []struct {
-			Kty string `json:"kty"`
-			Kid string `json:"kid"`
-			Use string `json:"use"`
-			N   string `json:"n"`
-			E   string `json:"e"`
-		} `json:"keys"`
-	}
-	if err := json.Unmarshal(body, &doc); err != nil {
-		return nil, fmt.Errorf("parse: %w", err)
-	}
-	out := Keyset{}
-	for _, k := range doc.Keys {
-		if k.Kty != "RSA" || (k.Use != "sig" && k.Use != "") {
-			continue
-		}
-		n, err := unpad(k.N)
-		if err != nil {
-			continue
-		}
-		e, err := unpad(k.E)
-		if err != nil || len(e) == 0 || len(e) > 8 {
-			continue
-		}
-		modulus := new(big.Int).SetBytes(n)
-		if modulus.BitLen() < minModulus {
-			continue
-		}
-		out[k.Kid] = &rsa.PublicKey{N: modulus, E: int(new(big.Int).SetBytes(e).Int64())}
-	}
-	if len(out) == 0 {
-		return nil, errors.New("no usable signing key")
-	}
-	return out, nil
-}
-
-// unpad decodes base64url with or without padding: RFC 7517 omits it, and
-// implementations that send it are common enough that refusing them would refuse
-// a working issuer.
-func unpad(s string) ([]byte, error) {
-	return base64.RawURLEncoding.DecodeString(strings.TrimRight(s, "="))
+	return nil
 }

@@ -13,9 +13,11 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/hanzoai/base"
@@ -45,6 +47,19 @@ var version = "(dev)"
 // failures have gone unnoticed.
 const listStale = 48 * time.Hour
 
+// How long an issuer's signing keys are held.
+//
+// keysTTL is the refresh, and it is what bounds how long a rotation takes to be
+// honoured: a token signed by a key published after the last fetch verifies against
+// nothing until the next one. IAM serves its JWKS with max-age=60, so minutes is
+// the right order. keysStale is the outage grace — keys already confirmed are
+// served past the refresh while the issuer is unreachable, and past this bound the
+// engine refuses rather than authenticating against a set it can no longer see.
+const (
+	keysTTL   = 5 * time.Minute
+	keysStale = time.Hour
+)
+
 func main() {
 	app := base.New()
 
@@ -52,6 +67,20 @@ func main() {
 	if org == "" {
 		org = "default"
 	}
+
+	// The IAM application this deployment IS. AML_CLIENT_ID is its clientId, which
+	// is the value IAM stamps as `aud` on every token it mints for it, and pinning
+	// it is what makes a token FOR this engine different from any other first-party
+	// token on the same issuer.
+	//
+	// There is no default and no unpinned mode: an instance without it authenticates
+	// nobody, and it refuses to start rather than serving while it accepts a token
+	// minted for a marketing site. The application must be dedicated to one
+	// financial institution — not shared, no org choice — because IAM stamps the
+	// APP's org as the tenant claim, and a shared application would make all of its
+	// users one tenant. IAMIdentity checks that constraint from the token side too,
+	// against the caller's own membership set.
+	client := strings.TrimSpace(os.Getenv("AML_CLIENT_ID"))
 
 	// Business-day and business-hour rules are answered in a stated zone. UTC is the
 	// default rather than the host's zone, so the same transaction does not evaluate
@@ -101,6 +130,14 @@ func main() {
 
 	app.OnServe().Bind(&hook.Handler[*core.ServeEvent]{
 		Func: func(se *core.ServeEvent) error {
+			// Refuse to serve unauthenticated. This is checked here, at the start,
+			// rather than one request at a time: an instance that cannot identify a
+			// caller has nothing it can safely answer, and an operator finds a process
+			// that will not start far sooner than one that 401s everything.
+			if client == "" {
+				return errors.New("refusing to start, AML_CLIENT_ID is not set: it is this deployment's IAM application clientId, and without it no token's audience can be checked")
+			}
+
 			// The transaction collection has to exist before any rule reads a
 			// window. Without it every aggregate rule reaches no verdict, which is
 			// how twelve of twenty rules came to fault on every transaction.
@@ -129,11 +166,19 @@ func main() {
 			}
 
 			handler := &api.Handler{
-				// The gateway authenticates the caller and writes the verified owner
-				// claim to this header, and this service is reachable only through it.
-				// That is an assumption about the deployment, so it is named here
-				// rather than left implicit in a handler.
-				Identity:  api.TrustedProxyHeader("X-Org-Id"),
+				// The token is verified here, in this process, against the JWKS of the
+				// brand whose Host the request arrived on.
+				//
+				// Not the gateway's header. The header is sound only where an
+				// authenticating proxy is the sole route in, and in a cluster this
+				// service is also reachable at its Service name and its pod IP by
+				// anything that can open a socket — at which point the header is an
+				// unauthenticated assertion and any caller names any tenant. The record
+				// plane of a compliance control is the wrong place to hold that
+				// assumption: it is one hop away from another institution's records.
+				// TrustedProxyHeader remains for a deployment that can prove the
+				// assumption, and it qualifies its tenant the same way.
+				Identity:  api.IAMIdentity(api.JWKS(keysTTL, keysStale), client),
 				Engine:    eng,
 				Cases:     cases.NewStore(),
 				Alerts:    api.NewAlertStore(),
