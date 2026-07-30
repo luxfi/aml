@@ -14,7 +14,8 @@ Real-time AML/CFT transaction monitoring engine. Pure Go, single binary, embedde
 - **Scoring**: Weight-of-evidence (pure Go math)
 - **Sanctions**: Jaro-Winkler + token-based fuzzy name matching
 - **HTTP**: Hanzo Base router (net/http)
-- **Auth**: X-Org-Id header (set by gateway from JWT owner claim)
+- **Auth**: IAM access token — the `owner` claim of a bearer JWT the request's own brand issued (`api.IAMIdentity`); or, behind an authenticating gateway, the header it writes from that same claim (`api.TrustedProxyHeader`)
+- **White-label**: brand per request Host (`pkg/brand`, mirroring HIP-0111) — one `amld` serves lux.network, hanzo.ai, zoo.ngo, pars.network
 
 ## Build & Run
 
@@ -92,6 +93,12 @@ pkg/
   api/routes.go            -- /v1/aml/* HTTP routes + SanctionsStore on Base
   api/records.go           -- The one place retention, token and replay are joined
   api/anomaly.go           -- Model state for governance + candidate scoring
+  api/iam.go               -- Identity from an IAM token: brand of the Host pins the
+                              issuer, `owner` claim is the tenant, JWKS with a
+                              bounded cache
+  api/brand.go             -- GET /v1/aml/config: the brand identity of this Host
+  brand/brand.go           -- Brand id and request Host -> issuer + domains
+                              (HIP-0111; the same registry as hanzoai/cloud brand)
 ```
 
 ## Behavioural detection
@@ -171,11 +178,32 @@ scores, learns and reports what it *would* have alerted on, changing nothing.
 | POST | /v1/aml/relationships/search | Art. 78 five-year lookback by party |
 | POST | /v1/aml/sanctions/search | Search sanctions lists by name |
 | GET | /v1/aml/health | Health check, 503 when records cannot be kept |
+| GET | /v1/aml/config | Brand identity of the request's Host: brand, display name, issuer, domain |
 
-Every route resolves its tenant through `Handler.Identity`. The deployment wires
-`api.TrustedProxyHeader("X-Org-Id")`, which is sound only because the gateway
-authenticates the caller, sets the header from the verified JWT owner claim,
+Every route resolves its tenant through `Handler.Identity`, and `/v1/aml/config`
+is the one exception: it names the issuer a caller needs in order to obtain a
+token, so requiring one would be a lock whose key is behind it.
+
+Two identities, one seam. `api.IAMIdentity(api.JWKS(ttl, stale))` takes the tenant
+from the `owner` claim of a bearer token, verified against the JWKS of the issuer
+belonging to the request's own Host — so a Lux token does not authenticate on a
+Zoo host even where one in-cluster IAM publishes both brands' signing certificates.
+`api.TrustedProxyHeader("X-Org-Id")` takes it from the header a gateway writes from
+that same claim, which is sound only where the gateway authenticates the caller,
 strips any client-supplied copy, and is the only route to this service.
+
+## White-label
+
+`pkg/brand` maps a brand id, and a request Host, to that brand's public identity:
+its OIDC issuer and the domains it serves on. It is a copy of the fleet's canonical
+registry (HIP-0111, `hanzoai/cloud` `brand/brand.go`) kept as a leaf, so one
+`amld` answers as Lux on lux.network, as Zoo on zoo.ngo and zoo.cloud, as Hanzo on
+hanzo.ai, and as Pars on pars.network — brand, console identity and trusted issuer
+all from the Host. An unrecognised Host falls back to Hanzo.
+
+Org names are unique within an issuer, not across issuers. One deployment serving
+more than one brand from one record plane therefore needs its store scoped by
+brand as well as by org; a deployment per brand needs nothing further.
 
 ## Records, tokenisation, and the sandbox
 

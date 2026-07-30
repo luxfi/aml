@@ -283,6 +283,15 @@ func TestIAMIdentityRefusesEveryDoubt(t *testing.T) {
 			r.Header.Set("Authorization", "Basic "+valid)
 			return r
 		}(),
+		// Digest is exactly as long as Bearer, so this row fails only if the scheme
+		// is actually compared. With "Basic" alone a verifier that skipped the
+		// compare would still refuse — it would read one character into the token
+		// and reject a mangled one — and the test would pass for the wrong reason.
+		func() *http.Request {
+			r := bearing("api.hanzo.ai", "")
+			r.Header.Set("Authorization", "Digest "+valid)
+			return r
+		}(),
 	} {
 		if org, err := id(r); err == nil {
 			t.Errorf("a token outside the bearer header authenticated as %q", org)
