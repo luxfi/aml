@@ -703,13 +703,18 @@ func TestEveryRouteIsServed(t *testing.T) {
 		{http.MethodPost, "/v1/aml/relationships/r-1/close", http.StatusUnauthorized},
 		{http.MethodPost, "/v1/aml/relationships/search", http.StatusUnauthorized},
 		{http.MethodGet, "/v1/aml/anomaly", http.StatusUnauthorized},
+		{http.MethodGet, "/v1/aml/sanctions/sources", http.StatusUnauthorized},
+		{http.MethodGet, "/v1/aml/catalog", http.StatusUnauthorized},
 		{http.MethodPost, "/v1/aml/anomaly/test", http.StatusUnauthorized},
-		// The rule catalog is the deployment's, not a tenant's, and the brand config
-		// is what a caller reads BEFORE it has a token. Both answer unauthenticated,
-		// which is also why they are the two rows that prove a 401 above means the
-		// tenancy check and not a route that answers 401 whatever happens.
-		{http.MethodGet, "/v1/aml/rules", http.StatusOK},
+		{http.MethodPost, "/v1/aml/sanctions/search", http.StatusUnauthorized},
+		{http.MethodGet, "/v1/aml/rules", http.StatusUnauthorized},
+		// Two routes answer an unauthenticated caller, and only these two. The brand
+		// config is what a caller reads BEFORE it has a token — the issuer it names is
+		// where the token comes from — and health is what a probe reads on a Host that
+		// names no brand at all. They are also what proves a 401 above is the tenancy
+		// check and not a route that answers 401 whatever happens.
 		{http.MethodGet, "/v1/aml/config", http.StatusOK},
+		{http.MethodGet, "/v1/aml/health", http.StatusServiceUnavailable},
 	} {
 		req := httptest.NewRequest(tc.method, tc.path, strings.NewReader("{}"))
 		req.Host = "api.hanzo.ai"

@@ -183,13 +183,18 @@ scores, learns and reports what it *would* have alerted on, changing nothing.
 | POST | /v1/aml/relationships/{id}/close | End one, starting the retention clocks |
 | POST | /v1/aml/relationships/search | Art. 78 five-year lookback by party |
 | POST | /v1/aml/sanctions/search | Search sanctions lists by name |
+| GET | /v1/aml/sanctions/sources | Per-list readiness: count, date, fitness |
+| GET | /v1/aml/catalog | Coverage: installed rules, their citations, and the stated gaps |
 | GET | /v1/aml/health | Health check, 503 when records cannot be kept |
 | GET | /v1/aml/config | Brand identity of the request's Host: brand, display name, issuer, domain |
 
-Every route resolves its tenant through `Handler.Identity`. `/v1/aml/config` and
-`/v1/aml/rules` are the exceptions: the first names the issuer a caller needs in
-order to obtain a token, so requiring one would be a lock whose key is behind it,
-and the second is the deployment's rule catalog rather than a tenant's data.
+Every route resolves its tenant through `Handler.Identity`. Exactly two do not:
+`/v1/aml/config`, which names the issuer a caller needs in order to obtain a token
+— requiring one would be a lock whose key is behind it — and `/v1/aml/health`,
+which a probe reads on a Host that names no brand. The rule list and sanctions
+search require a tenant too: the first is the map of what this institution's
+monitoring looks for, and the second runs a fuzzy match over every designation in
+the set, which is not work an unauthenticated caller gets to spend.
 
 Two identities, one seam, one tenant key.
 `api.IAMIdentity(api.JWKS(ttl, stale), clientId)` is what `amld` runs: it verifies
