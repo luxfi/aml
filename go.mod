@@ -4,6 +4,7 @@ go 1.26.4
 
 require (
 	github.com/expr-lang/expr v1.17.6
+	github.com/golang-jwt/jwt/v5 v5.3.1
 	github.com/google/uuid v1.6.0
 	github.com/hanzoai/base v1.5.8
 	github.com/hanzoai/dbx v1.16.0
@@ -32,7 +33,6 @@ require (
 	github.com/go-ini/ini v1.67.0 // indirect
 	github.com/go-jose/go-jose/v4 v4.1.4 // indirect
 	github.com/go-ozzo/ozzo-validation/v4 v4.3.0 // indirect
-	github.com/golang-jwt/jwt/v5 v5.3.1 // indirect
 	github.com/google/go-cmp v0.7.0 // indirect
 	github.com/gorilla/rpc v1.2.1 // indirect
 	github.com/grandcat/zeroconf v1.0.0 // indirect
