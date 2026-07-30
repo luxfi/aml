@@ -21,6 +21,13 @@ package api
 // This is stricter than the fleet edge (hanzoai/cloud auth_identity.go), which
 // trusts the union of brand issuers because one binary serves every brand's apps;
 // an AML record plane answers for one brand at a time, so it pins.
+//
+// What the pin does not settle: an org name is unique within an issuer, not across
+// issuers, and the tenant returned here is the org name. A deployment serving more
+// than one brand out of ONE record plane therefore has to scope that plane by
+// brand as well as by org — otherwise two brands' orgs of the same name are one
+// tenant. A deployment per brand needs nothing further, and that is the shape this
+// runs in today.
 
 import (
 	"crypto/rsa"
