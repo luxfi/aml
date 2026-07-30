@@ -452,7 +452,7 @@ func (h *Handler) caseOf(e *core.RequestEvent) (*types.Case, string, error) {
 
 func (h *Handler) addCaseEvent() func(e *core.RequestEvent) error {
 	return func(e *core.RequestEvent) error {
-		c, _, err := h.caseOf(e)
+		c, tenant, err := h.caseOf(e)
 		switch {
 		case errors.Is(err, errNoCase):
 			return fail(e, http.StatusNotFound, "no such case")
@@ -464,7 +464,7 @@ func (h *Handler) addCaseEvent() func(e *core.RequestEvent) error {
 		if err := json.NewDecoder(e.Request.Body).Decode(&evt); err != nil {
 			return fail(e, http.StatusBadRequest, "invalid request body")
 		}
-		if err := h.Cases.AddEvent(c.ID, evt); err != nil {
+		if err := h.Cases.AddEvent(tenant, c.ID, evt); err != nil {
 			return fail(e, http.StatusNotFound, err.Error())
 		}
 		return e.JSON(http.StatusCreated, map[string]string{"status": "ok"})
@@ -519,7 +519,7 @@ func (h *Handler) resolveCase() func(e *core.RequestEvent) error {
 			return unavailable(e, "retain assessment", err)
 		}
 
-		if err := h.Cases.Resolve(c.ID, in.Resolution, in.By, assessment); err != nil {
+		if err := h.Cases.Resolve(orgID, c.ID, in.Resolution, in.By, assessment); err != nil {
 			return fail(e, http.StatusBadRequest, err.Error())
 		}
 		return e.JSON(http.StatusOK, map[string]string{

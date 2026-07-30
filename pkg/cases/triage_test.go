@@ -96,7 +96,7 @@ func TestCheckEscalation_NotBreached(t *testing.T) {
 func TestCheckEscalation_AlreadyClosed(t *testing.T) {
 	s := NewStore()
 	c := s.Create("org1", types.SeverityCritical, nil, nil)
-	_ = s.Resolve(c.ID, "cleared", "analyst", "assessment-1")
+	_ = s.Resolve(c.OrgID, c.ID, "cleared", "analyst", "assessment-1")
 
 	config := DefaultTriageConfig()
 	escalated := s.CheckEscalation(c, config)
@@ -167,7 +167,7 @@ func TestNoTimerPathCanCloseACase(t *testing.T) {
 	}
 
 	// And the closure path still refuses without one.
-	if err := s.Resolve(c.ID, "cleared", "analyst-1", ""); err == nil {
+	if err := s.Resolve(c.OrgID, c.ID, "cleared", "analyst-1", ""); err == nil {
 		t.Fatal("a case was closed with no retained assessment")
 	}
 }

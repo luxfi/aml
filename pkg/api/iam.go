@@ -28,6 +28,17 @@ package api
 //     from the same issuer authenticates here — one minted for a marketing site,
 //     for another tenant's app, for anything at all on hanzo.id. RFC 9068 §4 makes
 //     this the resource server's own check, and nobody else can make it.
+//
+//     What the aud pin does NOT establish is that the token came through this
+//     app's own login gate. IAM's RFC 8693 token-exchange path
+//     (internal/oidc/token_exchange.go) takes aud from the caller's requested
+//     resource and can stamp a chosen owner, so a token bearing this app's aud
+//     need not have transited login.go. That path is not attacker-reachable — it
+//     is gated by IAM_KEY_MINT_ALLOWED_APPS, an exact-clientId allowlist that
+//     fails closed when empty and additionally requires reserved-org ownership —
+//     so the pin's guarantee rests on that env value being audited for the brand
+//     serving AML. This is a deploy-time trust delegation to IAM, named here so it
+//     is a stated dependency rather than an implied one.
 //   - It is an access token. IAM stamps tokenType, so an id_token — issued to a
 //     browser for the browser's own consumption, not a credential for an API, and
 //     carrying the same iss and the same aud — is refusable, and is refused.

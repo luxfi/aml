@@ -8,6 +8,12 @@
 // tokenisation vault. Writing a bare org into one of these fields puts two brands'
 // institutions of the same name into one tenant — one set of records, and one
 // vault, which decrypts across the two.
+//
+// The one exception is Rule.OrgID. The rule library is the deployment's catalog,
+// seeded at startup from AML_DEFAULT_ORG before any request — so there is no Host,
+// hence no brand, to qualify it with. It is the catalog's configured owner, never
+// a request tenant key, and nothing scopes a store read on it. It is documented on
+// the field so the distinction is stated where an auditor reads it, not inferred.
 package types
 
 import (
@@ -168,7 +174,11 @@ type Entity struct {
 // a coverage claim checkable: a reviewer reads the citation, reads the
 // expression, and decides whether the second implements the first.
 type Rule struct {
-	ID                 string              `json:"id"`
+	ID string `json:"id"`
+	// OrgID is the catalog's configured owner (the deployment's AML_DEFAULT_ORG),
+	// NOT a request tenant key — see the package doc's one exception. The library
+	// is seeded at startup with no Host in scope, so it cannot be brand-qualified,
+	// and nothing scopes a store read on it.
 	OrgID              string              `json:"org_id"`
 	Name               string              `json:"name"`
 	Description        string              `json:"description"`
