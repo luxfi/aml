@@ -53,11 +53,14 @@ func mint(t *testing.T, signer *rsa.PrivateKey, c jwt.MapClaims) string {
 }
 
 // published is the keyset every brand issuer publishes in these tests: ONE key,
-// shared. That is what the in-cluster IAM does — it serves every brand's signing
-// certificate from one JWKS — and it is the sharp version of the white-label
-// claim: with the same key behind every issuer, the only thing that can refuse a
-// Lux token on a Zoo host is the `iss` pin itself, not a signature that happens
-// not to verify.
+// shared. That is what the live IAM does — every brand's issuer serves the same
+// set, and zoolabs.id's /v1/iam/.well-known/jwks carries cert-lux, cert-hanzo,
+// cert-pars and cert-zoo together — so a Lux token's signature really does verify
+// against the Zoo issuer's keys.
+//
+// It is therefore the sharp version of the white-label claim: with the same key
+// behind every issuer, the only thing that can refuse a Lux token on a Zoo host is
+// the `iss` pin itself, and not a signature that happens not to verify.
 func published(issuer string) (Keyset, error) {
 	return Keyset{"iam": &key().PublicKey}, nil
 }
