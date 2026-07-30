@@ -530,14 +530,30 @@ func (h *Handler) resolveCase() func(e *core.RequestEvent) error {
 	}
 }
 
+// listRules is the installed detection catalog. It is the deployment's and not a
+// tenant's — every tenant is screened by the same library — but it still requires
+// one: a rule set states what this institution's monitoring does and does not look
+// for, which is exactly the map somebody structuring a payment around it would want.
 func (h *Handler) listRules() func(e *core.RequestEvent) error {
 	return func(e *core.RequestEvent) error {
+		if _, err := h.tenant(e); err != nil {
+			return refuse(e, err)
+		}
 		return e.JSON(http.StatusOK, h.Engine.Rules())
 	}
 }
 
+// searchSanctions screens a name against the published lists. A designation is
+// public and the answer does not depend on who is asking, so this reads no tenant
+// data — but it requires a tenant all the same, because a fuzzy match runs over
+// every designation in the set and an unauthenticated caller must not be able to
+// spend that. The name searched is also somebody's name.
 func (h *Handler) searchSanctions() func(e *core.RequestEvent) error {
 	return func(e *core.RequestEvent) error {
+		if _, err := h.tenant(e); err != nil {
+			return refuse(e, err)
+		}
+
 		var req struct {
 			Name string `json:"name"`
 			DOB  string `json:"dob"`
