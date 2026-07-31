@@ -16,8 +16,12 @@ RUN npm run build
 
 # ghcr.io/hanzoai/static serves it. -spa sends unknown paths to index.html, which
 # is what makes /cases/… and /callback resolve on a hard refresh; the security
-# headers and the CSP come from the server, and the deployment's SPA_* env is
-# templated into /config.json before the first request is answered.
+# headers and the CSP come from the server.
+#
+# Nothing is templated into the bundle at startup and no SPA_* env is set, so the
+# served root is never written and the container runs read-only and unprivileged.
+# The console derives its API from the host it is served on and reads its brand,
+# issuer and clientId from that API — so this image is every brand's, unchanged.
 FROM ghcr.io/hanzoai/static:v0.5.1
 COPY --from=build /ui/dist /public
 EXPOSE 3000

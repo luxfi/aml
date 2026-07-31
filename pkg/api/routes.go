@@ -66,6 +66,11 @@ type Handler struct {
 	// Anomaly scores whether a transaction is unusual for the entity, alongside
 	// the rules rather than instead of them. Nil runs on rules alone.
 	Anomaly *anomaly.Store
+	// ClientID is this deployment's IAM application — the audience every token
+	// is pinned to. It is served by /v1/aml/config so the console reads its own
+	// identity from the engine that enforces it.
+	ClientID string
+
 	// Limit is the reporting limit a transaction is judged against, which is
 	// what makes a payment sitting just under it visible as structuring rather
 	// than as an ordinary payment. Zero falls back to reportLimit.
@@ -685,6 +690,14 @@ func (h *Handler) testRule() func(e *core.RequestEvent) error {
 		if err != nil {
 			return refuse(e, err)
 		}
+
+		// One replay at a time per tenant. Rejecting is the honest answer: the
+		// caller asked for work that is already running, and queueing it would
+		// hold a connection open while the engine falls behind on ingest.
+		if !startReplay(orgID) {
+			return fail(e, http.StatusTooManyRequests, "a replay is already running for this tenant")
+		}
+		defer endReplay(orgID)
 
 		var req struct {
 			DSL       string         `json:"dsl"`

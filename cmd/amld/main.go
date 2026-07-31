@@ -203,6 +203,7 @@ func main() {
 				// assumption, and it qualifies its tenant the same way.
 				Identity:  api.IAMIdentity(api.JWKS(keysTTL, keysStale), client),
 				Engine:    eng,
+				ClientID:  client,
 				Cases:     cases.NewBase(app),
 				Alerts:    api.NewAlertStoreBase(app),
 				Screen:    lists,

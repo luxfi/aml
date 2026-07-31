@@ -9,9 +9,10 @@
 import { useEffect, useState } from 'react'
 import { Link, Route, Router, Switch, useLocation } from 'wouter'
 
+import { configureIam, getSession, getUser, handleCallback, logout, startLogin } from '@hanzo/iam/browser'
+import type { IAMUser } from '@hanzo/iam/browser'
+
 import * as api from './api'
-import * as auth from './auth'
-import { load as loadConfig } from './config'
 import { Card, Fail, Icon, Spinner } from './ui'
 
 import { Overview } from './pages/overview'
@@ -24,7 +25,7 @@ import { Relationships } from './pages/relationships'
 type Boot =
   | { at: 'loading' }
   | { at: 'failed'; error: unknown }
-  | { at: 'ready'; brand: api.Brand; session: auth.Session | null }
+  | { at: 'ready'; brand: api.Brand; signedIn: boolean }
 
 export function App() {
   const [boot, setBoot] = useState<Boot>({ at: 'loading' })
@@ -32,16 +33,24 @@ export function App() {
   useEffect(() => {
     void (async () => {
       try {
-        await loadConfig()
         const brand = await api.brand()
-        api.bind(brand.issuer)
+
+        // One session model for every Hanzo app. The issuer and the clientId
+        // both come from the API that enforces them, so this configures the
+        // SDK with what the engine will actually accept — nothing is stated
+        // twice and nothing can drift.
+        configureIam({
+          issuer: brand.issuer,
+          clientId: brand.client_id,
+          redirect: `${window.location.origin}/callback`,
+        })
 
         if (window.location.pathname === '/callback') {
-          const back = await auth.callback(brand.issuer, window.location.search)
+          const { redirect } = await handleCallback()
           // Replace, so the code never stays in history or in a shared URL.
-          window.history.replaceState(null, '', back)
+          window.history.replaceState(null, '', redirect || '/')
         }
-        setBoot({ at: 'ready', brand, session: auth.session() })
+        setBoot({ at: 'ready', brand, signedIn: getSession().authenticated })
       } catch (error) {
         setBoot({ at: 'failed', error })
       }
@@ -69,11 +78,11 @@ export function App() {
     )
   }
 
-  if (!boot.session) return <Gate brand={boot.brand} />
+  if (!boot.signedIn) return <Gate brand={boot.brand} />
 
   return (
     <Router>
-      <Shell brand={boot.brand} session={boot.session} />
+      <Shell brand={boot.brand} />
     </Router>
   )
 }
@@ -99,7 +108,7 @@ function Gate({ brand }: { brand: api.Brand }) {
             disabled={busy}
             onClick={() => {
               setBusy(true)
-              auth.login(brand.issuer).catch((e) => {
+              startLogin().catch((e: unknown) => {
                 setError(e)
                 setBusy(false)
               })
@@ -123,9 +132,12 @@ const screens = [
   { path: '/relationships', label: 'Relationships', icon: 'graph' as const, page: Relationships },
 ]
 
-function Shell({ brand, session }: { brand: api.Brand; session: auth.Session }) {
+function Shell({ brand }: { brand: api.Brand }) {
   const [path] = useLocation()
-  const who = auth.who(session)
+  const [who, setWho] = useState<IAMUser | null>(null)
+  useEffect(() => {
+    void getUser().then(setWho).catch(() => setWho(null))
+  }, [])
   const active = screens.find((s) => (s.path === '/' ? path === '/' : path.startsWith(s.path)))
 
   return (
@@ -148,12 +160,9 @@ function Shell({ brand, session }: { brand: api.Brand; session: auth.Session }) 
           ))}
         </div>
         <div className="rail-foot">
-          <div className="who org">{who.org || '—'}</div>
-          <div className="who">{who.name}</div>
-          <button className="btn ghost small" onClick={() => auth.logout(brand.issuer)}>
-            <Icon name="out" />
-            Sign out
-          </button>
+          <div className="who org">{who?.owner || '—'}</div>
+          <div className="who">{who?.name || who?.email || ''}</div>
+          <SignOut />
         </div>
       </nav>
 
@@ -204,5 +213,34 @@ function Health() {
       <i className="dot" aria-hidden="true" />
       {state ? (ok ? 'Healthy' : `Degraded: ${state.records}`) : 'Unreachable'}
     </span>
+  )
+}
+
+
+/**
+ * Sign out of this console, and say only what actually happened.
+ *
+ * The tokens are revoked as far as a public client can revoke them and this tab
+ * is cleared. The identity provider's own session is a separate thing and this
+ * cannot end it, so the button does not pretend otherwise — it says where to go
+ * and lets the reader decide.
+ */
+function SignOut() {
+  const [busy, setBusy] = useState(false)
+  return (
+    <button
+      className="btn ghost small"
+      disabled={busy}
+      onClick={() => {
+        setBusy(true)
+        // @hanzo/iam owns what signing out means — RP-initiated logout and the
+        // local clear, the same in every Hanzo app. When IAM's end-session
+        // behaviour improves, every app gets it without touching this line.
+        void logout().finally(() => window.location.assign('/'))
+      }}
+    >
+      {busy ? <Spinner /> : <Icon name="out" />}
+      Sign out
+    </button>
   )
 }
