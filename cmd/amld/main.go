@@ -164,6 +164,9 @@ func main() {
 			if err := cases.Ensure(app); err != nil {
 				return fmt.Errorf("refusing to start, the case plane cannot be created: %w", err)
 			}
+			if err := api.EnsureAlerts(app); err != nil {
+				return fmt.Errorf("refusing to start, alerts cannot be recorded: %w", err)
+			}
 
 			rates := reference.RatesFromEnv()
 
@@ -201,7 +204,7 @@ func main() {
 				Identity:  api.IAMIdentity(api.JWKS(keysTTL, keysStale), client),
 				Engine:    eng,
 				Cases:     cases.NewBase(app),
-				Alerts:    api.NewAlertStore(),
+				Alerts:    api.NewAlertStoreBase(app),
 				Screen:    lists,
 				Readiness: readiness,
 				History:   events,

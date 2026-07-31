@@ -501,6 +501,25 @@ archive (a `before` hook plus an `archives.files` entry), and the container imag
 Regenerate with `make notice`; verify by inspecting a built archive or the image
 filesystem, never by reading the config.
 
+## Durability
+
+Three planes, all Base-backed, all proven across an instance boundary. Nothing
+an obligation covers is held in memory: a rollout is not an event the
+record-keeping rules make an exception for.
+
+| Plane | Collections | Wired by | Restart test |
+|-------|-------------|----------|--------------|
+| Retained records | `aml_retention`, `aml_retention_parties` | `retention.Ensure` + `retention.NewBase` | `TestRetainedRecordsSurviveARestart` |
+| Cases + timelines | `aml_cases`, `aml_case_events` | `cases.Ensure` + `cases.NewBase` | `TestCasesSurviveARestart` |
+| Alerts | `aml_alerts` | `api.EnsureAlerts` + `api.NewAlertStoreBase` | `TestAlertsSurviveARestart` |
+
+Each test writes, copies the data directory as it stands, drops the instance,
+opens a second one over those bytes, and asks again — including that the tenant
+boundary still holds and that case numbering continues rather than restarting.
+
+The memory implementations remain, and are for tests. `cases.NewStore()` and
+`api.NewAlertStore()` are not what an instance serves from.
+
 ## Deployment
 
 - Single binary: `amld serve --http=0.0.0.0:8090`
