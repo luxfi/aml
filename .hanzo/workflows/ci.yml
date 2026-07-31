@@ -69,9 +69,8 @@ jobs:
         run: go test -race -count=1 ./...
 
       - name: Build the daemon
-        # No embedui tag here: the embedded operator surface needs ui/dist, which
-        # is built in the Dockerfile's UI stage, not committed. CI proves the Go
-        # code compiles and runs; the release build proves the embedded UI.
+        # The daemon is the API and nothing else — the console is a separate
+        # artifact with its own job below, so this needs no Node toolchain.
         run: |
           CGO_ENABLED=0 go build -trimpath -o /tmp/amld ./cmd/amld
           test -x /tmp/amld
@@ -108,3 +107,24 @@ jobs:
             exit 1
           fi
           echo "serves, and refuses an unauthenticated read"
+
+  console:
+    runs-on: [lux-build-linux-amd64]
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: ui/package-lock.json
+      - name: Install from the lockfile
+        # `npm ci` fails on drift rather than resolving fresh, so what CI builds
+        # is what the image builds.
+        run: npm --prefix ui ci
+      - name: Typecheck
+        run: npm --prefix ui exec tsc -- --noEmit
+      - name: Build the bundle
+        run: |
+          npm --prefix ui run build
+          test -f ui/dist/index.html

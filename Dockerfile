@@ -1,15 +1,6 @@
-# Stage 1: Build UI (Vite + React + @hanzo/gui)
-# pnpm must match pnpm-lock.yaml's lockfileVersion (9.0), and --frozen-lockfile
-# is mandatory so lockfile drift fails the build instead of resolving fresh.
-FROM node:22-alpine AS ui
-RUN corepack enable && corepack prepare pnpm@9.15.9 --activate
-WORKDIR /ui
-COPY ui/package.json ui/pnpm-lock.yaml ./
-RUN pnpm install --frozen-lockfile
-COPY ui/ .
-RUN pnpm build
-
-# Stage 2: Build Go binary with embedded UI
+# The API daemon. The console is a separate image built from ui/Dockerfile and
+# served on its own host — see ui/Dockerfile and LLM.md.
+#
 # Every dependency resolves through the default module proxy and is checked
 # against the default checksum database, so a tag that moves after the fact
 # cannot change what this image contains: proxy.golang.org serves the zip it
@@ -24,16 +15,15 @@ WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
-COPY --from=ui /ui/dist ./ui/dist/
-RUN CGO_ENABLED=0 go build -trimpath -tags embedui \
+RUN CGO_ENABLED=0 go build -trimpath \
       -ldflags="-s -w -X main.version=${VERSION}" -o /app/amld ./cmd/amld/
 
 # Third-party license and notice texts for the binary just built, derived from
 # its module graph while the module cache is still present.
-RUN CGO_ENABLED=0 go run ./internal/notice -tags embedui -pkg ./cmd/amld -name amld \
+RUN CGO_ENABLED=0 go run ./internal/notice -pkg ./cmd/amld -name amld \
       -o /app/THIRD-PARTY-NOTICES
 
-# Stage 3: Runtime
+# Runtime
 FROM alpine:3.21
 RUN apk add --no-cache ca-certificates tzdata
 COPY --from=build /app/amld /app/amld

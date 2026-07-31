@@ -21,7 +21,6 @@ import (
 	"time"
 
 	"github.com/hanzoai/base"
-	"github.com/hanzoai/base/apis"
 	"github.com/hanzoai/base/core"
 	"github.com/hanzoai/base/tools/hook"
 	"github.com/spf13/cobra"
@@ -37,7 +36,6 @@ import (
 	"github.com/luxfi/aml/pkg/screen"
 	"github.com/luxfi/aml/pkg/token"
 	"github.com/luxfi/aml/pkg/velocity"
-	uiaml "github.com/luxfi/aml/ui"
 )
 
 var version = "(dev)"
@@ -198,7 +196,6 @@ func main() {
 			// Destroy records whose retention period has run out, daily.
 			retention.Cron(app, records)
 
-			se.Router.GET("/_/aml/{path...}", apis.Static(uiaml.DistDirFS(), true))
 			return se.Next()
 		},
 	})
