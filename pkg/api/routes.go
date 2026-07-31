@@ -95,10 +95,17 @@ func (h *Handler) limit() float64 {
 // DefaultMaxAlerts is the default maximum number of transaction IDs in the alert store.
 const DefaultMaxAlerts = 100_000
 
-// AlertStore is a thread-safe in-memory alert store with LRU eviction.
-// RED-02: sync.RWMutex for data-race safety.
-// RED-08: LRU eviction prevents unbounded memory growth.
+// AlertStore holds the alerts a transaction raised.
+//
+// It keeps them on one of two shelves, the way the case plane does: a Base
+// collection when an app is set, which is what an instance serves from, and a
+// map when it is not, which is for tests. The map has an LRU bound because
+// memory does; the durable shelf does not evict, because an alert is evidence a
+// case cites and the retention plane is what decides when evidence goes.
 type AlertStore struct {
+	// app, when set, is the durable shelf — see NewAlertStoreBase.
+	app core.App
+
 	mu       sync.RWMutex
 	alerts   map[string][]types.Alert // keyed by tx_id
 	order    []string                 // insertion order for LRU eviction
@@ -121,8 +128,16 @@ func NewAlertStoreWithMax(maxItems int) *AlertStore {
 	}
 }
 
-// Add stores alerts for a transaction. Evicts oldest 10% when capacity is exceeded.
+// Add stores alerts for a transaction. On the memory shelf it evicts the oldest
+// 10% when capacity is exceeded.
 func (s *AlertStore) Add(txID string, alerts []types.Alert) {
+	if s.app != nil {
+		if err := s.add(txID, alerts); err != nil {
+			log.Printf("[aml] alerts on %s: %v", txID, err)
+		}
+		return
+	}
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -147,6 +162,10 @@ func (s *AlertStore) Add(txID string, alerts []types.Alert) {
 // secret and the store is shared, so the org is what scopes the read: without it
 // knowing an id in another org would be enough to read its alerts.
 func (s *AlertStore) ByTx(org, txID string) []types.Alert {
+	if s.app != nil {
+		return s.byTx(org, txID)
+	}
+
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
@@ -159,8 +178,13 @@ func (s *AlertStore) ByTx(org, txID string) []types.Alert {
 	return out
 }
 
-// Len returns the number of transaction IDs in the store.
+// Len returns the number of transaction IDs on the memory shelf.
 func (s *AlertStore) Len() int {
+	if s.app != nil {
+		n, _ := alertKind.Count(s.app)
+		return n
+	}
+
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return len(s.alerts)
