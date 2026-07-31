@@ -1,5 +1,8 @@
 name: Release
-# Builds ghcr.io/luxfi/aml on the native runners (git.hanzo.ai → git-runner).
+# Builds ghcr.io/luxfi/aml and ghcr.io/luxfi/aml-ui on the native runners
+# (git.hanzo.ai → git-runner). Two images because they are two deploy units: the
+# daemon answers api.<brand>/v1/aml, the console is a static bundle on its own
+# host. They share a tag so a release names one state of the product.
 #
 # A tag push vX.Y.Z is a release: the image carries the semver tags plus the sha
 # tag; a main push carries only the sha tag. The image must pass the smoke below
@@ -174,3 +177,109 @@ jobs:
       - name: Note when the sovereign copy was skipped
         if: ${{ secrets.OCI_USER == '' || secrets.OCI_TOKEN == '' }}
         run: echo "::warning::oci.hanzo.ai copy SKIPPED — OCI_USER/OCI_TOKEN not provisioned on this org. Canonical ghcr.io/luxfi/aml image is published; provision the IAM registry credential to enable the sovereign copy."
+
+  console:
+    # The console: the same bundle every brand is served, with its deployment's
+    # API and clientId templated into /config.json at container start. It holds
+    # no secret and cannot — it is a static file anyone may read.
+    runs-on: [lux-build-linux-amd64]
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Compute tags
+        id: meta
+        run: |
+          set -euo pipefail
+          SHA_TAG="ghcr.io/luxfi/aml-ui:sha-${GITHUB_SHA:0:7}"
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            VERSION="${GITHUB_REF#refs/tags/v}"
+            {
+              echo "tags<<EOF"
+              echo "ghcr.io/luxfi/aml-ui:v${VERSION}"
+              echo "ghcr.io/luxfi/aml-ui:${VERSION}"
+              echo "$SHA_TAG"
+              echo "EOF"
+            } >> "$GITHUB_OUTPUT"
+            echo "probe=ghcr.io/luxfi/aml-ui:v${VERSION}" >> "$GITHUB_OUTPUT"
+          else
+            {
+              echo "tags<<EOF"
+              echo "$SHA_TAG"
+              echo "EOF"
+            } >> "$GITHUB_OUTPUT"
+            echo "probe=$SHA_TAG" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Typecheck and build the bundle
+        # The type error is caught here, before an image exists to deploy.
+        run: |
+          set -euo pipefail
+          npm --prefix ui ci
+          npm --prefix ui run build
+          test -f ui/dist/index.html
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ secrets.GHCR_USER }}
+          password: ${{ secrets.GHCR_TOKEN }}
+
+      - name: Build
+        run: |
+          set -euo pipefail
+          args=""
+          while IFS= read -r t; do [ -n "$t" ] && args="$args -t $t"; done <<< "${{ steps.meta.outputs.tags }}"
+          docker build $args -f ui/Dockerfile ui/
+
+      - name: Smoke — it serves, it templates its config, and it answers deep links
+        # Three facts, each of which has to hold for the console to work at all:
+        # the bundle is served, the deployment's API is templated into
+        # /config.json from SPA_* env, and an unknown path returns index.html so
+        # a refresh on /cases does not 404.
+        run: |
+          set -euo pipefail
+          img="${{ steps.meta.outputs.probe }}"
+          cid=$(docker run -d -e SPA_API=https://api.hanzo.ai -e SPA_CLIENT_ID=hanzo-aml \
+            -p 127.0.0.1:8798:3000 "$img")
+          trap 'docker logs "$cid" | tail -40; docker rm -f "$cid" >/dev/null 2>&1 || true' EXIT
+
+          ready=""
+          for i in $(seq 1 30); do
+            if curl -sf -o /dev/null http://127.0.0.1:8798/healthz; then ready=1; break; fi
+            sleep 1
+          done
+          [ -n "$ready" ] || { echo "::error::the console never answered /healthz"; exit 1; }
+
+          curl -sf http://127.0.0.1:8798/ | grep -q '<div id="root">' \
+            || { echo "::error::/ did not serve the bundle"; exit 1; }
+
+          cfg=$(curl -sf http://127.0.0.1:8798/config.json)
+          echo "$cfg" | grep -q '"api":"https://api.hanzo.ai"' \
+            || { echo "::error::SPA_API was not templated into config.json: $cfg"; exit 1; }
+          echo "$cfg" | grep -q '"clientId":"hanzo-aml"' \
+            || { echo "::error::SPA_CLIENT_ID was not templated into config.json: $cfg"; exit 1; }
+
+          curl -sf http://127.0.0.1:8798/cases/anything | grep -q '<div id="root">' \
+            || { echo "::error::a deep link did not fall back to index.html"; exit 1; }
+
+          echo "serves, templates its config, and answers deep links"
+
+      - name: Push
+        run: |
+          set -euo pipefail
+          while IFS= read -r t; do
+            [ -n "$t" ] && docker push "$t"
+          done <<< "${{ steps.meta.outputs.tags }}"
+
+      - name: Verify the pushed manifest resolves
+        run: |
+          set -euo pipefail
+          img="${{ steps.meta.outputs.probe }}"
+          for i in 1 2 3 4 5 6; do
+            if docker manifest inspect "$img" >/dev/null 2>&1; then
+              echo "$img is resolvable"; exit 0
+            fi
+            echo "manifest not visible yet (attempt ${i}/6) — retrying"; sleep 5
+          done
+          echo "::error::$img not pullable after push"; exit 1
