@@ -934,6 +934,13 @@ textarea:focus {
 .gate p {
   color: var(--ink-2);
   font-size: var(--hz-text-sm);
+  max-width: 30ch;
+}
+
+.gate .btn {
+  min-width: 180px;
+  height: 34px;
+  margin-top: 4px;
 }
 
 .spin {
