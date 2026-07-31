@@ -67,7 +67,7 @@ func TestCheckEscalation_SLABreached(t *testing.T) {
 
 	// Backdate the case to trigger SLA breach.
 	s.mu.Lock()
-	s.cases[c.ID].OpenedAt = time.Now().UTC().Add(-2 * time.Hour)
+	c = age(t, s, c.ID, time.Now().UTC().Add(-2*time.Hour), time.Time{})
 	s.mu.Unlock()
 
 	config := DefaultTriageConfig()
@@ -119,7 +119,7 @@ func TestAStaleCaseIsEscalatedNotClosed(t *testing.T) {
 	stale := func(severity string) *types.Case {
 		c := s.Create("org1", severity, nil, nil)
 		s.mu.Lock()
-		s.cases[c.ID].UpdatedAt = time.Now().UTC().Add(-60 * 24 * time.Hour)
+		age(t, s, c.ID, time.Time{}, time.Now().UTC().Add(-60*24*time.Hour))
 		s.mu.Unlock()
 		return c
 	}
@@ -156,7 +156,7 @@ func TestNoTimerPathCanCloseACase(t *testing.T) {
 	s := NewStore()
 	c := s.Create("org1", types.SeverityLow, nil, nil)
 	s.mu.Lock()
-	s.cases[c.ID].UpdatedAt = time.Now().UTC().Add(-365 * 24 * time.Hour)
+	age(t, s, c.ID, time.Time{}, time.Now().UTC().Add(-365*24*time.Hour))
 	s.mu.Unlock()
 
 	s.AutoEscalateStale(DefaultTriageConfig())
@@ -194,13 +194,13 @@ func TestTriageCheck_FullCycle(t *testing.T) {
 	// Critical case past SLA.
 	c2 := s.Create("org1", types.SeverityCritical, nil, nil)
 	s.mu.Lock()
-	s.cases[c2.ID].OpenedAt = time.Now().UTC().Add(-3 * time.Hour)
+	c2 = age(t, s, c2.ID, time.Now().UTC().Add(-3*time.Hour), time.Time{})
 	s.mu.Unlock()
 
 	// Stale low-severity case.
 	c3 := s.Create("org1", types.SeverityLow, nil, nil)
 	s.mu.Lock()
-	s.cases[c3.ID].UpdatedAt = time.Now().UTC().Add(-60 * 24 * time.Hour)
+	age(t, s, c3.ID, time.Time{}, time.Now().UTC().Add(-60*24*time.Hour))
 	s.mu.Unlock()
 
 	config := DefaultTriageConfig()

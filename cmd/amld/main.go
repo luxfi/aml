@@ -157,6 +157,14 @@ func main() {
 			}
 			records := retention.NewBase(app)
 
+			// The case plane, on the same terms. A case is the record that an
+			// alert was considered and what was decided (AMLR Art. 77(1)(b)),
+			// and the timeline is the evidence of the work — both have to be
+			// there after a restart, so both are Base-backed.
+			if err := cases.Ensure(app); err != nil {
+				return fmt.Errorf("refusing to start, the case plane cannot be created: %w", err)
+			}
+
 			rates := reference.RatesFromEnv()
 
 			eng := engine.New(engine.Providers{
@@ -192,7 +200,7 @@ func main() {
 				// assumption, and it qualifies its tenant the same way.
 				Identity:  api.IAMIdentity(api.JWKS(keysTTL, keysStale), client),
 				Engine:    eng,
-				Cases:     cases.NewStore(),
+				Cases:     cases.NewBase(app),
 				Alerts:    api.NewAlertStore(),
 				Screen:    lists,
 				Readiness: readiness,

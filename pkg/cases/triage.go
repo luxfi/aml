@@ -4,6 +4,8 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/google/uuid"
+
 	"github.com/luxfi/aml/pkg/types"
 )
 
@@ -51,14 +53,13 @@ func (s *Store) AutoAssign(c *types.Case, analysts []string, mode string) string
 
 	case "least_loaded":
 		// Count open cases per analyst.
-		s.mu.RLock()
 		loads := make(map[string]int)
-		for _, existing := range s.cases {
+		_ = s.shelf.each(func(existing *types.Case) error {
 			if existing.Status != types.CaseClosed && existing.AssigneeID != "" {
 				loads[existing.AssigneeID]++
 			}
-		}
-		s.mu.RUnlock()
+			return nil
+		})
 
 		minLoad := -1
 		for _, a := range analysts {
@@ -98,24 +99,28 @@ func (s *Store) CheckEscalation(c *types.Case, config TriageConfig) bool {
 
 	// SLA breached: escalate.
 	s.mu.Lock()
-	existing, ok := s.cases[c.ID]
-	if !ok {
-		s.mu.Unlock()
+	defer s.mu.Unlock()
+
+	existing, err := s.shelf.get(c.ID)
+	if err != nil || existing == nil {
 		return false
 	}
 
 	now := time.Now().UTC()
 	existing.Status = types.CaseEscalated
 	existing.UpdatedAt = now
+	if err := s.shelf.put(existing); err != nil {
+		return false
+	}
 
-	s.events[c.ID] = append(s.events[c.ID], types.CaseEvent{
+	_ = s.shelf.appendEvent(types.CaseEvent{
+		ID:        uuid.NewString(),
 		Kind:      types.EventStatusChange,
 		CaseID:    c.ID,
 		AuthorID:  "system",
 		Body:      "auto-escalated: SLA breached",
 		CreatedAt: now,
 	})
-	s.mu.Unlock()
 
 	return true
 }
@@ -152,12 +157,12 @@ func (s *Store) AutoEscalateStale(config TriageConfig) int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	for _, c := range s.cases {
+	_ = s.shelf.each(func(c *types.Case) error {
 		if c.Status == types.CaseClosed || c.Status == types.CaseEscalated {
-			continue
+			return nil
 		}
 		if !c.UpdatedAt.Before(threshold) {
-			continue
+			return nil
 		}
 
 		// Every severity, not only low. The original only swept low-severity cases,
@@ -165,8 +170,12 @@ func (s *Store) AutoEscalateStale(config TriageConfig) int {
 		// has touched is the more serious governance failure, not the less.
 		c.Status = types.CaseEscalated
 		c.UpdatedAt = now
+		if err := s.shelf.put(c); err != nil {
+			return nil
+		}
 
-		s.events[c.ID] = append(s.events[c.ID], types.CaseEvent{
+		_ = s.shelf.appendEvent(types.CaseEvent{
+			ID:        uuid.NewString(),
 			Kind:      types.EventStatusChange,
 			CaseID:    c.ID,
 			AuthorID:  "system",
@@ -174,7 +183,8 @@ func (s *Store) AutoEscalateStale(config TriageConfig) int {
 			CreatedAt: now,
 		})
 		escalated++
-	}
+		return nil
+	})
 
 	return escalated
 }
