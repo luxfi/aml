@@ -109,7 +109,6 @@ func main() {
 	// an instance without it reports itself unfit and refuses to process a
 	// transaction it could not record — the right failure for a control whose whole
 	// job is to have kept the record.
-	records := retention.New()
 	keys := token.NewKeyring(token.Env("AML_TOKEN_KEY"))
 
 	// The behavioural plane. Sliding aggregates are the substrate every behavioural
@@ -143,6 +142,21 @@ func main() {
 				return fmt.Errorf("refusing to start, the transaction record cannot be created: %w", err)
 			}
 			events := history.NewBase(app)
+
+			// The retained record plane, on the same terms as the transaction
+			// record above: collections first, then a ledger over them.
+			//
+			// It is Base-backed and not the memory shelf, which is the whole
+			// obligation. Records have to be kept for five years after the
+			// relationship ends (AMLR Art. 77(3)); a shelf that empties on restart
+			// keeps them until the next rollout, and a `kubectl rollout restart`
+			// is not an event the law makes an exception for. The memory shelf is
+			// for tests and says so.
+			if err := retention.Ensure(app); err != nil {
+				return fmt.Errorf("refusing to start, the retained record cannot be created: %w", err)
+			}
+			records := retention.NewBase(app)
+
 			rates := reference.RatesFromEnv()
 
 			eng := engine.New(engine.Providers{
