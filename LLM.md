@@ -21,43 +21,42 @@ Real-time AML/CFT transaction monitoring engine. Pure Go, single binary, embedde
 ## Build & Run
 
 ```bash
-make build                  # UI build + Go build -tags embedui -> ./amld (the product)
+make build                  # Go build -> ./amld (the daemon)
 make test                   # go test -race -count=1 ./...
 make vet                    # go vet ./...
-make ui                     # pnpm install --frozen-lockfile && pnpm build -> ui/dist
+make ui                     # npm ci && npm run build -> ui/dist (the console)
 make run                    # Build + run dev
 ```
 
-`make build` is the only command that produces the shippable binary: the admin
-dashboard is embedded, so it always builds `ui/dist` first and links with
-`-tags embedui`.
-
-Bare `go build ./...`, `go vet ./...`, `go test ./...` and `go install` work on a
-fresh clone with no Node toolchain — without the `embedui` tag, `ui/embed.go`
-supplies a placeholder tree instead of embedding `ui/dist`. That is what keeps
-the module installable, since `ui/dist` is a build artifact and is not committed.
+Two artifacts, because they are two deploy units. `make build` produces the
+daemon, which serves the API and nothing else; `make ui` produces the console
+bundle, which is served by `ghcr.io/hanzoai/static` on its own host. No Node
+toolchain is needed to build, vet, test or install the module.
 
 ## Module Layout
 
 ```
-cmd/amld/main.go          -- Single binary: serve, version, embedded admin UI
+cmd/amld/main.go          -- Single binary: serve, version
 migrations/0001_core.sql   -- 9 SQLite collections
-ui/                        -- Embedded admin dashboard (Vite + React + @hanzo/gui)
-  embed.go                 -- !embedui: placeholder DistDirFS(), no dist/ needed
-  embed_prod.go            -- embedui: go:embed all:dist -> DistDirFS()
-  package.json             -- @luxfi/aml-ui (private, pnpm)
-  vite.config.ts           -- base: /_/aml/, proxy /v1/aml to :8090
+ui/                        -- The console: its own bundle, its own image, its own host
+  Dockerfile               -- node build -> ghcr.io/hanzoai/static -root /public -spa
+  public/config.json       -- placeholder; the static server templates SPA_* over it
   src/
     main.tsx               -- React 19 entry
-    App.tsx                -- Hash router (wouter), sidebar nav, 5 routes
-    api.ts                 -- Typed fetch wrappers for /v1/aml/* endpoints
+    app.tsx                -- Shell: brand from /v1/aml/config, PKCE gate, 6 routes
+    app.css                -- The one stylesheet, on @hanzo/tokens. No inline styles.
+    config.ts              -- /config.json: the API origin and this app's clientId
+    auth.ts                -- Authorization code + PKCE against the brand's issuer
+    api.ts                 -- One function per route the engine serves
+    ui.tsx                 -- Card, Badge, Tile, Meter, Panel, useLoad, formatting
     pages/
-      Dashboard.tsx        -- Stats cards, recent cases, health check
-      Cases.tsx            -- DataTable with status filter tabs, expandable rows
-      Rules.tsx            -- DataTable with DSL display, test rule modal
-      Alerts.tsx           -- DataTable with severity filter chips, score breakdown
-      Sanctions.tsx        -- Name search form, results table with scores
-  dist/                    -- Built output (gitignored, ~220KB)
+      overview.tsx         -- Readiness, coverage, the published gaps, model state
+      cases.tsx            -- Queue, detail panel, timeline, resolve with rationale
+      rules.tsx            -- Visual builder over the engine vocabulary + replay
+      flow.tsx             -- Evaluate or score a transaction; alerts by transaction
+      sanctions.tsx        -- Screen a party (agree/conflict), list readiness
+      relationships.tsx    -- Art. 78 lookback as a graph; open and close
+  dist/                    -- Built output (gitignored)
 pkg/
   types/types.go           -- Canonical domain types (Transaction, Entity, Rule, Alert, Case)
   engine/
@@ -173,6 +172,7 @@ scores, learns and reports what it *would* have alerted on, changing nothing.
 | POST | /v1/aml/transactions | Ingest transaction, sync rule eval, returns action |
 | GET | /v1/aml/transactions/{id}/alerts | Alerts for a transaction |
 | GET | /v1/aml/cases | List cases (filter by status) |
+| GET | /v1/aml/cases/{id}/events | The case timeline, scoped by the case's tenancy |
 | POST | /v1/aml/cases/{id}/events | Add case event (note, status change) |
 | GET | /v1/aml/rules | List all rules |
 | POST | /v1/aml/rules/test | Replay a candidate rule over history (dry run) |
@@ -302,21 +302,36 @@ processed.
 | `AML_BUSINESS_ZONE` | Zone business-day and business-hour rules are answered in. Default UTC |
 | `AML_ANOMALY` | `live` leaves shadow mode. Anything else scores without contributing |
 
-## Embedded Admin UI
+## Console (`ui/`)
 
-Served at `/_/aml/` via `go:embed`. Hash router (`/#/cases`, `/#/rules`, etc.) for SPA routing without server rewrites.
+A compiled SPA, its own image, its own host. `ghcr.io/luxfi/aml-ui` is
+`ghcr.io/hanzoai/static` with the bundle in `/public`, served with `-spa` so a
+hard refresh on `/cases` resolves. It is NOT embedded in the daemon: the API is
+one door (`api.<brand>/v1/aml`) and the console is another (`aml.<brand>`), and
+putting them in one pod puts them in one blast radius.
 
 ```bash
-make build             # builds ui/dist, then links it with -tags embedui
-./amld serve --dev     # UI at http://localhost:8090/_/aml/
+make ui                                  # npm ci && npm run build -> ui/dist
+cd ui && npm run dev                     # port 3000, proxies /v1/aml to aml.hanzo.ai
+docker build -f ui/Dockerfile ui/        # what CI builds
 ```
 
-Without `-tags embedui` the binary serves a placeholder page at `/_/aml/`; that
-is the expected result of a bare `go build`/`go install`.
+Screens: overview (readiness, coverage and the published gaps), cases (queue +
+timeline + resolve), rules (visual builder over the engine's own vocabulary,
+with the replay report), transactions (evaluate or score, alerts by
+transaction), sanctions (screen a party, list readiness), relationships (Art. 78
+lookback drawn as a graph, open and close).
 
-Dev mode: `cd ui && pnpm dev` (port 3000, proxies API to :8090).
+Deploy-time configuration is two values, templated by the static server into
+`/config.json` from `SPA_API` and `SPA_CLIENT_ID` before the first request. The
+brand's display name and its issuer are NOT configured — the console reads them
+from `/v1/aml/config`, so it can only ever send a user to the issuer the engine
+will accept a token from. The bundle holds no secret: sign-in is
+authorization-code with PKCE against that issuer, as a public client.
 
-Tech: React 19, wouter (hash router), @hanzo/gui, Vite 6. Dark theme.
+Tech: React 19, wouter, Vite 6, `@hanzo/tokens` for the Hanzo design tokens —
+the same values `@hanzo/ui`'s `theme.css` derives from. No runtime style
+injection anywhere, so the served CSP needs no `'unsafe-inline'`.
 
 ## Transaction Ingest Flow
 
@@ -489,7 +504,10 @@ filesystem, never by reading the config.
 ## Deployment
 
 - Single binary: `amld serve --http=0.0.0.0:8090`
-- Docker: `ghcr.io/luxfi/aml:{env}`
+- Docker: `ghcr.io/luxfi/aml:{tag}` (API), `ghcr.io/luxfi/aml-ui:{tag}` (console)
+- Hanzo fleet: `charts/app/values/hanzo/aml.yaml` (no host of its own; reached at
+  `api.hanzo.ai/v1/aml`, a path on the api Ingress in `hanzo-domains.yaml`) and
+  `charts/app/values/hanzo/aml-ui.yaml` (the console at `aml.hanzo.ai`)
 - K8s: Deployment, replicas=1 (SQLite single-writer), PVC for /data
 - Replication: hanzoai/replicate sidecar for age-encrypted S3 WAL streaming
 

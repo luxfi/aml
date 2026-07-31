@@ -172,6 +172,7 @@ func (h *Handler) Register(se *core.ServeEvent) {
 	se.Router.POST("/v1/aml/transactions", h.ingestTransaction())
 	se.Router.GET("/v1/aml/transactions/{id}/alerts", h.getAlerts())
 	se.Router.GET("/v1/aml/cases", h.listCases())
+	se.Router.GET("/v1/aml/cases/{id}/events", h.caseEvents())
 	se.Router.POST("/v1/aml/cases/{id}/events", h.addCaseEvent())
 	se.Router.POST("/v1/aml/cases/{id}/resolve", h.resolveCase())
 	se.Router.GET("/v1/aml/rules", h.listRules())
@@ -448,6 +449,34 @@ func (h *Handler) caseOf(e *core.RequestEvent) (*types.Case, string, error) {
 		return nil, "", errNoCase
 	}
 	return c, tenant, nil
+}
+
+// caseEvents is a case's timeline: what was noted, what changed, and when.
+//
+// The events were being written and never read. A case whose history cannot be
+// read back is not reviewable — the note an analyst adds under Art. 77(1)(b) is
+// evidence only if somebody can see it — so the write path had a read path
+// owing, and this is it.
+//
+// It resolves the case through caseOf first, so the timeline is scoped by the
+// case's own tenancy: a case in another tenant answers 404 exactly as a case
+// that does not exist does. The store is keyed by case id alone, which is safe
+// only because nothing reaches it without that check.
+func (h *Handler) caseEvents() func(e *core.RequestEvent) error {
+	return func(e *core.RequestEvent) error {
+		c, _, err := h.caseOf(e)
+		switch {
+		case errors.Is(err, errNoCase):
+			return fail(e, http.StatusNotFound, "no such case")
+		case err != nil:
+			return refuse(e, err)
+		}
+		events := h.Cases.Events(c.ID)
+		if events == nil {
+			events = []types.CaseEvent{}
+		}
+		return e.JSON(http.StatusOK, events)
+	}
 }
 
 func (h *Handler) addCaseEvent() func(e *core.RequestEvent) error {
