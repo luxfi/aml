@@ -4,42 +4,44 @@ package cases
 
 import (
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/luxfi/aml/pkg/types"
 )
 
-// DefaultClosedCaseRetention is how long closed cases stay in memory.
+// DefaultClosedCaseRetention is how long a closed case is kept before eviction.
 const DefaultClosedCaseRetention = 90 * 24 * time.Hour // 90 days
 
-// DefaultMaxCases is the maximum open+recent cases held in memory.
+// DefaultMaxCases is the point at which eviction runs.
 const DefaultMaxCases = 100_000
 
-// Store is an in-memory case store with eviction of old closed cases.
-// RED-08: Prevents unbounded memory growth by evicting closed cases
-// older than the retention period, and hard-capping total count.
+// Store is the case plane: the cases, their timelines, and the decisions that
+// closed them.
+//
+// The state lives on a [shelf], which is either durable or in memory. What an
+// instance serves from is the durable one ([NewBase]); [NewStore] is the memory
+// one and is for tests.
+//
+// The mutex is still here, and still does the same job: a status change is a
+// read, a mutation and a write, and two of those interleaved lose one. It
+// serialises them within the process. A second replica would need the database
+// to do it instead — this deployment runs one, which is why one lock is enough
+// and why that is worth stating rather than assuming.
 type Store struct {
-	mu        sync.RWMutex
-	cases     map[string]*types.Case
-	events    map[string][]types.CaseEvent
-	seq       atomic.Int64
+	mu        sync.Mutex
+	shelf     shelf
 	maxCases  int
 	retention time.Duration
 }
 
-// NewStore creates an empty case store with default limits.
+// NewStore creates an empty in-memory case store. Nothing in it survives the
+// process; [NewBase] is what an instance serves from.
 func NewStore() *Store {
-	return &Store{
-		cases:     make(map[string]*types.Case),
-		events:    make(map[string][]types.CaseEvent),
-		maxCases:  DefaultMaxCases,
-		retention: DefaultClosedCaseRetention,
-	}
+	return &Store{shelf: newMemory(), maxCases: DefaultMaxCases, retention: DefaultClosedCaseRetention}
 }
 
-// NewStoreWithLimits creates a case store with explicit limits.
+// NewStoreWithLimits creates an in-memory case store with explicit limits.
 func NewStoreWithLimits(maxCases int, retention time.Duration) *Store {
 	if maxCases <= 0 {
 		maxCases = DefaultMaxCases
@@ -47,49 +49,60 @@ func NewStoreWithLimits(maxCases int, retention time.Duration) *Store {
 	if retention <= 0 {
 		retention = DefaultClosedCaseRetention
 	}
-	return &Store{
-		cases:     make(map[string]*types.Case),
-		events:    make(map[string][]types.CaseEvent),
-		maxCases:  maxCases,
-		retention: retention,
-	}
+	return &Store{shelf: newMemory(), maxCases: maxCases, retention: retention}
 }
 
 // EvictExpired removes closed cases older than the retention period.
-// Called internally after Create; can also be called externally by a cron.
+//
+// It evicts only what has been closed for longer than the window, so an open
+// case is never dropped however many there are: the alternative — capping by
+// count and evicting the oldest — throws away the investigations nobody has
+// finished, which are the ones that matter.
 func (s *Store) EvictExpired() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.evictExpiredLocked()
+	return s.evictLocked()
 }
 
-func (s *Store) evictExpiredLocked() int {
+func (s *Store) evictLocked() int {
 	cutoff := time.Now().UTC().Add(-s.retention)
-	evicted := 0
-	for id, c := range s.cases {
-		if c.Status == types.CaseClosed && c.ClosedAt != nil && c.ClosedAt.Before(cutoff) {
-			delete(s.cases, id)
-			delete(s.events, id)
-			evicted++
+	var expired []string
+	_ = s.shelf.each(func(c *types.Case) error {
+		if !stillOpen(c, cutoff) {
+			expired = append(expired, c.ID)
 		}
+		return nil
+	})
+	if len(expired) == 0 {
+		return 0
 	}
-	return evicted
+	if err := s.shelf.drop(expired); err != nil {
+		return 0
+	}
+	return len(expired)
 }
 
-// Len returns the number of cases in the store.
+// Len returns the number of cases held.
 func (s *Store) Len() int {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	return len(s.cases)
+	n := 0
+	_ = s.shelf.each(func(*types.Case) error { n++; return nil })
+	return n
 }
 
 // Create opens a new case from a set of alerts.
 func (s *Store) Create(orgID string, severity string, alertIDs []string, entityIDs []string) *types.Case {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	number, err := s.shelf.number()
+	if err != nil {
+		return nil
+	}
 	now := time.Now().UTC()
 	c := &types.Case{
 		ID:        uuid.NewString(),
 		OrgID:     orgID,
-		Number:    s.seq.Add(1),
+		Number:    number,
 		Status:    types.CaseOpen,
 		Severity:  severity,
 		AlertIDs:  alertIDs,
@@ -98,39 +111,34 @@ func (s *Store) Create(orgID string, severity string, alertIDs []string, entityI
 		CreatedAt: now,
 		UpdatedAt: now,
 	}
-
-	s.mu.Lock()
-	s.cases[c.ID] = c
-	// RED-08: Evict expired closed cases when approaching capacity.
-	if len(s.cases) > s.maxCases {
-		s.evictExpiredLocked()
+	if err := s.shelf.put(c); err != nil {
+		return nil
 	}
-	s.mu.Unlock()
-
+	if s.Len() > s.maxCases {
+		s.evictLocked()
+	}
 	return c
 }
 
-// Get returns a case by ID.
+// Get returns a case by ID, or nil.
+//
+// It does not scope by tenant, because the caller holding an id is the one that
+// knows whose it should be — every caller checks OrgID against its own tenant,
+// and doing it here as well would put the check in two places and make the
+// second one the easy one to forget.
 func (s *Store) Get(id string) *types.Case {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	return s.cases[id]
+	c, err := s.shelf.get(id)
+	if err != nil {
+		return nil
+	}
+	return c
 }
 
-// List returns cases for an org, optionally filtered by status.
+// List returns cases for an org, optionally filtered by status, newest first.
 func (s *Store) List(orgID, status string) []*types.Case {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
-	var out []*types.Case
-	for _, c := range s.cases {
-		if c.OrgID != orgID {
-			continue
-		}
-		if status != "" && c.Status != status {
-			continue
-		}
-		out = append(out, c)
+	out, err := s.shelf.list(orgID, status)
+	if err != nil {
+		return nil
 	}
 	return out
 }
@@ -140,30 +148,29 @@ func (s *Store) UpdateStatus(orgID, caseID, status, authorID string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	c, ok := s.cases[caseID]
-	if !ok || c.OrgID != orgID {
-		return ErrNotFound
+	c, err := s.owned(orgID, caseID)
+	if err != nil {
+		return err
 	}
 
-	oldStatus := c.Status
-	c.Status = status
+	old := c.Status
 	now := time.Now().UTC()
+	c.Status = status
 	c.UpdatedAt = now
-
 	if status == types.CaseClosed {
 		c.ClosedAt = &now
 	}
-
-	s.events[caseID] = append(s.events[caseID], types.CaseEvent{
+	if err := s.shelf.put(c); err != nil {
+		return err
+	}
+	return s.shelf.appendEvent(types.CaseEvent{
 		ID:        uuid.NewString(),
 		CaseID:    caseID,
 		AuthorID:  authorID,
 		Kind:      types.EventStatusChange,
-		Body:      oldStatus + " -> " + status,
+		Body:      old + " -> " + status,
 		CreatedAt: now,
 	})
-
-	return nil
 }
 
 // AddEvent appends to a case timeline after confirming the case belongs to the
@@ -179,23 +186,22 @@ func (s *Store) AddEvent(orgID, caseID string, evt types.CaseEvent) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	c, ok := s.cases[caseID]
-	if !ok || c.OrgID != orgID {
-		return ErrNotFound
+	if _, err := s.owned(orgID, caseID); err != nil {
+		return err
 	}
-
 	evt.ID = uuid.NewString()
 	evt.CaseID = caseID
 	evt.CreatedAt = time.Now().UTC()
-	s.events[caseID] = append(s.events[caseID], evt)
-	return nil
+	return s.shelf.appendEvent(evt)
 }
 
-// Events returns the timeline for a case.
+// Events returns the timeline for a case, oldest first.
 func (s *Store) Events(caseID string) []types.CaseEvent {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	return s.events[caseID]
+	out, err := s.shelf.events(caseID)
+	if err != nil {
+		return nil
+	}
+	return out
 }
 
 // Assign sets the assignee for a case.
@@ -203,13 +209,16 @@ func (s *Store) Assign(caseID, assigneeID string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	c, ok := s.cases[caseID]
-	if !ok {
+	c, err := s.shelf.get(caseID)
+	if err != nil {
+		return err
+	}
+	if c == nil {
 		return ErrNotFound
 	}
 	c.AssigneeID = assigneeID
 	c.UpdatedAt = time.Now().UTC()
-	return nil
+	return s.shelf.put(c)
 }
 
 // Resolve closes a case with a resolution, against the retained assessment that
@@ -229,9 +238,9 @@ func (s *Store) Resolve(orgID, caseID, resolution, authorID, assessment string) 
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	c, ok := s.cases[caseID]
-	if !ok || c.OrgID != orgID {
-		return ErrNotFound
+	c, err := s.owned(orgID, caseID)
+	if err != nil {
+		return err
 	}
 
 	now := time.Now().UTC()
@@ -240,8 +249,10 @@ func (s *Store) Resolve(orgID, caseID, resolution, authorID, assessment string) 
 	c.Assessment = assessment
 	c.ClosedAt = &now
 	c.UpdatedAt = now
-
-	s.events[caseID] = append(s.events[caseID], types.CaseEvent{
+	if err := s.shelf.put(c); err != nil {
+		return err
+	}
+	return s.shelf.appendEvent(types.CaseEvent{
 		ID:        uuid.NewString(),
 		CaseID:    caseID,
 		AuthorID:  authorID,
@@ -249,6 +260,19 @@ func (s *Store) Resolve(orgID, caseID, resolution, authorID, assessment string) 
 		Body:      "closed: " + resolution + " (assessment " + assessment + ")",
 		CreatedAt: now,
 	})
+}
 
-	return nil
+// owned resolves a case within a tenant. A case in another tenant is reported the
+// same way one that does not exist is, because the caller may not tell them apart:
+// a case id is not a secret, and a different answer for each would enumerate
+// another institution's cases.
+func (s *Store) owned(orgID, caseID string) (*types.Case, error) {
+	c, err := s.shelf.get(caseID)
+	if err != nil {
+		return nil, err
+	}
+	if c == nil || c.OrgID != orgID {
+		return nil, ErrNotFound
+	}
+	return c, nil
 }
