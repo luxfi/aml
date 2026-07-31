@@ -41,11 +41,19 @@ func (h *Handler) brandConfig() func(*core.RequestEvent) error {
 			return fail(e, http.StatusNotFound, "no brand serves this host")
 		}
 		b, _ := brand.For(id)
+		// The clientId is named here because this is the one place that already
+		// answers "which identity does this surface have". A console that had to
+		// be told its own clientId separately is a second place for the two to
+		// disagree — and they disagree silently: a token minted for the wrong
+		// audience is refused by the auth path with no hint as to why. It is not
+		// a secret; IAM stamps it into every token as `aud`, and a public PKCE
+		// client holds no credential at all.
 		return e.JSON(http.StatusOK, map[string]string{
-			"brand":   b.ID,
-			"display": brand.Display(b.ID),
-			"issuer":  b.IAMIssuer,
-			"domain":  b.Domain,
+			"brand":     b.ID,
+			"display":   brand.Display(b.ID),
+			"issuer":    b.IAMIssuer,
+			"domain":    b.Domain,
+			"client_id": h.ClientID,
 		})
 	}
 }

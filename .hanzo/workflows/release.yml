@@ -232,16 +232,17 @@ jobs:
           while IFS= read -r t; do [ -n "$t" ] && args="$args -t $t"; done <<< "${{ steps.meta.outputs.tags }}"
           docker build $args -f ui/Dockerfile ui/
 
-      - name: Smoke — it serves, it templates its config, and it answers deep links
-        # Three facts, each of which has to hold for the console to work at all:
-        # the bundle is served, the deployment's API is templated into
-        # /config.json from SPA_* env, and an unknown path returns index.html so
-        # a refresh on /cases does not 404.
+      - name: Smoke — it serves, it answers deep links, and it is configured by nothing
+        # Four facts, each of which has to hold for the console to be both usable
+        # and safe: the bundle is served; an unknown path returns index.html so a
+        # refresh on /cases does not 404; there is NO config.json, because the
+        # API origin is derived from the host and the clientId comes from the
+        # API; and the bundle names no clientId of its own, so the same image is
+        # every brand's.
         run: |
           set -euo pipefail
           img="${{ steps.meta.outputs.probe }}"
-          cid=$(docker run -d -e SPA_API=https://api.hanzo.ai -e SPA_CLIENT_ID=hanzo-aml \
-            -p 127.0.0.1:8798:3000 "$img")
+          cid=$(docker run -d -p 127.0.0.1:8798:3000 "$img")
           trap 'docker logs "$cid" | tail -40; docker rm -f "$cid" >/dev/null 2>&1 || true' EXIT
 
           ready=""
@@ -254,16 +255,23 @@ jobs:
           curl -sf http://127.0.0.1:8798/ | grep -q '<div id="root">' \
             || { echo "::error::/ did not serve the bundle"; exit 1; }
 
-          cfg=$(curl -sf http://127.0.0.1:8798/config.json)
-          echo "$cfg" | grep -q '"api":"https://api.hanzo.ai"' \
-            || { echo "::error::SPA_API was not templated into config.json: $cfg"; exit 1; }
-          echo "$cfg" | grep -q '"clientId":"hanzo-aml"' \
-            || { echo "::error::SPA_CLIENT_ID was not templated into config.json: $cfg"; exit 1; }
-
           curl -sf http://127.0.0.1:8798/cases/anything | grep -q '<div id="root">' \
             || { echo "::error::a deep link did not fall back to index.html"; exit 1; }
 
-          echo "serves, templates its config, and answers deep links"
+          # A config.json would mean the API origin is a setting again, and a
+          # setting that points every authenticated request somewhere is the one
+          # worth attacking. In SPA mode an absent file falls back to index.html,
+          # so the check is that it is NOT a config document.
+          if curl -sf http://127.0.0.1:8798/config.json | grep -q '"api"'; then
+            echo "::error::a config.json is being served — the API origin is derived, not configured"; exit 1
+          fi
+
+          # The same image is every brand's, so it can name none of them.
+          if docker run --rm --entrypoint sh "$img" -c 'grep -rl "hanzo-aml" /public 2>/dev/null | head -1' | grep -q .; then
+            echo "::error::the bundle names a clientId; it must come from /v1/aml/config"; exit 1
+          fi
+
+          echo "serves, answers deep links, and carries no configuration"
 
       - name: Push
         run: |

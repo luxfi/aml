@@ -1,40 +1,70 @@
-// Deploy-time configuration, read at startup from /config.json.
+// Where the API is, and which IAM application this bundle is.
 //
-// Two values, and only two: where the API is, and which IAM application this
-// bundle is. Everything else about the brand — its display name and the issuer
-// a caller must get a token from — comes from the API's own /v1/aml/config,
-// which derives it from the Host. One source for the brand, and it is the
-// server that already had to decide.
+// Neither is configured. There is no config.json and no build-time value: the
+// API origin is derived from the host this console is served on, and the
+// clientId comes from the API's own /v1/aml/config, which is the route that
+// already answers "which identity does this surface have".
 //
-// The file is templated at container start by hanzoai/static from SPA_* env
-// (SPA_API -> api, SPA_CLIENT_ID -> clientId), so the same immutable bundle
-// serves every brand and every environment. Nothing here is a secret: a
-// clientId is public by construction, and a public PKCE client holds none.
+// That is not a convenience, it is the security property. A configurable API
+// origin is a value that points every authenticated request somewhere — set it
+// to a host somebody else controls and the console hands over a bearer on the
+// next call, and the authorization code with its verifier at the next exchange.
+// Derivation removes the setting, so there is nothing to point: aml.hanzo.ai can
+// only ever talk to api.hanzo.ai. The CSP names the same origin a second time,
+// from the server side, so the two have to agree.
+//
+// The same goes for the clientId. Baked into the image it would be one brand's,
+// and the image serves every brand — a Lux console carrying hanzo-aml
+// authenticates against the wrong application, and every token it obtains is
+// refused by the engine with nothing in the failure that says why.
 
-export type Config = {
-  /** API origin, e.g. https://api.hanzo.ai. Empty means same origin. */
-  api: string
-  /** This deployment's IAM application. The audience every token is pinned to. */
-  clientId: string
+/**
+ * origin is the API this console talks to: the same registrable domain, under
+ * the `api` label.
+ *
+ *   aml.hanzo.ai    -> https://api.hanzo.ai
+ *   aml.lux.network -> https://api.lux.network
+ *
+ * A host that names no parent domain gets the empty string, which means same
+ * origin, which is what the dev server proxies. That covers localhost, a bare
+ * two-label domain, and an address literal: 127.0.0.1 has four labels but no
+ * parent domain, and deriving api.0.0.1 from it would point the console at a
+ * host that does not exist. A registrable domain never ends in a numeric label.
+ *
+ * There is deliberately no override. An override is the setting this exists to
+ * remove.
+ */
+export function origin(): string {
+  const host = window.location.hostname
+  if (host.includes(':')) return '' // IPv6 literal
+  const labels = host.split('.')
+  if (labels.length < 3) return ''
+  if (/^\d+$/.test(labels[labels.length - 1])) return '' // IPv4 literal
+  return `${window.location.protocol}//api.${labels.slice(1).join('.')}`
 }
 
-let loaded: Config | null = null
+let clientID = ''
 
-export async function load(): Promise<Config> {
-  if (loaded) return loaded
-  const res = await fetch('/config.json', { cache: 'no-store' })
-  if (!res.ok) throw new Error(`config.json: ${res.status}`)
-  const raw = (await res.json()) as Partial<Config>
-  loaded = {
-    api: (raw.api ?? '').replace(/\/+$/, ''),
-    clientId: raw.clientId ?? '',
+/**
+ * bindClient records the IAM application the API says this surface is. It is
+ * called once, from the unauthenticated /v1/aml/config read, before anything
+ * offers a sign-in.
+ */
+export function bindClient(id: string) {
+  clientID = (id ?? '').trim()
+}
+
+/**
+ * client is the IAM application this bundle authenticates as.
+ *
+ * It throws rather than returning empty. An empty clientId produces an
+ * authorization request the issuer answers with an error, or a token with no
+ * audience pinned — failing here, before the redirect, is the difference
+ * between a message and a mystery.
+ */
+export function client(): string {
+  if (!clientID) {
+    throw new Error('the API named no client_id, so this console has no identity to sign in as')
   }
-  if (!loaded.clientId) throw new Error('config.json names no clientId, so no token can be obtained')
-  return loaded
-}
-
-/** The loaded config. Only valid after load() has resolved. */
-export function config(): Config {
-  if (!loaded) throw new Error('config read before it was loaded')
-  return loaded
+  return clientID
 }

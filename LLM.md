@@ -45,8 +45,7 @@ ui/                        -- The console: its own bundle, its own image, its ow
     main.tsx               -- React 19 entry
     app.tsx                -- Shell: brand from /v1/aml/config, PKCE gate, 6 routes
     app.css                -- The one stylesheet, on @hanzo/tokens. No inline styles.
-    config.ts              -- /config.json: the API origin and this app's clientId
-    auth.ts                -- Authorization code + PKCE against the brand's issuer
+    config.ts              -- API origin derived from the host; clientId from the API
     api.ts                 -- One function per route the engine serves
     ui.tsx                 -- Card, Badge, Tile, Meter, Panel, useLoad, formatting
     pages/
@@ -322,14 +321,27 @@ with the replay report), transactions (evaluate or score, alerts by
 transaction), sanctions (screen a party, list readiness), relationships (Art. 78
 lookback drawn as a graph, open and close).
 
-Deploy-time configuration is two values, templated by the static server into
-`/config.json` from `SPA_API` and `SPA_CLIENT_ID` before the first request. The
-brand's display name and its issuer are NOT configured — the console reads them
-from `/v1/aml/config`, so it can only ever send a user to the issuer the engine
-will accept a token from. The bundle holds no secret: sign-in is
-authorization-code with PKCE against that issuer, as a public client.
+There is no deploy-time configuration at all. The console derives its API from
+the host it is served on (`aml.<domain>` -> `api.<domain>`; a bare domain or an
+address literal means same origin, which is what the dev proxy serves) and reads
+its brand, display name, issuer AND IAM `client_id` from that API's
+`/v1/aml/config`. No config.json, no SPA_* env, no baked clientId — so there is
+no setting that points authenticated requests anywhere, and one image is every
+brand's. Nothing writes the served root, so the container runs
+`readOnlyRootFilesystem` and `runAsNonRoot`.
 
-Tech: React 19, wouter, Vite 6, `@hanzo/tokens` for the Hanzo design tokens —
+Auth is **`@hanzo/iam/browser`** — the SDK every Hanzo app uses, not a local
+copy of it. `configureIam({issuer, clientId, redirect})` with both values from
+`/v1/aml/config`, then `startLogin` / `handleCallback` / `getSession` /
+`getUser` / `logout`. There is no auth code in this repo to review, drift or get
+wrong: PKCE, token storage, refresh and RP-initiated logout are the SDK's, so
+when IAM changes every app gets it.
+
+Verified against production IAM: `hanzo.id` reflects `https://aml.hanzo.ai` on
+discovery, token and userinfo, so the flow works cross-origin from the console
+host.
+
+Tech: React 19, wouter, Vite 6, `@hanzo/iam` for auth, `@hanzo/tokens` for the Hanzo design tokens —
 the same values `@hanzo/ui`'s `theme.css` derives from. No runtime style
 injection anywhere, so the served CSP needs no `'unsafe-inline'`.
 

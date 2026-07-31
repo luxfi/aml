@@ -7,8 +7,9 @@
 // membership), so the console never asserts a tenant: it presents a credential
 // and the engine decides whose data that is.
 
-import { config } from './config'
-import * as auth from './auth'
+import { getIam, getSession } from '@hanzo/iam/browser'
+
+import { bindClient, origin } from './config'
 
 /** Raised when the session is over. The shell answers by signing in again. */
 export class Unauthenticated extends Error {}
@@ -24,30 +25,44 @@ export class Refused extends Error {
 }
 
 function base(): string {
-  return `${config().api}/v1/aml`
+  return `${origin()}/v1/aml`
 }
 
-/** The brand this API answers as. Unauthenticated: it names the issuer a caller needs. */
-export type Brand = { brand: string; display: string; issuer: string; domain: string }
+/**
+ * The brand this API answers as, and the IAM application it pins tokens to.
+ * Unauthenticated by necessity: it names the issuer a caller needs in order to
+ * obtain the token that would identify them.
+ */
+export type Brand = {
+  brand: string
+  display: string
+  issuer: string
+  domain: string
+  client_id: string
+}
 
 export async function brand(): Promise<Brand> {
   const res = await fetch(`${base()}/config`)
   if (!res.ok) throw new Refused(res.status, `no brand serves this host (${res.status})`)
-  return res.json() as Promise<Brand>
+  const b = (await res.json()) as Brand
+  // The console's identity comes from the engine that enforces it, so the two
+  // cannot disagree about which application these tokens are for.
+  bindClient(b.client_id)
+  return b
 }
 
-let issuer = ''
-
-/** Bind the issuer the session refreshes against. Called once, after brand(). */
-export function bind(iss: string) {
-  issuer = iss
-}
-
+/**
+ * The bearer for the next request.
+ *
+ * Expiry, refresh and storage are @hanzo/iam's — one session model for every
+ * Hanzo app, so this asks for a token and does not own one.
+ */
 async function bearer(): Promise<string> {
-  let s = auth.session()
-  if (s && s.expires <= Date.now()) s = await auth.refresh(issuer)
-  if (!s) throw new Unauthenticated('not signed in')
-  return s.access
+  const s = getSession()
+  if (s.authenticated && s.accessToken) return s.accessToken
+  const refreshed = await getIam().refreshAccessToken().catch(() => null)
+  if (!refreshed) throw new Unauthenticated('not signed in')
+  return getSession().accessToken ?? ''
 }
 
 type Options = { method?: string; body?: unknown; accept?: number[] }
@@ -67,9 +82,9 @@ async function call<T>(path: string, o: Options = {}): Promise<T> {
   if (res.status === 401) {
     // One retry on a fresh token: an access token can expire between the check
     // and the read. A second 401 is an answer, not a race.
-    const next = await auth.refresh(issuer)
+    const next = await getIam().refreshAccessToken().catch(() => null)
     if (!next) throw new Unauthenticated('session expired')
-    res = await send(next.access)
+    res = await send(getSession().accessToken ?? '')
     if (res.status === 401) throw new Unauthenticated('session expired')
   }
   if (!res.ok && !(o.accept ?? []).includes(res.status)) {
