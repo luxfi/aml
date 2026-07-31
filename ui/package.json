@@ -5,13 +5,11 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc -b && vite build",
+    "typecheck": "tsc -b",
     "preview": "vite preview"
   },
   "dependencies": {
-    "@hanzo/gui": "^4.8.0",
-    "@hanzogui/config-default": "^4.4.0",
-    "@hanzogui/core": "^4.4.0",
-    "@hanzogui/theme": "^4.4.0",
+    "@hanzo/tokens": "1.0.0",
     "react": "^19.0.0",
     "react-dom": "^19.0.0",
     "wouter": "^3.0.0"
