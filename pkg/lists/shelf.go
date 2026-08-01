@@ -210,8 +210,17 @@ func (s *Shelf) Add(ctx context.Context, org string, in *AddIn) (*List, error) {
 
 	at := s.now()
 	by := trim(in.By)
-	updated := *l
+	var updated List
+	// The counters are read and written INSIDE the transaction, from the row, so a
+	// transaction the store retries counts once. Carried in from the read above
+	// they would be incremented again on every attempt, and a count that drifts
+	// upward is a list whose size nobody can state.
 	err = s.app.RunInTransaction(func(tx core.App) error {
+		held, herr := s.listIn(tx, org, l.Name)
+		if herr != nil {
+			return herr
+		}
+		updated = *held
 		for _, p := range ready {
 			found, ferr := entryKind.Find(tx, org, fieldList+" = {:list} && "+fieldValue+" = {:value}", "", 1,
 				dbx.Params{"list": l.Name, "value": p.value})
@@ -283,8 +292,13 @@ func (s *Shelf) Remove(ctx context.Context, org string, in *RemoveIn) (*List, er
 	}
 
 	at := s.now()
-	updated := *l
+	var updated List
 	err = s.app.RunInTransaction(func(tx core.App) error {
+		held, herr := s.listIn(tx, org, l.Name)
+		if herr != nil {
+			return herr
+		}
+		updated = *held
 		found, ferr := entryKind.Find(tx, org, fieldList+" = {:list} && "+fieldValue+" = {:value}", "", 1,
 			dbx.Params{"list": l.Name, "value": norm})
 		if ferr != nil {
@@ -396,11 +410,15 @@ func (s *Shelf) Lookup(ctx context.Context, org string, in *LookupIn) (*Match, e
 
 // list reads one declaration, or reports that the caller named a list nobody
 // declared.
-func (s *Shelf) list(org, name string) (*List, error) {
+func (s *Shelf) list(org, name string) (*List, error) { return s.listIn(s.app, org, name) }
+
+// listIn is the same read against a given app, which is how a transaction reads
+// the row it is about to write.
+func (s *Shelf) listIn(app core.App, org, name string) (*List, error) {
 	if name == "" {
 		return nil, ErrName
 	}
-	rows, err := listKind.Find(s.app, org, fieldName+" = {:name}", "", 1, dbx.Params{"name": name})
+	rows, err := listKind.Find(app, org, fieldName+" = {:name}", "", 1, dbx.Params{"name": name})
 	if err != nil {
 		return nil, fmt.Errorf("%w: %w", ErrStore, err)
 	}

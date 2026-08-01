@@ -11,6 +11,7 @@ import (
 	"math"
 	"reflect"
 	"sort"
+	"strconv"
 	"sync"
 	"time"
 
@@ -110,7 +111,7 @@ func (s *stat) observe(org, name string, r reading, at time.Time) {
 		s.bits.add(org, name, r.text)
 	}
 	if r.isNum {
-		s.bits.add(org, name, fmt.Sprintf("%v", r.num))
+		s.bits.add(org, name, strconv.FormatFloat(r.num, 'g', -1, 64))
 		s.count++
 		s.sum += r.num
 		s.square += r.num * r.num
