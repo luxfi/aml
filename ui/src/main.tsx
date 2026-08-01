@@ -2,7 +2,7 @@ import { StrictMode } from 'react'
 import { createRoot } from 'react-dom/client'
 import { GuiProvider } from '@hanzogui/core'
 
-import config, { adoptStyles } from './gui'
+import config, { adoptStyles, theme } from './gui'
 import './app.css'
 import { App } from './app'
 
@@ -15,7 +15,7 @@ adoptStyles()
 
 createRoot(root).render(
   <StrictMode>
-    <GuiProvider config={config} defaultTheme="dark" disableInjectCSS>
+    <GuiProvider config={config} defaultTheme={theme} disableInjectCSS>
       <App />
     </GuiProvider>
   </StrictMode>,

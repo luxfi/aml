@@ -40,14 +40,16 @@ cmd/amld/main.go          -- Single binary: serve, version
 migrations/0001_core.sql   -- 9 SQLite collections
 ui/                        -- The console: its own bundle, its own image, its own host
   Dockerfile               -- node build -> ghcr.io/hanzoai/static -root /public -spa
-  public/config.json       -- placeholder; the static server templates SPA_* over it
   src/
     main.tsx               -- React 19 entry
+    gui.ts                 -- The kit, and the one way its stylesheet reaches the DOM
     app.tsx                -- Shell: brand from /v1/aml/config, PKCE gate, 6 routes
-    app.css                -- The one stylesheet, on @hanzo/tokens. No inline styles.
+    app.css                -- The one stylesheet: the kit's theme under this
+                              file's names, plus the arrangements the kit has no
+                              equivalent for. No inline styles.
     config.ts              -- API origin derived from the host; clientId from the API
     api.ts                 -- One function per route the engine serves
-    ui.tsx                 -- Card, Badge, Tile, Meter, Panel, useLoad, formatting
+    ui.tsx                 -- The screens' whole vocabulary, on @hanzo/gui
     pages/
       overview.tsx         -- Readiness, coverage, the published gaps, model state
       cases.tsx            -- Queue, detail panel, timeline, resolve with rationale
@@ -55,6 +57,13 @@ ui/                        -- The console: its own bundle, its own image, its ow
       flow.tsx             -- Evaluate or score a transaction; alerts by transaction
       sanctions.tsx        -- Screen a party (agree/conflict), list readiness
       relationships.tsx    -- Art. 78 lookback as a graph; open and close
+  e2e/
+    session.ts             -- A signed-in console, seeded the way the SDK stores one
+    serve.mjs              -- Serves dist under csp.txt, with a mock API on-origin
+    console.spec.ts        -- The served CSP, signed in, on every screen the rail offers
+    kit.spec.ts            -- Whether the kit actually reaches the screens
+    origin.spec.ts         -- apiOrigin over 22 hosts
+  csp.txt                  -- The policy under test, byte-identical to the chart
   dist/                    -- Built output (gitignored)
 pkg/
   types/types.go           -- Canonical domain types (Transaction, Entity, Rule, Alert, Case)
@@ -343,11 +352,60 @@ host.
 
 Tech: React 19, wouter, Vite 8, `@hanzo/iam` for auth, **`@hanzo/gui`** for the
 kit — the Hanzo design system, so this console wears the fleet's identity rather
-than a lookalike assembled here. Layout, surfaces, controls and type are the
-kit's; the four state colours and the meter are not (`ui/src/ui.tsx` says why).
-The kit is imported at the part (`@hanzogui/stacks`, `@hanzogui/button`, …)
-rather than at the barrel, because the barrel re-exports components built on
-react-native primitives this bundle never renders. One kit, one version pin.
+than a lookalike assembled here. The kit is imported at the part
+(`@hanzogui/stacks`, `@hanzogui/button`, …) rather than at the barrel, because
+the barrel re-exports components built on react-native primitives this bundle
+never renders. One kit, one version pin.
+
+### The kit reaches the screens
+
+`ui/src/ui.tsx` is the screens' whole vocabulary, and it is the ONLY place that
+writes an HTML control or names a stylesheet class. A page composes `Row`,
+`Col`, `Stack`, `Cols`, `Tiles`, `Split`, `Scroll`, `Body`, `Frame`, `Card`,
+`Field`, `Input`, `TextArea`, `Select`, `Button`, `Tabs`/`Tab`, `Badge`, `Tile`,
+`Meter`, `Panel`, `Hint`, `Mono`, `Sub`, `Code`, `Kv`, `Go` — and writes no
+`<input>`, `<button>`, `<select>` or `<textarea>` of its own.
+
+That boundary is checked rather than intended. `ui/e2e/kit.spec.ts` reads these
+sources and fails on a raw control or a stylesheet-class arrangement in a page,
+so "the console is on the kit" cannot decay into "the shell is on the kit".
+
+Four things are deliberately not the kit's, each because the kit's answer would
+be wrong here (`ui/src/ui.tsx` states each at the code):
+
+| Not the kit's | Why |
+|---|---|
+| The four state colours | A state must read the same in every theme and in a screenshot of one. It never carries meaning alone: every badge, accent and dot ships with its label |
+| The meter | Geometry is an SVG attribute. A width that varies with data is the one thing that would otherwise reach the DOM as an inline style |
+| `Cols`, `Tiles`, `Split` | `repeat(auto-fit, minmax(…))`, which reflows on its own width with no breakpoint. The kit's stacks are flexbox; `flex-wrap` strands the last item rather than dividing the row |
+| `Select` | The kit's is built on Sheet and Adapt, whose pan responder needs a react-native runtime this bundle does not carry. One native `<select>`, in one place |
+
+Three properties of the kit are worth knowing before changing `ui.tsx`, because
+each produced a defect that a build, a typecheck, a CSP run and a render test
+all passed, and only looking at the screen found:
+
+1. **`size` is a size token.** The kit derives the box AND the type from it, so a
+   button asked for by height comes out with type to match. Box and type are
+   given separately, from the console's scale (13px, or 11px when quiet), once.
+2. **Button does not forward `className`.** A tone written as a class is dropped
+   in silence: the one action a screen exists for looks like every other action,
+   and a segment strip shows no selection. Tone is style props.
+3. **A custom property is substituted where it is DECLARED.** The kit publishes
+   themes as `:root .t_dark` — a descendant selector — so a theme is always a
+   subtree and never reaches `:root`. `app.css` therefore bridges the theme on
+   `.shell, .gate`, which are inside it. Bridged at `:root` it reads the kit's
+   OS-preference default instead, and a control whose ground and ink both come
+   through it becomes white on white.
+   The kit's default web config is also worth knowing about here: its Button
+   sub-theme carries placeholders (`--t0: dark`, `--t1: button`), which are
+   names and not colours, so `$color` inside a Button is not a colour. Tone
+   reads the bridge, which is where this console reads the theme, once.
+
+`kit.spec.ts` asserts all three as invariants rather than as three regression
+cases — a label is measured, a primary button is compared against a plain one, a
+pressed segment against an unpressed one, and no control may paint its text in
+its own background colour. Each was mutation-proven: reintroduce the defect and
+the matching assertion fails.
 
 ### The console and the CSP
 
@@ -585,13 +643,13 @@ The memory implementations remain, and are for tests. `cases.NewStore()` and
 
 ## Test Coverage
 
-133 tests across 8 packages. All pass with `-race`.
+366 Go tests across 18 packages, all green under `-race`, plus 12 browser tests.
 
-- engine: 38 tests (evaluator, scoring, integration)
-- cases: 28 tests (CRUD, status, events, assignment, resolution)
-- sanctions: 24 tests (Jaro-Winkler, normalize, token match)
-- rules: 21 tests (all 20 starter rules compile + individual eval)
-- chain: 7 tests (Chainalysis client: entities, transfers, webhooks)
-- workflows: 7 tests
-- webhook: 5 tests (sign, verify, deliver, failure)
-- api: 3 tests
+- api: 52 · retention: 43 · cases: 40 · sanctions: 39 · engine: 38 · anomaly: 27
+- measure: 26 · screen: 15 · token: 14 · replay: 14 · rules: 13 · velocity: 11
+- brand: 8 · chain: 7 · workflows: 7 · webhook: 5 · store: 4 · history: 3
+
+The browser suite is `ui/e2e`, run by `npm --prefix ui run e2e` and by CI. It
+builds the bundle, serves it under `ui/csp.txt`, signs in before the first
+script runs, and drives Chromium. See "The console and the CSP" and "The kit
+reaches the screens" below for what each half of it establishes.
