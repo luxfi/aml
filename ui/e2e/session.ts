@@ -7,7 +7,15 @@
 
 import type { Page } from '@playwright/test'
 
+import { serveFonts } from './cdn'
+
 export async function signIn(page: Page) {
+  // Every origin this console reaches is answered locally, so the run is
+  // offline and its result is about the console rather than about the network.
+  // The faces come first because they are fetched at first paint, before
+  // anything below has been read.
+  await serveFonts(page)
+
   await page.addInitScript(() => {
     const hour = Date.now() + 60 * 60 * 1000
     sessionStorage.setItem('hanzo_iam_access_token', 'at-e2e')

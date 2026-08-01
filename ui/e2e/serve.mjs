@@ -19,7 +19,9 @@ import { extname, join, normalize, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 const here = fileURLToPath(new URL('.', import.meta.url))
-const root = resolve(here, '..', 'dist')
+// Which build is being served. The default is the one `npm run build` writes;
+// the offline spec points this at its own so the two never share a directory.
+const root = resolve(here, '..', process.env.ROOT ?? 'dist')
 const csp = (await readFile(resolve(here, '..', 'csp.txt'), 'utf8')).trim()
 const port = Number(process.env.PORT ?? 4173)
 

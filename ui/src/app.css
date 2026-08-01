@@ -22,16 +22,28 @@
  * attribute rather than a style.
  */
 
-/* Values that are the console's own and answer to no theme: the typefaces, the
-   four state steps, the type scale, and the two fixed dimensions of the frame.
-   A typeface is not a theme — the same two stacks serve dark and light — so
-   they are declared here, where every element can reach them. They were in the
-   theme bridge below, which is on .shell and .gate; body is outside both, so
-   `font-family: var(--hz-font-sans)` there substituted nothing, the declaration
-   was invalid, and the document fell back to the browser's default serif. */
+/* The typeface floor, and only the floor.
+ *
+ * The typeface itself is @hanzo/gui's: Geist Sans and Geist Mono, whose stacks
+ * come from the kit's font packages and are declared at :root, with the
+ * @font-face rules that install them, by src/gui.ts. These two are what is left
+ * if that never happens — a browser with no constructable stylesheets — and
+ * they exist because the alternative is not "no typeface" but the browser's
+ * default, which is a serif. That is the bug this console shipped with: a
+ * font-family whose variable was not in scope is not an error, it is Times New
+ * Roman.
+ *
+ * On `html` rather than :root so that SPECIFICITY, not source order, decides:
+ * `:root` is (0,1,0) and `html` is (0,0,1), so the real stacks win wherever in
+ * the cascade an adopted stylesheet happens to land. */
+html {
+  --hz-font-sans: system-ui, sans-serif;
+  --hz-font-mono: ui-monospace, monospace;
+}
+
+/* Values that are the console's own and answer to no theme: the four state
+   steps, the type scale, and the two fixed dimensions of the frame. */
 :root {
-  --hz-font-sans: ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
-  --hz-font-mono: ui-monospace, SFMono-Regular, 'SF Mono', Menlo, monospace;
   --hz-text-xs: 11px;
   --hz-text-sm: 13px;
   --hz-text-lg: 16px;
@@ -118,12 +130,40 @@ body {
   -webkit-font-smoothing: antialiased;
 }
 
-code,
-kbd,
-pre,
-.mono {
+/* Machine text — ids, hashes, code, and anything a screen marks as monospace.
+ *
+ * The `:root` prefix is load-bearing rather than decorative. `ui.tsx` exports a
+ * Mono that is a KIT component carrying this class, and the kit dresses its own
+ * with `.font_body, .font_heading, .font_mono, .is_View { font-family:
+ * var(--f-family) }` — a single class, in an adopted stylesheet, which the
+ * cascade places after this file. A bare `.mono` ties with that on specificity
+ * and loses on order, so machine text asked for through the kit came out in the
+ * UI face: an id or a rate in proportional digits, in a column, which is
+ * exactly where it shows. `:root :is(…)` is (0,2,0) and settles it on
+ * specificity, which no ordering can undo.
+ *
+ * Ligatures off, because `!=` and `->` in a rule expression must read as the
+ * two characters they are. */
+:root :is(code, kbd, pre, .mono) {
   font-family: var(--hz-font-mono);
   font-variant-ligatures: none;
+  font-variant-numeric: tabular-nums;
+}
+
+/* A quantity — a count, a score, a proportion, an age, an amount of money.
+ *
+ * Tabular figures give every digit the same advance, so a column of them forms
+ * real columns of units, tens and hundreds, and an order-of-magnitude
+ * difference is visible before a single number has been read. On a risk console
+ * that is the difference between scanning a page of alerts and reading it.
+ *
+ * Here with the rest of how text is set, not in the table section, because a
+ * quantity is a quantity wherever it is shown — a stat tile is not in a table
+ * and needs it just as much. Being in a COLUMN is what makes it right-aligned,
+ * and that stays with the table. */
+.num,
+.tile-value {
+  font-variant-numeric: tabular-nums;
 }
 
 a {
@@ -372,7 +412,6 @@ a {
   font-size: var(--hz-text-2xl);
   font-weight: var(--hz-weight-medium);
   letter-spacing: var(--hz-tracking-tight);
-  font-variant-numeric: tabular-nums;
   line-height: var(--hz-leading-none);
 }
 
@@ -420,7 +459,6 @@ a {
 
 .grid .num {
   text-align: right;
-  font-variant-numeric: tabular-nums;
 }
 
 .grid .id {
