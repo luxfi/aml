@@ -641,6 +641,25 @@ The memory implementations remain, and are for tests. `cases.NewStore()` and
 - K8s: Deployment, replicas=1 (SQLite single-writer), PVC for /data
 - Replication: hanzoai/replicate sidecar for age-encrypted S3 WAL streaming
 
+### What the release smoke has to know about the runner
+
+Three facts, each learned from a release that produced no image at all. Every
+v0.3.x tag before v0.3.6 is a tag with nothing behind it for these reasons.
+
+- `amld` lives at `/usr/local/bin/amld`, on PATH. It was `/app/amld`, which
+  alpine's PATH does not contain, so the smoke's `command -v amld` exited 127 and
+  the release died one line into the check.
+- A smoke container shares the job container's network namespace
+  (`--network "container:$(hostname)"`) and is probed on its own port. It must
+  not publish one: the step runs inside a job container while the docker daemon
+  is the runner's, so `-p 127.0.0.1:…` binds in the runner's namespace and the
+  loopback in the step reaches nothing.
+- Hex comes from `od -An -tx1 | tr -d ' \n'`. `xxd` is not in the runner image.
+  It failed quietly to an empty `AML_TOKEN_KEY` — an env prefix on a backgrounded
+  command reports the async list's status, not the substitution's — so the CI
+  smoke ran green for weeks against a daemon holding no key. The length is now
+  asserted before use.
+
 ## Test Coverage
 
 366 Go tests across 18 packages, all green under `-race`, plus 12 browser tests.
