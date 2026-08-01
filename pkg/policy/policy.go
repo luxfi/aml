@@ -54,6 +54,7 @@ var (
 	ErrNoAction   = errors.New("policy: a rung with no action")
 	ErrSameAction = errors.New("policy: a rung asks for the action already in force below it")
 	ErrCost       = errors.New("policy: a cost cannot be negative")
+	ErrPrice      = errors.New("policy: a price above the bound cannot be multiplied by a count without overflowing, and a wrapped cost reads as a recommendation")
 )
 
 // Rung is one step of the ladder: at or above this probability, this action.
@@ -81,6 +82,26 @@ type Cost struct {
 	Miss  int64 `json:"miss"`
 	Alarm int64 `json:"alarm"`
 }
+
+// Volume and MaxPrice are the bound that keeps the cost arithmetic exact.
+//
+// A price is multiplied by a COUNT of observations and the products are summed
+// in int64. An int64 that overflows does not fail — it wraps, silently, and the
+// cost-minimising threshold then becomes a number chosen by the wrap rather than
+// by the evidence. That is the worst failure this package could have: it does
+// not look like an error, it looks like a recommendation.
+//
+// Volume is the largest number of observations any one measurement will price.
+// It is set well above the bounded read every measurement is taken under, so
+// raising that read does not quietly invalidate the invariant. MaxPrice is
+// int64's ceiling divided by it, which comes to roughly 92 thousand units of the
+// tenant's currency for the price of ONE mistake — far above any average a
+// lifecycle stage would state, and below the point where the arithmetic stops
+// being exact.
+const (
+	Volume   = 100_000
+	MaxPrice = math.MaxInt64 / Volume
+)
 
 // Stated reports whether this cost says anything. A zero cost is not a free
 // mistake, it is an unstated price, and every metric derived from it is absent
@@ -182,6 +203,9 @@ func (p Policy) Validate() error {
 	}
 	if p.Cost.Miss < 0 || p.Cost.Alarm < 0 {
 		return ErrCost
+	}
+	if p.Cost.Miss > MaxPrice || p.Cost.Alarm > MaxPrice {
+		return fmt.Errorf("%w: %d and %d against a bound of %d", ErrPrice, p.Cost.Miss, p.Cost.Alarm, MaxPrice)
 	}
 	prev, prevAction := -1.0, p.Floor
 	for i, r := range p.Rungs {

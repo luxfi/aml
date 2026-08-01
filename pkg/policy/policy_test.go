@@ -2,6 +2,7 @@ package policy
 
 import (
 	"errors"
+	"math"
 	"testing"
 	"time"
 )
@@ -148,5 +149,36 @@ func TestUnstatedCostIsNotZeroCost(t *testing.T) {
 	}
 	if !(Cost{Alarm: 1}).Stated() {
 		t.Error("a stated alarm price reads as unstated")
+	}
+}
+
+// A price is multiplied by a count and summed in int64. Above the bound that
+// product wraps, and a wrapped cost does not read as an error — it reads as a
+// recommendation about where to put a threshold. The ladder is refused at the
+// door, which is the one place a caller-supplied number arrives.
+func TestAPriceAboveTheBoundIsRefused(t *testing.T) {
+	l := ladder()
+	l.Cost = Cost{Miss: MaxPrice + 1, Alarm: 1}
+	if _, err := Seal(l); !errors.Is(err, ErrPrice) {
+		t.Errorf("a price of %d was accepted: %v", l.Cost.Miss, err)
+	}
+	l.Cost = Cost{Miss: 1, Alarm: MaxPrice + 1}
+	if _, err := Seal(l); !errors.Is(err, ErrPrice) {
+		t.Errorf("an alarm price of %d was accepted: %v", l.Cost.Alarm, err)
+	}
+	// And the bound itself is reachable: refusing at the boundary would make the
+	// stated maximum a number nobody can use.
+	l.Cost = Cost{Miss: MaxPrice, Alarm: MaxPrice}
+	if _, err := Seal(l); err != nil {
+		t.Errorf("the stated maximum was refused: %v", err)
+	}
+	// The bound has to be worth something. A price that cannot express an
+	// ordinary large loss would push a tenant into understating one.
+	if MaxPrice < 10_000*1_000_000_000 {
+		t.Errorf("MaxPrice is %d nano — under ten thousand units, which is too small to state a real loss", MaxPrice)
+	}
+	// And it has to actually prevent the wrap it exists for.
+	if MaxPrice > math.MaxInt64/Volume {
+		t.Errorf("MaxPrice %d times Volume %d overflows int64", MaxPrice, Volume)
 	}
 }
