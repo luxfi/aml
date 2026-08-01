@@ -85,12 +85,20 @@ jobs:
         # cannot check the audience authenticates any first-party token. A real
         # bearer is a brand-issued IAM token CI cannot mint, so the smoke checks
         # what needs no token: it serves, and an unauthenticated read is refused.
+        #
+        # The key is hex from od/tr, and its length is asserted before use. It was
+        # xxd, which is not in the runner image; the substitution failed to an
+        # EMPTY key and nothing caught it, because an env prefix on a backgrounded
+        # command reports the status of the async list, not of the substitution.
+        # The smoke ran green for weeks against a daemon holding no key.
         run: |
           set -euo pipefail
           dir=$(mktemp -d)
+          key=$(head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n')
+          [ ${#key} -eq 64 ] || { echo "::error::token key is ${#key} hex chars, want 64"; exit 1; }
           AML_TENANT_HEADER=X-Org-Id \
           AML_CLIENT_ID=aml-ci-smoke \
-          AML_TOKEN_KEY=$(head -c 32 /dev/urandom | xxd -p -c 64) \
+          AML_TOKEN_KEY="$key" \
             /tmp/amld serve --dir "$dir" --http 127.0.0.1:8791 --dev=false &
           pid=$!
           for i in $(seq 1 60); do
