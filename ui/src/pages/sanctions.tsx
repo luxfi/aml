@@ -13,7 +13,27 @@
 import { useState } from 'react'
 
 import * as api from '../api'
-import { Badge, Card, Empty, Fail, Field, Meter, Spinner, useLoad, when } from '../ui'
+import {
+  Badge,
+  Body,
+  Button,
+  Card,
+  Col,
+  Cols,
+  Empty,
+  Fail,
+  Field,
+  Hint,
+  Input,
+  Meter,
+  Row,
+  Scroll,
+  Sub,
+  SizableText,
+  Spinner,
+  useLoad,
+  when,
+} from '../ui'
 
 export function Sanctions() {
   const [name, setName] = useState('')
@@ -40,9 +60,9 @@ export function Sanctions() {
   return (
     <>
       <Card title="Screen a party">
-        <div className="cols">
+        <Cols>
           <Field label="Name">
-            <input
+            <Input
               type="text"
               value={name}
               placeholder="As it appears on the instruction"
@@ -51,26 +71,30 @@ export function Sanctions() {
             />
           </Field>
           <Field label="Date of birth" hint="Optional. Corroborates or contradicts a name match.">
-            <input type="text" value={dob} placeholder="1974-03-02" onChange={(e) => setDOB(e.target.value)} />
+            <Input type="text" value={dob} placeholder="1974-03-02" onChange={(e) => setDOB(e.target.value)} />
           </Field>
-        </div>
-        <div className="row">
-          <button className="btn primary" disabled={busy || !name.trim()} onClick={() => void search()}>
-            {busy ? <Spinner /> : null}
+        </Cols>
+        <Row wrap>
+          <Button
+            tone="primary"
+            busy={busy}
+            disabled={busy || !name.trim()}
+            onPress={() => void search()}
+          >
             Search
-          </button>
+          </Button>
           {screening.data && !screening.data.ready ? (
             <Badge state="critical">
               screening is unfit: {screening.data.unfit.join(', ')}
             </Badge>
           ) : null}
-        </div>
+        </Row>
         <Fail error={error} />
       </Card>
 
       {hits ? (
         <Card title={`${hits.length} match${hits.length === 1 ? '' : 'es'}`} flush>
-          <div className="scroll">
+          <Scroll>
             <table className="grid">
               <thead>
                 <tr>
@@ -86,15 +110,17 @@ export function Sanctions() {
                 {hits.map((h) => (
                   <tr key={`${h.list}:${h.ref_id}`} className={h.conflict?.length ? 'warning' : 'critical'}>
                     <td>
-                      <div>{h.name}</div>
-                      <div className="id">
-                        {h.kind} · {h.ref_id} · {h.reason}
-                      </div>
+                      <Col gap={2}>
+                        <SizableText size={13}>{h.name}</SizableText>
+                        <Sub>
+                          {h.kind} · {h.ref_id} · {h.reason}
+                        </Sub>
+                      </Col>
                     </td>
                     <td>{h.list}</td>
                     <td className="num">
                       <Meter value={h.score} state={h.score > 0.9 ? 'critical' : 'serious'} width={48} />
-                      <div className="id">{h.score.toFixed(3)}</div>
+                      <Sub>{h.score.toFixed(3)}</Sub>
                     </td>
                     <td>{(h.agree ?? []).join(', ') || '—'}</td>
                     <td>{(h.conflict ?? []).join(', ') || '—'}</td>
@@ -107,32 +133,32 @@ export function Sanctions() {
               <Empty>
                 No designation matched.
                 {screening.data ? (
-                  <span className="hint">
+                  <Hint>
                     Screened against {screening.data.total_entries.toLocaleString()} designations across{' '}
                     {screening.data.sources.length} lists.
-                  </span>
+                  </Hint>
                 ) : null}
               </Empty>
             ) : null}
-          </div>
+          </Scroll>
         </Card>
       ) : null}
 
       <Card
         title="Lists"
         actions={
-          <button className="btn ghost small" onClick={() => void screening.reload()}>
+          <Button quiet onPress={() => void screening.reload()}>
             Refresh
-          </button>
+          </Button>
         }
         flush
       >
         {screening.error ? (
-          <div className="body">
+          <Body>
             <Fail error={screening.error} />
-          </div>
+          </Body>
         ) : null}
-        <div className="scroll">
+        <Scroll>
           <table className="grid">
             <thead>
               <tr>
@@ -155,7 +181,7 @@ export function Sanctions() {
                     <Badge state={s.fresh ? 'good' : 'critical'}>
                       {s.fresh ? 'fresh' : s.error ? 'failing' : 'stale'}
                     </Badge>
-                    {s.error ? <div className="id">{s.error}</div> : null}
+                    {s.error ? <Sub>{s.error}</Sub> : null}
                   </td>
                   <td className="id">{s.sha256 ? s.sha256.slice(0, 12) : '—'}</td>
                 </tr>
@@ -163,11 +189,11 @@ export function Sanctions() {
             </tbody>
           </table>
           {screening.busy ? (
-            <div className="empty">
+            <Empty>
               <Spinner />
-            </div>
+            </Empty>
           ) : null}
-        </div>
+        </Scroll>
       </Card>
     </>
   )

@@ -15,7 +15,23 @@
 import { useState } from 'react'
 
 import * as api from '../api'
-import { Badge, Card, Empty, Fail, Field, Spinner, day } from '../ui'
+import {
+  Badge,
+  Button,
+  Card,
+  Cols,
+  Empty,
+  Fail,
+  Field,
+  Hint,
+  Input,
+  Mono,
+  Row,
+  Select,
+  Tile,
+  Tiles,
+  day,
+} from '../ui'
 
 export function Relationships() {
   const [party, setParty] = useState('')
@@ -45,9 +61,9 @@ export function Relationships() {
   return (
     <>
       <Card title="Find a party">
-        <div className="cols">
+        <Cols>
           <Field label="Party">
-            <input
+            <Input
               type="text"
               value={party}
               placeholder="Name, customer id, account or wallet"
@@ -56,52 +72,46 @@ export function Relationships() {
             />
           </Field>
           <Field label="Named as" hint="Which index the value is looked up in.">
-            <select value={domain} onChange={(e) => setDomain(e.target.value as api.Domain)}>
-              {api.domains.map((d) => (
-                <option key={d} value={d}>
-                  {d}
-                </option>
-              ))}
-            </select>
+            <Select
+              label="Named as"
+              value={domain}
+              options={api.domains}
+              onChange={(v) => setDomain(v as api.Domain)}
+            />
           </Field>
-        </div>
-        <div className="row">
-          <button className="btn primary" disabled={busy || !party.trim()} onClick={() => void search()}>
-            {busy ? <Spinner /> : null}
+        </Cols>
+        <Row wrap>
+          <Button
+            tone="primary"
+            busy={busy}
+            disabled={busy || !party.trim()}
+            onPress={() => void search()}
+          >
             Search
-          </button>
-        </div>
+          </Button>
+        </Row>
         <Fail error={error} />
       </Card>
 
       {answer ? (
         <>
-          <div className="tiles">
-            <div className="tile">
-              <div className="label">Maintained</div>
-              <div className="value">{answer.maintained ? 'Yes' : 'No'}</div>
-              <div className="cap">
-                <Badge state={answer.maintained ? (answer.current ? 'warning' : 'plain') : 'good'}>
-                  {answer.maintained ? (answer.current ? 'current' : 'within the window') : 'no relationship found'}
-                </Badge>
-              </div>
-            </div>
-            <div className="tile">
-              <div className="label">Records</div>
-              <div className="value">{(answer.records ?? []).length}</div>
-              <div className="cap">{answer.examined} examined</div>
-            </div>
-            <div className="tile">
-              <div className="label">Window</div>
-              <div className="value">{day(answer.from)}</div>
-              <div className="cap">to {day(answer.to)}</div>
-            </div>
-            <div className="tile">
-              <div className="label">Nature</div>
-              <div className="value">{(answer.natures ?? []).length}</div>
-              <div className="cap">{(answer.natures ?? []).join(', ') || '—'}</div>
-            </div>
-          </div>
+          <Tiles>
+            <Tile
+              label="Maintained"
+              value={answer.maintained ? 'Yes' : 'No'}
+              state={answer.maintained ? (answer.current ? 'warning' : 'plain') : 'good'}
+              note={
+                answer.maintained ? (answer.current ? 'current' : 'within the window') : 'no relationship found'
+              }
+            />
+            <Tile label="Records" value={(answer.records ?? []).length} note={`${answer.examined} examined`} />
+            <Tile label="Window" value={day(answer.from)} note={`to ${day(answer.to)}`} />
+            <Tile
+              label="Nature"
+              value={(answer.natures ?? []).length}
+              note={(answer.natures ?? []).join(', ') || '—'}
+            />
+          </Tiles>
 
           <Card title="Relationships">
             <Graph
@@ -213,22 +223,26 @@ function Close({ id, onClosed }: { id: string; onClosed: () => void }) {
 
   return (
     <Card title="End this relationship">
-      <p className="hint">
+      <Hint>
         Ending it starts the retention clock on the relationship and on everything retained inside
-        it. <span className="mono">{id}</span>
-      </p>
-      <div className="cols">
+        it. <Mono>{id}</Mono>
+      </Hint>
+      <Cols>
         <Field label="Ended">
-          <input type="date" value={ended} onChange={(e) => setEnded(e.target.value)} />
+          <Input type="date" value={ended} onChange={(e) => setEnded(e.target.value)} />
         </Field>
-      </div>
-      <div className="row">
-        <button className="btn danger" disabled={busy} onClick={() => void submit()}>
-          {busy ? <Spinner /> : null}
+      </Cols>
+      <Row wrap>
+        <Button
+          tone="critical"
+          busy={busy}
+          disabled={busy}
+          onPress={() => void submit()}
+        >
           End relationship
-        </button>
+        </Button>
         {started !== null ? <Badge state="good">{started} retention clocks started</Badge> : null}
-      </div>
+      </Row>
       <Fail error={error} />
     </Card>
   )
@@ -258,33 +272,41 @@ function Open({ onOpened }: { onOpened: () => void }) {
 
   return (
     <Card title="Open a relationship">
-      <div className="cols">
+      <Cols>
         <Field label="Your reference" hint="Retained in the clear, so it must be synthetic — never a direct identifier.">
-          <input type="text" value={form.ref} onChange={(e) => set('ref')(e.target.value)} placeholder="rel-2026-0181" />
+          <Input type="text" value={form.ref} onChange={(e) => set('ref')(e.target.value)} placeholder="rel-2026-0181" />
         </Field>
         <Field label="Nature">
-          <input type="text" value={form.nature} onChange={(e) => set('nature')(e.target.value)} placeholder="correspondent banking" />
+          <Input
+            type="text"
+            value={form.nature}
+            onChange={(e) => set('nature')(e.target.value)}
+            placeholder="correspondent banking"
+          />
         </Field>
         <Field label="Customer name">
-          <input type="text" value={form.name ?? ''} onChange={(e) => set('name')(e.target.value)} />
+          <Input type="text" value={form.name ?? ''} onChange={(e) => set('name')(e.target.value)} />
         </Field>
         <Field label="Customer id">
-          <input type="text" value={form.user_id ?? ''} onChange={(e) => set('user_id')(e.target.value)} />
+          <Input type="text" value={form.user_id ?? ''} onChange={(e) => set('user_id')(e.target.value)} />
         </Field>
         <Field label="Account">
-          <input type="text" value={form.account_id ?? ''} onChange={(e) => set('account_id')(e.target.value)} />
+          <Input type="text" value={form.account_id ?? ''} onChange={(e) => set('account_id')(e.target.value)} />
         </Field>
         <Field label="Wallet">
-          <input type="text" value={form.wallet ?? ''} onChange={(e) => set('wallet')(e.target.value)} />
+          <Input type="text" value={form.wallet ?? ''} onChange={(e) => set('wallet')(e.target.value)} />
         </Field>
-      </div>
-      <div className="row">
-        <button className="btn" disabled={busy || !form.ref.trim() || !form.nature.trim()} onClick={() => void submit()}>
-          {busy ? <Spinner /> : null}
+      </Cols>
+      <Row wrap>
+        <Button
+          busy={busy}
+          disabled={busy || !form.ref.trim() || !form.nature.trim()}
+          onPress={() => void submit()}
+        >
           Open
-        </button>
+        </Button>
         {id ? <Badge state="good">opened {id}</Badge> : null}
-      </div>
+      </Row>
       <Fail error={error} />
     </Card>
   )

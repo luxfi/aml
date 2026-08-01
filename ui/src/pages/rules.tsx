@@ -18,7 +18,39 @@
 import { useMemo, useState } from 'react'
 
 import * as api from '../api'
-import { Badge, Card, Empty, Fail, Field, Meter, Spinner, Tile, pct, severity, useLoad } from '../ui'
+import {
+  Badge,
+  Body,
+  Button,
+  Card,
+  Code,
+  Col,
+  Empty,
+  Fail,
+  Frame,
+  Field,
+  Grow,
+  Hint,
+  Input,
+  Meter,
+  Mono,
+  Row,
+  Scroll,
+  Select,
+  SizableText,
+  Spinner,
+  Split,
+  Stack,
+  Sub,
+  Tab,
+  Tabs,
+  TextArea,
+  Tile,
+  Tiles,
+  pct,
+  severity,
+  useLoad,
+} from '../ui'
 
 // ── The language ────────────────────────────────────────────────────────────
 
@@ -172,19 +204,19 @@ export function Rules() {
   }
 
   return (
-    <div className="split">
-      <div className="stack">
+    <Split>
+      <Stack>
         <Card
           title="Expression"
           actions={
-            <div className="tabs">
-              <button aria-pressed={handwritten === null} onClick={() => setHandwritten(null)}>
+            <Tabs>
+              <Tab on={handwritten === null} onPress={() => setHandwritten(null)}>
                 Builder
-              </button>
-              <button aria-pressed={handwritten !== null} onClick={() => setHandwritten(built)}>
+              </Tab>
+              <Tab on={handwritten !== null} onPress={() => setHandwritten(built)}>
                 Code
-              </button>
-            </div>
+              </Tab>
+            </Tabs>
           }
         >
           {handwritten === null ? (
@@ -195,44 +227,49 @@ export function Rules() {
                 label="Expression"
                 hint="Hand-written. The builder emits code; it does not read it back, so switching to Builder starts from the tree as you left it."
               >
-                <textarea rows={6} value={handwritten} onChange={(e) => setHandwritten(e.target.value)} />
+                <TextArea rows={6} value={handwritten} onChangeText={setHandwritten} />
               </Field>
             </>
           )}
-          <pre className="code">{dsl || '// nothing to evaluate yet'}</pre>
-          <div className="row">
+          <Code>{dsl || '// nothing to evaluate yet'}</Code>
+          <Row wrap>
             <Field label="Replaces (optional)">
-              <select value={incumbent} onChange={(e) => setIncumbent(e.target.value)}>
-                <option value="">nothing — this is a new rule</option>
-                {(installed.data ?? []).map((r) => (
-                  <option key={r.id} value={r.id}>
-                    {r.name}
-                  </option>
-                ))}
-              </select>
+              <Select
+                label="Replaces"
+                value={incumbent}
+                options={[
+                  { value: '', label: 'nothing — this is a new rule' },
+                  ...(installed.data ?? []).map((r) => ({ value: r.id, label: r.name })),
+                ]}
+                onChange={setIncumbent}
+              />
             </Field>
-          </div>
-          <div className="row">
-            <button className="btn primary" disabled={busy || !dsl.trim()} onClick={() => void test()}>
-              {busy ? <Spinner /> : null}
+          </Row>
+          <Row wrap>
+            <Button
+              tone="primary"
+              busy={busy}
+              disabled={busy || !dsl.trim()}
+              onPress={() => void test()}
+            >
               Replay over history
-            </button>
-            <span className="hint">Reads the org&apos;s retained transactions. Writes nothing.</span>
-          </div>
+            </Button>
+            <Hint>Reads the org&apos;s retained transactions. Writes nothing.</Hint>
+          </Row>
           <Fail error={error} />
         </Card>
 
         {report ? <Report report={report} /> : null}
-      </div>
+      </Stack>
 
-      <div className="stack">
+      <Stack>
         <Card title="Installed rules" flush>
           {installed.error ? (
-            <div className="body">
+            <Body>
               <Fail error={installed.error} />
-            </div>
+            </Body>
           ) : null}
-          <div className="scroll">
+          <Scroll>
             <table className="grid">
               <thead>
                 <tr>
@@ -253,8 +290,10 @@ export function Rules() {
                     }}
                   >
                     <td>
-                      <div>{r.name}</div>
-                      <div className="id">{r.dsl}</div>
+                      <Col gap={2}>
+                        <SizableText size={13}>{r.name}</SizableText>
+                        <Sub>{r.dsl}</Sub>
+                      </Col>
                     </td>
                     <td>{(r.typology ?? '').replace(/_/g, ' ')}</td>
                     <td>
@@ -266,17 +305,17 @@ export function Rules() {
               </tbody>
             </table>
             {installed.busy ? (
-              <div className="empty">
+              <Empty>
                 <Spinner />
-              </div>
+              </Empty>
             ) : null}
             {!installed.busy && !(installed.data ?? []).length ? (
               <Empty>No rule is installed.</Empty>
             ) : null}
-          </div>
+          </Scroll>
         </Card>
-      </div>
-    </div>
+      </Stack>
+    </Split>
   )
 }
 
@@ -290,52 +329,52 @@ function GroupEditor({
   edit: (k: string, fn: (n: Node) => Node | null) => void
 }) {
   return (
-    <div className="group">
-      <div className="head">
-        <div className="tabs">
-          <button
-            aria-pressed={node.join === 'and'}
-            onClick={() => edit(node.key, (n) => ({ ...(n as Group), join: 'and' }))}
+    <Frame>
+      <Row wrap>
+        <Tabs>
+          <Tab
+            on={node.join === 'and'}
+            onPress={() => edit(node.key, (n) => ({ ...(n as Group), join: 'and' }))}
           >
             all of
-          </button>
-          <button
-            aria-pressed={node.join === 'or'}
-            onClick={() => edit(node.key, (n) => ({ ...(n as Group), join: 'or' }))}
+          </Tab>
+          <Tab
+            on={node.join === 'or'}
+            onPress={() => edit(node.key, (n) => ({ ...(n as Group), join: 'or' }))}
           >
             any of
-          </button>
-          <button
-            aria-pressed={node.negate}
-            onClick={() => edit(node.key, (n) => ({ ...(n as Group), negate: !(n as Group).negate }))}
+          </Tab>
+          <Tab
+            on={node.negate}
+            onPress={() => edit(node.key, (n) => ({ ...(n as Group), negate: !(n as Group).negate }))}
           >
             not
-          </button>
-        </div>
-        <div className="grow" />
-        <button
-          className="btn ghost small"
-          onClick={() =>
+          </Tab>
+        </Tabs>
+        <Grow />
+        <Button
+          quiet
+          onPress={() =>
             edit(node.key, (n) => ({ ...(n as Group), kids: [...(n as Group).kids, condOf('USD')] }))
           }
         >
           + condition
-        </button>
-        <button
-          className="btn ghost small"
-          onClick={() =>
+        </Button>
+        <Button
+          quiet
+          onPress={() =>
             edit(node.key, (n) => ({ ...(n as Group), kids: [...(n as Group).kids, groupOf()] }))
           }
         >
           + group
-        </button>
+        </Button>
         {depth > 0 ? (
-          <button className="btn ghost small" onClick={() => edit(node.key, () => null)}>
+          <Button quiet onPress={() => edit(node.key, () => null)}>
             remove
-          </button>
+          </Button>
         ) : null}
-      </div>
-      <div className="kids">
+      </Row>
+      <Col gap={8}>
         {node.kids.map((k) =>
           k.at === 'group' ? (
             <GroupEditor key={k.key} node={k} depth={depth + 1} edit={edit} />
@@ -344,8 +383,8 @@ function GroupEditor({
           ),
         )}
         {!node.kids.length ? <Empty>Empty group.</Empty> : null}
-      </div>
-    </div>
+      </Col>
+    </Frame>
   )
 }
 
@@ -360,20 +399,16 @@ function CondEditor({
   const set = (patch: Partial<Cond>) => edit(node.key, (n) => ({ ...(n as Cond), ...patch }))
 
   return (
-    <div className="cond">
-      <select
+    <Row wrap gap={6}>
+      <Select
+        label="Term"
         value={node.term}
-        onChange={(e) => {
-          const next = condOf(e.target.value)
+        options={terms.map((x) => ({ value: x.id, label: x.label }))}
+        onChange={(v) => {
+          const next = condOf(v)
           set({ term: next.term, args: next.args, op: next.op, value: next.value })
         }}
-      >
-        {terms.map((x) => (
-          <option key={x.id} value={x.id}>
-            {x.label}
-          </option>
-        ))}
-      </select>
+      />
 
       {t.args.map((a, i) => (
         <ArgEditor
@@ -386,14 +421,14 @@ function CondEditor({
 
       {t.returns !== 'bool' ? (
         <>
-          <select className="op" value={node.op} onChange={(e) => set({ op: e.target.value })}>
-            {comparators[t.returns].map((c) => (
-              <option key={c} value={c}>
-                {c}
-              </option>
-            ))}
-          </select>
-          <input
+          <Select
+            narrow
+            label="Comparator"
+            value={node.op}
+            options={comparators[t.returns]}
+            onChange={(v) => set({ op: v })}
+          />
+          <Input
             type="text"
             value={node.value}
             onChange={(e) => set({ value: e.target.value })}
@@ -401,13 +436,13 @@ function CondEditor({
           />
         </>
       ) : (
-        <span className="hint">{t.hint ?? 'holds or does not'}</span>
+        <Hint>{t.hint ?? 'holds or does not'}</Hint>
       )}
 
-      <button className="btn ghost small" onClick={() => edit(node.key, () => null)}>
+      <Button quiet onPress={() => edit(node.key, () => null)}>
         ×
-      </button>
-    </div>
+      </Button>
+    </Row>
   )
 }
 
@@ -423,18 +458,16 @@ function ArgEditor({
   const options =
     a.kind === 'subject' ? subjects : a.kind === 'dimension' ? dimensions : a.kind === 'window' ? windows : null
   if (options) {
-    return (
-      <select value={value} onChange={(e) => onChange(e.target.value)} aria-label={a.name}>
-        {options.map((o) => (
-          <option key={o} value={o}>
-            {o}
-          </option>
-        ))}
-      </select>
-    )
+    return <Select label={a.name} value={value} options={options} onChange={onChange} />
   }
   return (
-    <input type="text" value={value} onChange={(e) => onChange(e.target.value)} aria-label={a.name} placeholder={a.name} />
+    <Input
+      type="text"
+      value={value}
+      onChange={(e) => onChange(e.target.value)}
+      aria-label={a.name}
+      placeholder={a.name}
+    />
   )
 }
 
@@ -445,15 +478,15 @@ function Report({ report }: { report: api.Replay }) {
   const i = report.incumbent
   return (
     <Card title="Replay">
-      <div className="tiles">
+      <Tiles>
         <Tile label="Events replayed" value={report.events.toLocaleString()} />
         <Tile label="Would alert" value={c.alerts.toLocaleString()} />
         <Tile label="Judged" value={`${c.judged.toLocaleString()} of ${c.observed.toLocaleString()}`} />
         <Tile label="Productive" value={c.productive.toLocaleString()} />
-      </div>
+      </Tiles>
 
-      <div className="row">
-        <span className="hint">false positives</span>
+      <Row wrap>
+        <Hint>false positives</Hint>
         <Meter
           value={c.false_positive_proportion ?? 0}
           state={
@@ -466,10 +499,10 @@ function Report({ report }: { report: api.Replay }) {
                   : 'good'
           }
         />
-        <span className="mono">{pct(c.false_positive_proportion)}</span>
-        <span className="hint">intelligence value</span>
-        <span className="mono">{pct(c.intelligence_value)}</span>
-      </div>
+        <Mono>{pct(c.false_positive_proportion)}</Mono>
+        <Hint>intelligence value</Hint>
+        <Mono>{pct(c.intelligence_value)}</Mono>
+      </Row>
 
       {i ? (
         <table className="grid">
@@ -502,18 +535,18 @@ function Report({ report }: { report: api.Replay }) {
       ) : null}
 
       {report.delta ? (
-        <div className="row">
+        <Row wrap>
           <Badge state="good">+{report.delta.counts.added} newly caught</Badge>
           <Badge state="critical">−{report.delta.counts.dropped} no longer caught</Badge>
           <Badge>{report.delta.counts.kept} unchanged</Badge>
-        </div>
+        </Row>
       ) : null}
 
       {report.from ? (
-        <span className="hint">
+        <Hint>
           replayed {new Date(report.from).toLocaleDateString()} to{' '}
           {report.to ? new Date(report.to).toLocaleDateString() : 'now'}
-        </span>
+        </Hint>
       ) : null}
     </Card>
   )

@@ -12,7 +12,35 @@
 import { useState } from 'react'
 
 import * as api from '../api'
-import { Badge, Card, Empty, Fail, Field, Meter, Spinner, action, severity, useLoad, when } from '../ui'
+import {
+  Badge,
+  Body,
+  Button,
+  Card,
+  Code,
+  Col,
+  Cols,
+  Empty,
+  Fail,
+  Field,
+  Hint,
+  Input,
+  Kv,
+  Meter,
+  Mono,
+  Row,
+  Scroll,
+  Select,
+  SizableText,
+  Spinner,
+  Split,
+  Stack,
+  Sub,
+  action,
+  severity,
+  useLoad,
+  when,
+} from '../ui'
 
 const blank: api.Transaction = {
   user_id: '',
@@ -52,92 +80,96 @@ export function Flow() {
   }
 
   return (
-    <div className="split">
-      <div className="stack">
+    <Split>
+      <Stack>
         <Card title="Transaction">
-          <div className="cols">
+          <Cols>
             <Field label="Customer id">
-              <input type="text" value={tx.user_id} onChange={(e) => field('user_id')(e.target.value)} placeholder="cust-1042" />
+              <Input type="text" value={tx.user_id} onChange={(e) => field('user_id')(e.target.value)} placeholder="cust-1042" />
             </Field>
             <Field label="Account id">
-              <input type="text" value={tx.account_id ?? ''} onChange={(e) => field('account_id')(e.target.value)} />
+              <Input type="text" value={tx.account_id ?? ''} onChange={(e) => field('account_id')(e.target.value)} />
             </Field>
             <Field label="Amount">
-              <input type="number" value={tx.notional || ''} onChange={(e) => field('notional')(e.target.value)} />
+              <Input type="number" value={tx.notional || ''} onChange={(e) => field('notional')(e.target.value)} />
             </Field>
             <Field label="Currency" hint="Converted server-side. An unconvertible currency is refused, not passed through.">
-              <input type="text" value={tx.currency} onChange={(e) => field('currency')(e.target.value.toUpperCase())} />
+              <Input type="text" value={tx.currency} onChange={(e) => field('currency')(e.target.value.toUpperCase())} />
             </Field>
             <Field label="Direction">
-              <select value={tx.side ?? 'in'} onChange={(e) => field('side')(e.target.value)}>
-                <option value="in">in</option>
-                <option value="out">out</option>
-              </select>
+              <Select label="Direction" value={tx.side ?? 'in'} options={['in', 'out']} onChange={field('side')} />
             </Field>
             <Field label="Counterparty">
-              <input type="text" value={tx.counterparty ?? ''} onChange={(e) => field('counterparty')(e.target.value)} />
+              <Input type="text" value={tx.counterparty ?? ''} onChange={(e) => field('counterparty')(e.target.value)} />
             </Field>
             <Field label="Device fingerprint">
-              <input type="text" value={tx.device_fingerprint ?? ''} onChange={(e) => field('device_fingerprint')(e.target.value)} />
+              <Input type="text" value={tx.device_fingerprint ?? ''} onChange={(e) => field('device_fingerprint')(e.target.value)} />
             </Field>
             <Field label="Transaction jurisdiction">
-              <input type="text" value={tx.customer_jurisdiction ?? ''} onChange={(e) => field('customer_jurisdiction')(e.target.value)} placeholder="GB" />
+              <Input type="text" value={tx.customer_jurisdiction ?? ''} onChange={(e) => field('customer_jurisdiction')(e.target.value)} placeholder="GB" />
             </Field>
-          </div>
+          </Cols>
         </Card>
 
         <Card title="Customer">
-          <div className="cols">
+          <Cols>
             <Field
               label="Name"
               hint="Screening has no input without it. A customer id is not a name, and the engine will not treat one as though it were."
             >
-              <input type="text" value={entity.name ?? ''} onChange={(e) => setEntity((x) => ({ ...x, name: e.target.value }))} />
+              <Input type="text" value={entity.name ?? ''} onChange={(e) => setEntity((x) => ({ ...x, name: e.target.value }))} />
             </Field>
             <Field label="Jurisdiction">
-              <input type="text" value={entity.jurisdiction ?? ''} onChange={(e) => setEntity((x) => ({ ...x, jurisdiction: e.target.value }))} placeholder="IR" />
+              <Input type="text" value={entity.jurisdiction ?? ''} onChange={(e) => setEntity((x) => ({ ...x, jurisdiction: e.target.value }))} placeholder="IR" />
             </Field>
-          </div>
-          <div className="row">
-            <button className="btn" disabled={!!busy} onClick={() => void run('score')}>
-              {busy === 'score' ? <Spinner /> : null}
+          </Cols>
+          <Row wrap>
+            <Button
+              busy={busy === 'score'}
+              disabled={!!busy}
+              onPress={() => void run('score')}
+            >
               Score without recording
-            </button>
-            <button className="btn primary" disabled={!!busy || !tx.user_id || !tx.notional} onClick={() => void run('send')}>
-              {busy === 'send' ? <Spinner /> : null}
+            </Button>
+            <Button
+              tone="primary"
+              busy={busy === 'send'}
+              disabled={!!busy || !tx.user_id || !tx.notional}
+              onPress={() => void run('send')}
+            >
               Submit and record
-            </button>
-          </div>
+            </Button>
+          </Row>
           <Fail error={error} />
         </Card>
 
         {outcome ? <Outcome outcome={outcome} /> : null}
         {score ? <Score score={score} /> : null}
-      </div>
+      </Stack>
 
-      <div className="stack">
+      <Stack>
         <Alerts />
-      </div>
-    </div>
+      </Stack>
+    </Split>
   )
 }
 
 function Outcome({ outcome }: { outcome: api.Evaluation }) {
   return (
     <Card title="Decision">
-      <div className="row">
+      <Row wrap>
         <Badge state={action(outcome.action)}>{outcome.action}</Badge>
         <Meter value={outcome.score} state={action(outcome.action)} />
-        <span className="mono">{outcome.score.toFixed(3)}</span>
-      </div>
-      <dl className="kv">
+        <Mono>{outcome.score.toFixed(3)}</Mono>
+      </Row>
+      <Kv>
         <dt>Alerts</dt>
         <dd className="mono">{(outcome.alert_ids ?? []).join(', ') || 'none'}</dd>
         <dt>Case</dt>
         <dd className="mono">{outcome.case_id || 'none opened'}</dd>
         <dt>Record</dt>
         <dd className="mono">{outcome.record}</dd>
-      </dl>
+      </Kv>
     </Card>
   )
 }
@@ -145,11 +177,11 @@ function Outcome({ outcome }: { outcome: api.Evaluation }) {
 function Score({ score }: { score: Record<string, unknown> }) {
   return (
     <Card title="Model inspection">
-      <p className="hint">
+      <Hint>
         Every coordinate the model read, including the ones that contributed nothing. What it
         looked at is as much part of the account as what it concluded.
-      </p>
-      <pre className="code">{JSON.stringify(score, null, 2)}</pre>
+      </Hint>
+      <Code>{JSON.stringify(score, null, 2)}</Code>
     </Card>
   )
 }
@@ -164,26 +196,26 @@ function Alerts() {
       title="Alerts by transaction"
       actions={
         <>
-          <input
+          <Input
             type="text"
             value={id}
             placeholder="Transaction id"
             onChange={(e) => setID(e.target.value)}
             onKeyDown={(e) => e.key === 'Enter' && setAsked(id.trim())}
           />
-          <button className="btn small" disabled={!id.trim()} onClick={() => setAsked(id.trim())}>
+          <Button disabled={!id.trim()} onPress={() => setAsked(id.trim())}>
             Look up
-          </button>
+          </Button>
         </>
       }
       flush
     >
       {found.error ? (
-        <div className="body">
+        <Body>
           <Fail error={found.error} />
-        </div>
+        </Body>
       ) : null}
-      <div className="scroll">
+      <Scroll>
         <table className="grid">
           <thead>
             <tr>
@@ -198,9 +230,11 @@ function Alerts() {
             {(found.data ?? []).map((a) => (
               <tr key={a.id} className={severity(a.severity)}>
                 <td>
-                  <div>{a.rule_name}</div>
-                  <div className="id">{a.typology?.replace(/_/g, ' ')}</div>
-                  {a.eval_error ? <div className="id">error: {a.eval_error}</div> : null}
+                  <Col gap={2}>
+                    <SizableText size={13}>{a.rule_name}</SizableText>
+                    <Sub>{a.typology?.replace(/_/g, ' ')}</Sub>
+                    {a.eval_error ? <Sub>error: {a.eval_error}</Sub> : null}
+                  </Col>
                 </td>
                 <td>
                   <Badge state={severity(a.severity)}>{a.severity}</Badge>
@@ -215,15 +249,15 @@ function Alerts() {
           </tbody>
         </table>
         {found.busy ? (
-          <div className="empty">
+          <Empty>
             <Spinner />
-          </div>
+          </Empty>
         ) : null}
         {!found.busy && asked && !(found.data ?? []).length ? (
           <Empty>No alert was raised on {asked}.</Empty>
         ) : null}
         {!asked ? <Empty>Enter a transaction id to read its alerts.</Empty> : null}
-      </div>
+      </Scroll>
     </Card>
   )
 }

@@ -13,7 +13,7 @@ import { configureIam, getSession, getUser, handleCallback, logout, startLogin }
 import type { IAMUser } from '@hanzo/iam/browser'
 
 import * as api from './api'
-import { Card, Fail, Icon, Spinner } from './ui'
+import { Badge, Body, Button, Card, Fail, Grow, Icon, Spinner } from './ui'
 
 import { Overview } from './pages/overview'
 import { Cases } from './pages/cases'
@@ -70,9 +70,7 @@ export function App() {
       <div className="gate">
         <Card title="Cannot start">
           <Fail error={boot.error} />
-          <button className="btn" onClick={() => window.location.assign('/')}>
-            Try again
-          </button>
+          <Button onPress={() => window.location.assign('/')}>Try again</Button>
         </Card>
       </div>
     )
@@ -93,7 +91,7 @@ function Gate({ brand }: { brand: api.Brand }) {
   return (
     <div className="gate">
       <Card>
-        <div className="body">
+        <Body centred>
           <span className="glyph">
             <Icon name="shield" />
           </span>
@@ -103,10 +101,11 @@ function Gate({ brand }: { brand: api.Brand }) {
             {brand.display} account to continue.
           </p>
           <Fail error={error} />
-          <button
-            className="btn primary"
+          <Button
+            tone="primary"
+            busy={busy}
             disabled={busy}
-            onClick={() => {
+            onPress={() => {
               setBusy(true)
               startLogin().catch((e: unknown) => {
                 setError(e)
@@ -114,10 +113,9 @@ function Gate({ brand }: { brand: api.Brand }) {
               })
             }}
           >
-            {busy ? <Spinner /> : null}
             Sign in
-          </button>
-        </div>
+          </Button>
+        </Body>
       </Card>
     </div>
   )
@@ -169,7 +167,7 @@ function Shell({ brand }: { brand: api.Brand }) {
       <div className="main">
         <header className="bar">
           <h1>{active?.label ?? 'Not found'}</h1>
-          <div className="grow" />
+          <Grow />
           <Health />
         </header>
         <main className="view">
@@ -209,10 +207,9 @@ function Health() {
   }, [])
   const ok = state?.status === 'ok'
   return (
-    <span className={`badge ${state ? (ok ? 'good' : 'critical') : 'plain'}`} title={state?.records ?? ''}>
-      <i className="dot" aria-hidden="true" />
+    <Badge state={state ? (ok ? 'good' : 'critical') : 'plain'}>
       {state ? (ok ? 'Healthy' : `Degraded: ${state.records}`) : 'Unreachable'}
-    </span>
+    </Badge>
   )
 }
 
@@ -228,10 +225,11 @@ function Health() {
 function SignOut() {
   const [busy, setBusy] = useState(false)
   return (
-    <button
-      className="btn ghost small"
-      disabled={busy}
-      onClick={() => {
+    <Button
+      quiet
+      busy={busy}
+      icon={<Icon name="out" />}
+      onPress={() => {
         setBusy(true)
         // @hanzo/iam owns what signing out means — RP-initiated logout and the
         // local clear, the same in every Hanzo app. When IAM's end-session
@@ -239,8 +237,7 @@ function SignOut() {
         void logout().finally(() => window.location.assign('/'))
       }}
     >
-      {busy ? <Spinner /> : <Icon name="out" />}
       Sign out
-    </button>
+    </Button>
   )
 }

@@ -13,7 +13,29 @@
 import { useState } from 'react'
 
 import * as api from '../api'
-import { Badge, Card, Empty, Fail, Field, Panel, Spinner, severity, useLoad, when } from '../ui'
+import {
+  Badge,
+  Body,
+  Button,
+  Card,
+  Empty,
+  Fail,
+  Field,
+  Input,
+  Kv,
+  Panel,
+  Row,
+  Scroll,
+  Select,
+  SizableText,
+  Spinner,
+  Tab,
+  Tabs,
+  TextArea,
+  severity,
+  useLoad,
+  when,
+} from '../ui'
 
 const statuses = ['all', 'open', 'in_review', 'escalated', 'closed'] as const
 
@@ -40,32 +62,32 @@ export function Cases() {
         title={`${rows.length} case${rows.length === 1 ? '' : 's'}`}
         actions={
           <>
-            <div className="tabs">
+            <Tabs>
               {statuses.map((s) => (
-                <button key={s} aria-pressed={status === s} onClick={() => setStatus(s)}>
+                <Tab key={s} on={status === s} onPress={() => setStatus(s)}>
                   {s.replace(/_/g, ' ')}
-                </button>
+                </Tab>
               ))}
-            </div>
-            <input
+            </Tabs>
+            <Input
               type="text"
               placeholder="Find a case, entity or alert"
               value={query}
               onChange={(e) => setQuery(e.target.value)}
             />
-            <button className="btn ghost small" onClick={() => void list.reload()}>
+            <Button quiet onPress={() => void list.reload()}>
               Refresh
-            </button>
+            </Button>
           </>
         }
         flush
       >
         {list.error ? (
-          <div className="body">
+          <Body>
             <Fail error={list.error} />
-          </div>
+          </Body>
         ) : null}
-        <div className="scroll">
+        <Scroll>
           <table className="grid">
             <thead>
               <tr>
@@ -100,12 +122,12 @@ export function Cases() {
             </tbody>
           </table>
           {list.busy ? (
-            <div className="empty">
+            <Empty>
               <Spinner />
-            </div>
+            </Empty>
           ) : null}
           {!list.busy && !rows.length ? <Empty>No case matches.</Empty> : null}
-        </div>
+        </Scroll>
       </Card>
 
       {open ? (
@@ -140,20 +162,20 @@ function Detail({
       onClose={onClose}
       actions={
         c.status !== 'closed' ? (
-          <button className="btn small" onClick={() => setClosing((v) => !v)}>
+          <Button onPress={() => setClosing((v) => !v)}>
             {closing ? 'Cancel' : 'Resolve'}
-          </button>
+          </Button>
         ) : null
       }
     >
-      <div className="row">
+      <Row wrap>
         <Badge state={severity(c.severity)}>{c.severity}</Badge>
         <Badge state={c.status === 'closed' ? 'plain' : 'warning'}>
           {c.status.replace(/_/g, ' ')}
         </Badge>
-      </div>
+      </Row>
 
-      <dl className="kv">
+      <Kv>
         <dt>Case</dt>
         <dd className="mono">{c.id}</dd>
         <dt>Opened</dt>
@@ -180,37 +202,38 @@ function Detail({
             <dd className="mono">{c.assessment}</dd>
           </>
         ) : null}
-      </dl>
+      </Kv>
 
       {closing ? <Resolve c={c} onDone={onChanged} /> : null}
 
       <Card title="Timeline" flush>
-        <div className="body">
+        <Body>
           <Fail error={timeline.error} />
           {timeline.busy ? <Spinner /> : null}
           {!timeline.busy && !(timeline.data ?? []).length ? (
             <Empty>Nothing has been recorded on this case yet.</Empty>
           ) : null}
-          <div className="timeline">
+          <ol className="timeline">
             {(timeline.data ?? []).map((e) => (
-              <div className="event" key={e.id}>
-                <div className="track">
-                  <i className="pip" />
-                  <i className="line" />
-                </div>
-                <div className="content">
-                  <div className="meta">
-                    <span className="kind">{e.kind.replace(/_/g, ' ')}</span>
-                    <span>{when(e.created_at)}</span>
-                    {e.author_id ? <span className="mono">{e.author_id}</span> : null}
-                  </div>
-                  {e.body ? <div>{e.body}</div> : null}
-                </div>
-              </div>
+              <li className="event" key={e.id}>
+                <i className="pip" aria-hidden="true" />
+                <Row wrap gap={6}>
+                  <SizableText size={11} className="kind">
+                    {e.kind.replace(/_/g, ' ')}
+                  </SizableText>
+                  <SizableText size={11}>{when(e.created_at)}</SizableText>
+                  {e.author_id ? (
+                    <SizableText size={11} className="mono">
+                      {e.author_id}
+                    </SizableText>
+                  ) : null}
+                </Row>
+                {e.body ? <SizableText size={13}>{e.body}</SizableText> : null}
+              </li>
             ))}
-          </div>
+          </ol>
           <AddNote id={c.id} onAdded={() => void timeline.reload()} />
-        </div>
+        </Body>
       </Card>
     </Panel>
   )
@@ -240,32 +263,35 @@ function AddNote({ id, onAdded }: { id: string; onAdded: () => void }) {
     <>
       <Fail error={error} />
       <Field label="Add a note">
-        <textarea
+        <TextArea
           rows={3}
           value={body}
           placeholder="What was checked, what was found, what happens next"
-          onChange={(e) => setBody(e.target.value)}
+          onChangeText={setBody}
         />
       </Field>
-      <div className="row">
-        <button className="btn" disabled={busy || !body.trim()} onClick={() => void submit()}>
-          {busy ? <Spinner /> : null}
+      <Row wrap>
+        <Button
+          busy={busy}
+          disabled={busy || !body.trim()}
+          onPress={() => void submit()}
+        >
           Record note
-        </button>
-      </div>
+        </Button>
+      </Row>
     </>
   )
 }
 
 const resolutions = [
-  { id: 'cleared', label: 'Cleared' },
-  { id: 'false_positive', label: 'False positive' },
-  { id: 'sar_filed', label: 'Report filed' },
-  { id: 'account_frozen', label: 'Account frozen' },
+  { value: 'cleared', label: 'Cleared' },
+  { value: 'false_positive', label: 'False positive' },
+  { value: 'sar_filed', label: 'Report filed' },
+  { value: 'account_frozen', label: 'Account frozen' },
 ]
 
 function Resolve({ c, onDone }: { c: api.Case; onDone: () => void }) {
-  const [resolution, setResolution] = useState(resolutions[0].id)
+  const [resolution, setResolution] = useState(resolutions[0].value)
   const [rationale, setRationale] = useState('')
   const [considered, setConsidered] = useState('')
   const [by, setBy] = useState('')
@@ -297,46 +323,45 @@ function Resolve({ c, onDone }: { c: api.Case; onDone: () => void }) {
     <Card title="Resolve">
       <Fail error={error} />
       <Field label="Resolution">
-        <select value={resolution} onChange={(e) => setResolution(e.target.value)}>
-          {resolutions.map((r) => (
-            <option key={r.id} value={r.id}>
-              {r.label}
-            </option>
-          ))}
-        </select>
+        <Select label="Resolution" value={resolution} options={resolutions} onChange={setResolution} />
       </Field>
       <Field
         label="Rationale"
         hint="Retained with the decision. This is the record that the alert was considered."
       >
-        <textarea
+        <TextArea
           rows={3}
           value={rationale}
-          onChange={(e) => setRationale(e.target.value)}
+          onChangeText={setRationale}
           placeholder="Why this disposal, on what evidence"
         />
       </Field>
       <Field label="Considered" hint="What was examined, one per line.">
-        <textarea
+        <TextArea
           rows={2}
           value={considered}
-          onChange={(e) => setConsidered(e.target.value)}
+          onChangeText={setConsidered}
           placeholder={'account history\nsource of funds document'}
         />
       </Field>
       <Field label="Decided by">
-        <input type="text" value={by} onChange={(e) => setBy(e.target.value)} placeholder="Who is accountable for this decision" />
+        <Input
+          type="text"
+          value={by}
+          onChange={(e) => setBy(e.target.value)}
+          placeholder="Who is accountable for this decision"
+        />
       </Field>
-      <div className="row">
-        <button
-          className="btn primary"
+      <Row wrap>
+        <Button
+          tone="primary"
+          busy={busy}
           disabled={busy || !rationale.trim() || !by.trim()}
-          onClick={() => void submit()}
+          onPress={() => void submit()}
         >
-          {busy ? <Spinner /> : null}
           Close case
-        </button>
-      </div>
+        </Button>
+      </Row>
     </Card>
   )
 }

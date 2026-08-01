@@ -5,10 +5,29 @@
 // both and this shows both, in the same place, at the same size.
 
 import { Fragment } from 'react'
-import { Link } from 'wouter'
 
 import * as api from '../api'
-import { Badge, Card, Empty, Fail, Meter, Spinner, Tile, useLoad, when } from '../ui'
+import {
+  Badge,
+  Body,
+  Button,
+  Card,
+  Empty,
+  Fail,
+  Go,
+  Hint,
+  Kv,
+  Meter,
+  Mono,
+  Row,
+  Scroll,
+  Spinner,
+  Split,
+  Tile,
+  Tiles,
+  useLoad,
+  when,
+} from '../ui'
 
 export function Overview() {
   const cases = useLoad(() => api.cases())
@@ -25,7 +44,7 @@ export function Overview() {
 
   return (
     <>
-      <div className="tiles">
+      <Tiles>
         <Tile
           label="Open cases"
           value={cases.busy ? <Spinner /> : open.length}
@@ -56,19 +75,19 @@ export function Overview() {
           note={model.data?.enabled ? `${model.data.faults ?? 0} faults` : 'rules alone'}
           state={model.data?.enabled ? 'good' : 'warning'}
         />
-      </div>
+      </Tiles>
 
-      <div className="split">
+      <Split>
         <Card
           title="Screening readiness"
           actions={
-            <button className="btn ghost small" onClick={() => void screening.reload()}>
+            <Button quiet onPress={() => void screening.reload()}>
               Refresh
-            </button>
+            </Button>
           }
           flush
         >
-          <div className="scroll">
+          <Scroll>
             <table className="grid">
               <thead>
                 <tr>
@@ -94,24 +113,22 @@ export function Overview() {
               </tbody>
             </table>
             {screening.error ? (
-              <div className="body">
+              <Body>
                 <Fail error={screening.error} />
-              </div>
+              </Body>
             ) : null}
             {!screening.busy && !lists.length ? <Empty>No list has been loaded.</Empty> : null}
-          </div>
+          </Scroll>
         </Card>
 
         <Card
           title="Open cases"
           actions={
-            <Link className="btn ghost small" href="/cases">
-              All cases
-            </Link>
+            <Go href="/cases">All cases</Go>
           }
           flush
         >
-          <div className="scroll">
+          <Scroll>
             <table className="grid">
               <thead>
                 <tr>
@@ -137,29 +154,29 @@ export function Overview() {
               </tbody>
             </table>
             {cases.error ? (
-              <div className="body">
+              <Body>
                 <Fail error={cases.error} />
-              </div>
+              </Body>
             ) : null}
             {!cases.busy && !open.length ? <Empty>Nothing open.</Empty> : null}
-          </div>
+          </Scroll>
         </Card>
-      </div>
+      </Split>
 
       <Card title="Coverage" flush>
-        <div className="body">
-          <div className="row">
+        <Body>
+          <Row wrap>
             {(catalog.data?.typologies ?? []).map((t) => (
               <Badge key={t}>{t.replace(/_/g, ' ')}</Badge>
             ))}
-          </div>
-          <span className="hint">
+          </Row>
+          <Hint>
             {catalog.data?.obligations.length ?? 0} obligations claimed ·{' '}
             {catalog.data?.gaps.length ?? 0} gaps published
-          </span>
+          </Hint>
           <Fail error={catalog.error} />
-        </div>
-        <div className="scroll">
+        </Body>
+        <Scroll>
           <table className="grid">
             <thead>
               <tr>
@@ -180,7 +197,7 @@ export function Overview() {
               ))}
             </tbody>
           </table>
-        </div>
+        </Scroll>
       </Card>
 
       {model.data?.enabled ? <ModelState state={model.data} /> : null}
@@ -194,15 +211,15 @@ function ModelState({ state }: { state: api.Model }) {
   return (
     <Card title="Behavioural model">
       {rate !== null && appetite !== null ? (
-        <div className="row">
-          <span className="hint">alert rate against appetite</span>
+        <Row wrap>
+          <Hint>alert rate against appetite</Hint>
           <Meter value={appetite ? rate / appetite : 0} state={rate > appetite ? 'serious' : 'good'} />
-          <span className="mono">
+          <Mono>
             {(rate * 100).toFixed(2)}% of {(appetite * 100).toFixed(2)}%
-          </span>
-        </div>
+          </Mono>
+        </Row>
       ) : null}
-      <dl className="kv">
+      <Kv>
         {Object.entries(state)
           .filter(([k]) => k !== 'enabled' && k !== 'reason')
           .map(([k, v]) => (
@@ -211,7 +228,7 @@ function ModelState({ state }: { state: api.Model }) {
               <dd className="mono">{show(v)}</dd>
             </Fragment>
           ))}
-      </dl>
+      </Kv>
     </Card>
   )
 }
