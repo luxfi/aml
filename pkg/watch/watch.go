@@ -125,8 +125,10 @@ type Activation struct {
 	// Rung names the declared policy that raised the response, when one did.
 	Rung string `json:"rung,omitempty"`
 	// Streak is how many activations of this rule on this subject fall inside the
-	// widest window any rung declared for it, this one included. Zero when the
-	// tenant has declared no rung, because the count is not computed then.
+	// widest window any rung declared for it, this one included, counted up to
+	// what the deepest rung asks for. Zero when the tenant has declared no rung,
+	// because the count is not computed then — an unread number is not worth an
+	// indexed read per detection.
 	Streak int `json:"streak,omitempty"`
 }
 

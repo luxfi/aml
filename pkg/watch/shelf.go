@@ -225,13 +225,16 @@ func (s *Shelf) apply(org string, a *Activation) error {
 		return nil
 	}
 
-	widest := time.Duration(0)
+	widest, deepest := time.Duration(0), 0
 	for _, r := range rungs {
 		if r.Within.Duration() > widest {
 			widest = r.Within.Duration()
 		}
+		if r.Count > deepest {
+			deepest = r.Count
+		}
 	}
-	prior, err := s.priorInWindow(org, a, widest)
+	prior, err := s.priorInWindow(org, a, widest, deepest)
 	if err != nil {
 		return err
 	}
@@ -293,13 +296,25 @@ func within(prior []Activation, at time.Time, w time.Duration) int {
 }
 
 // priorInWindow reads this rule's earlier activations on this subject, most
-// recent first. Suppressed ones are included in the read and counted, because a
-// streak that ignores what a suppression hid would restart every time somebody
-// suppressed one.
-func (s *Shelf) priorInWindow(org string, a *Activation, w time.Duration) ([]Activation, error) {
+// recent first.
+//
+// It reads exactly as many as the deepest rung needs and no more. That is not an
+// optimisation with an accuracy cost: every rung asks whether the streak has
+// REACHED its count, so a read of `deepest` rows answers every one of them
+// exactly — a subject with more than that in the window satisfies them all either
+// way. Reading a fixed large page instead would cost the ingest path a scan
+// proportional to a busy account's whole history for an answer that stops
+// changing after the first few rows.
+//
+// Suppressed ones are included and counted, because a streak that ignored what a
+// suppression hid would restart every time somebody suppressed one. The upper
+// bound is inclusive: this activation is not written yet, so it cannot match
+// itself, and a strict bound would lose a prior one that landed in the same
+// instant.
+func (s *Shelf) priorInWindow(org string, a *Activation, w time.Duration, deepest int) ([]Activation, error) {
 	filter := fieldRule + " = {:rule} && " + fieldKind + " = {:kind} && " + fieldValue + " = {:value} && " +
-		fieldAt + " >= {:from} && " + fieldAt + " < {:at}"
-	rows, err := activationKind.Find(s.app, org, filter, "-"+fieldAt, MaxLimit,
+		fieldAt + " >= {:from} && " + fieldAt + " <= {:at}"
+	rows, err := activationKind.Find(s.app, org, filter, "-"+fieldAt, deepest,
 		dbx.Params{"rule": a.Rule, "kind": a.Subject.Kind, "value": a.Subject.Value,
 			"from": a.At.Add(-w), "at": a.At})
 	if err != nil {
