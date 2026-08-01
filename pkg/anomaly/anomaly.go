@@ -235,6 +235,34 @@ type Store struct {
 	vel  *velocity.Store
 	mu   sync.RWMutex
 	orgs map[string]*model
+	// adopted is where a tenant's previously adopted state is read back from when
+	// this store has no model for it. See SetAdopted.
+	adopted Adopted
+}
+
+// Adopted answers what a tenant last adopted into its model, if anything.
+//
+// It is the seam that makes an adoption survive the things memory does not. A
+// model lives in this process; the deployment is one replica with a Recreate
+// strategy, so every rollout empties it, and the store holds a bounded number of
+// tenants' models at once, so an idle tenant's can be dropped for a busy one's.
+// Neither of those is a decision anybody took, and both of them silently return a
+// tenant to warming — which reports no alerts, which is what a quiet institution
+// also reports. A control must not be able to go quiet without somebody deciding
+// it should.
+//
+// The implementation is the model plane's durable record of the adoption
+// (models.Shelf.Adopted). It is an interface here rather than an import because
+// the dependency runs one way: the model plane knows about the model, and the
+// model knows nothing about a store.
+type Adopted func(org string) (Snapshot, bool)
+
+// SetAdopted wires the reload. It is called once at start-up, before the store
+// serves anything: this is deployment wiring and not a runtime switch.
+func (s *Store) SetAdopted(fn Adopted) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.adopted = fn
 }
 
 type model struct {
@@ -252,6 +280,15 @@ type model struct {
 	sample  []Sampled
 	at      int
 	updated time.Time
+	// planted is when this tenant's model started, and restored says it started
+	// from an adoption rather than blind. Both are published (see State) because
+	// the events that reset a model — a rollout, an eviction to make room for
+	// another tenant — are nobody's decision, and a control that quietly went
+	// back to warming reports no alerts, which is what a quiet institution also
+	// reports. A model that started this morning under an institution that has
+	// been live for a year is the fact that answers "why did this go quiet".
+	planted  time.Time
+	restored bool
 }
 
 // New builds a Store reading aggregates from vel.
@@ -739,9 +776,29 @@ const sampleDepth = 256
 func (s *Store) model(orgID string) *model {
 	s.mu.RLock()
 	m := s.orgs[orgID]
+	adopted := s.adopted
 	s.mu.RUnlock()
 	if m != nil {
 		return m
+	}
+
+	// No model in memory. Before planting a blind one, ask whether this tenant
+	// adopted state that a rollout or an eviction took away — see Adopted. The
+	// read happens without the lock, because it reaches a store, and it happens
+	// at most once per planting: whichever way it goes, the tenant has a model
+	// afterwards. Two first transactions arriving together may both ask, and both
+	// answers are the same row.
+	if adopted != nil {
+		if snap, ok := adopted(orgID); ok && snap.OrgID == orgID {
+			if err := s.Restore(snap); err == nil {
+				s.mu.RLock()
+				m = s.orgs[orgID]
+				s.mu.RUnlock()
+				if m != nil {
+					return m
+				}
+			}
+		}
 	}
 
 	s.mu.Lock()
@@ -766,6 +823,7 @@ func (s *Store) plant(orgID string, seed uint64) *model {
 		sample:  make([]Sampled, 0, sampleDepth),
 		cut:     1, // admit nothing until a distribution exists
 		updated: time.Now().UTC(),
+		planted: time.Now().UTC(),
 	}
 	for i := range m.trees {
 		m.trees[i] = plant(rng, Dims, s.cfg.Depth)
@@ -842,6 +900,19 @@ type State struct {
 	// Sample is the below-the-line window: transactions scored, not alerted, and
 	// retained for review so the miss rate can be measured.
 	Sample []Sampled `json:"sample"`
+	// Planted is when the model this tenant is being scored by started, and
+	// Restored says it started from an adopted state rather than blind.
+	//
+	// They are published because the two things that reset a model are not
+	// decisions anybody took: this deployment is one replica with a Recreate
+	// strategy, so a rollout empties every model, and the store holds a bounded
+	// number of tenants' models at once, so an idle institution's can be dropped
+	// to make room for a busy one's. Either way the tenant returns to warming,
+	// which reports no alerts — indistinguishable from a quiet institution unless
+	// the model says when it started. An adopted state comes back on its own
+	// (models.Shelf.Adopted) and Restored is how a reviewer sees that it did.
+	Planted  time.Time `json:"planted,omitzero"`
+	Restored bool      `json:"restored,omitempty"`
 }
 
 // State reports the model for one tenant.
@@ -863,6 +934,7 @@ func (s *Store) State(orgID string) State {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	st.Learned, st.Cut, st.Scored, st.Alerted = m.learned, m.cut, m.scored, m.alerted
+	st.Planted, st.Restored = m.planted, m.restored
 	st.Warm = m.learned >= int64(s.cfg.Appetite.Warm)
 	st.Saturated = st.Warm && m.cut >= 1
 	if m.scored > 0 {
@@ -999,6 +1071,7 @@ func (s *Store) Restore(snap Snapshot) error {
 		}
 	}
 	m.learned, m.seen, m.cut = snap.Learned, snap.Seen, snap.Cut
+	m.restored = true
 	copy(m.hist[:], snap.Hist)
 
 	s.mu.Lock()

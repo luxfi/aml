@@ -6,6 +6,8 @@ package watch
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"slices"
 	"sort"
@@ -42,6 +44,7 @@ const (
 	fieldBy         = "by"
 	fieldRung       = "rung"
 	fieldStreak     = "streak"
+	fieldUnchecked  = "unchecked"
 
 	fieldCount   = "count"
 	fieldWithin  = "within"
@@ -71,6 +74,7 @@ var activationKind = store.Kind{
 		&core.TextField{Name: fieldBy},
 		&core.TextField{Name: fieldRung},
 		&core.NumberField{Name: fieldStreak},
+		&core.BoolField{Name: fieldUnchecked},
 	},
 	Indexes: []store.Index{
 		// The feed and the rates: this tenant's activations in time order.
@@ -148,6 +152,24 @@ func (s *Shelf) now() time.Time {
 // The order is the whole design: the row is written first, and only a written row
 // is offered to the live feed. Wired the other way a monitor could show a
 // detection that the store never took, which is worse than showing none.
+//
+// # Exactly one row per firing
+//
+// An activation naming a transaction IS one rule firing on one subject in one
+// transaction, so its identity is that tuple and not a fresh number each time it
+// is offered. Ingest records a transaction, then its alerts, then their
+// activations; anything after the first write that fails answers 503, and a
+// client that retries a 503 offers the same firings again. With a new id each
+// time, the retry writes a second row, and the second row is counted in the
+// streak — so a repetition policy fires on a repeat that never happened, and the
+// rates report a volume the institution did not have.
+//
+// The id is therefore derived from (tenant, transaction, rule, subject) and the
+// row is looked up before anything is computed. Re-offering a firing returns the
+// row that already exists, unchanged, without a second cover check, a second
+// streak read or a second write. An activation with no transaction has no natural
+// identity — it is an operator recording something by hand — and keeps a fresh
+// one.
 func (s *Shelf) Record(ctx context.Context, org string, in *RecordIn) (*Activation, error) {
 	if err := brand.Tenant(org); err != nil {
 		return nil, err
@@ -175,6 +197,16 @@ func (s *Shelf) Record(ctx context.Context, org string, in *RecordIn) (*Activati
 		Score: in.Score, Tx: strings.TrimSpace(in.Tx), Subject: subj,
 		Action: in.Action, Response: in.Action,
 	}
+	if a.Tx != "" {
+		a.ID = firing(org, a.Tx, rule, subj)
+		held, err := s.activation(org, a.ID)
+		if err != nil {
+			return nil, err
+		}
+		if held != nil {
+			return held, nil
+		}
+	}
 
 	// A declared suppression is the first question, because it is a decision
 	// somebody took and it outranks anything computed from repetition.
@@ -187,6 +219,11 @@ func (s *Shelf) Record(ctx context.Context, org string, in *RecordIn) (*Activati
 			a.Suppressed, a.Cause, a.By = true, CauseSuppressed, cover.Suppression.ID
 			a.Response = types.ActionAllow
 		}
+		// An answer over a bounded page of the candidates is an answer, and it is
+		// marked as one. Not covered here means "no suppression was found among
+		// those read", which is a weaker statement than "no suppression covers
+		// this", and the row is the place that difference is kept.
+		a.Unchecked = cover.Partial && !cover.Covered
 	}
 
 	if !a.Suppressed {
@@ -209,6 +246,38 @@ func (s *Shelf) Record(ctx context.Context, org string, in *RecordIn) (*Activati
 	return &a, nil
 }
 
+// firing is the identity of one rule firing on one subject in one transaction.
+//
+// The tenant is in the hash and it is first, so two institutions that share a
+// transaction id — which they will, since ids are the institutions' own — cannot
+// derive the same activation id. It is a hash and not a join of the parts because
+// the parts are customer data: an id that read `hanzo/acme|tx-1|r7|account|GB29…`
+// would put an account number in a primary key, in every index that references
+// it, and in every log line that mentions the row.
+func firing(org, tx, rule string, subj Subject) string {
+	h := sha256.New()
+	for _, part := range []string{org, tx, rule, subj.Kind, subj.Value} {
+		h.Write([]byte(part))
+		h.Write([]byte{0})
+	}
+	return hex.EncodeToString(h.Sum(nil))[:32]
+}
+
+// activation reads one of this tenant's activations by id, or nil if there is
+// none. Scoped by the tenant like every other read here, so an id that exists in
+// another institution's store is not found.
+func (s *Shelf) activation(org, id string) (*Activation, error) {
+	rows, err := activationKind.Find(s.app, org, "id = {:id}", "", 1, dbx.Params{"id": id})
+	if err != nil {
+		return nil, fmt.Errorf("%w: %w", ErrStore, err)
+	}
+	if len(rows) == 0 {
+		return nil, nil
+	}
+	held := readActivation(rows[0])
+	return &held, nil
+}
+
 // apply reads the tenant's rungs for this rule and subject kind, counts the
 // streak once if any of them could bear on it, and moves the response.
 //
@@ -225,15 +294,7 @@ func (s *Shelf) apply(org string, a *Activation) error {
 		return nil
 	}
 
-	widest, deepest := time.Duration(0), 0
-	for _, r := range rungs {
-		if r.Within.Duration() > widest {
-			widest = r.Within.Duration()
-		}
-		if r.Count > deepest {
-			deepest = r.Count
-		}
-	}
+	widest, deepest := bounds(rungs)
 	prior, err := s.priorInWindow(org, a, widest, deepest)
 	if err != nil {
 		return err
@@ -280,6 +341,33 @@ func (s *Shelf) apply(org string, a *Activation) error {
 		return nil
 	}
 	return nil
+}
+
+// bounds is how far back and how deep the streak read goes: the widest window
+// and the deepest count any of these rungs declared, each clamped.
+//
+// The clamp is here as well as at Declare because the two answer different
+// questions. Declare tells a tenant what it may ask for; this is what the INGEST
+// path is guaranteed, whatever a row written before the bound existed happens to
+// say — and the two numbers below become a store LIMIT and a time window
+// directly, so this is the line that makes it a bounded read rather than a claim
+// of one.
+func bounds(rungs []Rung) (widest time.Duration, deepest int) {
+	for _, r := range rungs {
+		if w := r.Within.Duration(); w > widest {
+			widest = w
+		}
+		if r.Count > deepest {
+			deepest = r.Count
+		}
+	}
+	if widest > MaxWithin.Duration() {
+		widest = MaxWithin.Duration()
+	}
+	if deepest > MaxCount {
+		deepest = MaxCount
+	}
+	return widest, deepest
 }
 
 // within counts how many of the prior activations fall inside a window ending at
@@ -443,18 +531,23 @@ func (s *Shelf) Declare(ctx context.Context, org string, in *DeclareIn) (*Rung, 
 		return nil, fmt.Errorf("%w: a rung may only raise a response, and lowering one is a suppression", ErrTo)
 	case in.Count < 2:
 		return nil, fmt.Errorf("%w: %d", ErrCount, in.Count)
+	case in.Count > MaxCount:
+		// The count becomes the limit of a read on the ingest path. See MaxCount.
+		return nil, fmt.Errorf("%w: %d, at most %d", ErrCount, in.Count, MaxCount)
 	case in.Within <= 0:
 		return nil, ErrWithin
+	case in.Within > MaxWithin:
+		return nil, fmt.Errorf("%w: %s, at most %s", ErrWithin, in.Within, MaxWithin)
 	case strings.TrimSpace(in.Reason) == "":
 		return nil, ErrReason
-	case strings.TrimSpace(in.By) == "":
+	case in.By.Trim() == "":
 		return nil, ErrDecider
 	}
 
 	r := Rung{
 		ID: uuid.NewString(), Org: org, Rule: rule, Kind: kindName,
 		Count: in.Count, Within: in.Within, To: in.To,
-		Reason: strings.TrimSpace(in.Reason), By: strings.TrimSpace(in.By), At: s.now(),
+		Reason: strings.TrimSpace(in.Reason), By: in.By.Trim(), At: s.now(),
 	}
 	row, err := rungKind.New(s.app, org)
 	if err != nil {
@@ -476,7 +569,7 @@ func (s *Shelf) Retire(ctx context.Context, org string, in *RetireIn) (*Rung, er
 	if strings.TrimSpace(in.Reason) == "" {
 		return nil, ErrReason
 	}
-	if strings.TrimSpace(in.By) == "" {
+	if in.By.Trim() == "" {
 		return nil, ErrDecider
 	}
 	rows, err := rungKind.Find(s.app, org, "id = {:id}", "", 1, dbx.Params{"id": strings.TrimSpace(in.ID)})
@@ -490,7 +583,7 @@ func (s *Shelf) Retire(ctx context.Context, org string, in *RetireIn) (*Rung, er
 	if !r.Retired.IsZero() {
 		return nil, fmt.Errorf("%w: %s", ErrRetired, r.ID)
 	}
-	r.Retired, r.RetiredBy, r.RetireWhy = s.now(), strings.TrimSpace(in.By), strings.TrimSpace(in.Reason)
+	r.Retired, r.RetiredBy, r.RetireWhy = s.now(), in.By.Trim(), strings.TrimSpace(in.Reason)
 	writeRung(rows[0], r)
 	if err := s.app.Save(rows[0]); err != nil {
 		return nil, fmt.Errorf("%w: %w", ErrStore, err)
@@ -568,6 +661,7 @@ func writeActivation(row *core.Record, a Activation) {
 	row.Set(fieldBy, a.By)
 	row.Set(fieldRung, a.Rung)
 	row.Set(fieldStreak, a.Streak)
+	row.Set(fieldUnchecked, a.Unchecked)
 }
 
 func readActivation(row *core.Record) Activation {
@@ -589,6 +683,7 @@ func readActivation(row *core.Record) Activation {
 		By:         row.GetString(fieldBy),
 		Rung:       row.GetString(fieldRung),
 		Streak:     row.GetInt(fieldStreak),
+		Unchecked:  row.GetBool(fieldUnchecked),
 	}
 }
 

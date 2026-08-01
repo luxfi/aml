@@ -71,6 +71,7 @@ var fitKind = store.Kind{
 	Fields: []core.Field{
 		&core.DateField{Name: fieldAt, Required: true},
 		&core.TextField{Name: fieldBy, Required: true},
+		&core.NumberField{Name: fieldElapsed},
 		&core.JSONField{Name: fieldTopology, Required: true},
 		&core.TextField{Name: fieldDigest, Required: true},
 		&core.JSONField{Name: fieldTrial, Required: true},
@@ -84,6 +85,10 @@ var fitKind = store.Kind{
 	Indexes: []store.Index{
 		{Name: "at", Fields: []string{store.Org, fieldAt}},
 		{Name: "digest", Fields: []string{store.Org, fieldDigest}},
+		// The reload: this tenant's adopted fits, most recent first. A model that
+		// is planted after a rollout or an eviction asks this index what it was
+		// last told to be — see Adopted.
+		{Name: "adopted", Fields: []string{store.Org, fieldAdopted}},
 	},
 }
 
@@ -113,6 +118,10 @@ type Shelf struct {
 	History Source
 	// Model is the live detector. Only Adopt touches it, and only to restore.
 	Model *anomaly.Store
+	// Cores is the share of the machine every study together may take
+	// (topology.Budget). Nil is unbounded and is for tests; a deployment wires
+	// one, because a search that takes every core takes the cores ingest needs.
+	Cores *topology.Budget
 	// Now supplies the instant. Tests set it.
 	Now func() time.Time
 }
@@ -136,7 +145,7 @@ func (s *Shelf) Search(ctx context.Context, org string, in *SearchIn) (*Run, err
 	if err := brand.Tenant(org); err != nil {
 		return nil, err
 	}
-	if strings.TrimSpace(in.By) == "" {
+	if in.By.Trim() == "" {
 		return nil, ErrDecider
 	}
 	if s.History == nil {
@@ -146,13 +155,13 @@ func (s *Shelf) Search(ctx context.Context, org string, in *SearchIn) (*Run, err
 	if err != nil {
 		return nil, err
 	}
-	report, err := topology.Search(ctx, org, h, in.Space, in.Options)
+	report, err := topology.Search(ctx, org, h, in.Space, in.Options, s.Cores)
 	if err != nil {
 		return nil, err
 	}
 
 	run := &Run{
-		ID: uuid.NewString(), Org: org, At: s.now(), By: strings.TrimSpace(in.By),
+		ID: uuid.NewString(), Org: org, At: s.now(), By: in.By.Trim(),
 		Space: in.Space, Options: in.Options, Report: report,
 	}
 	row, err := runKind.New(s.app, org)
@@ -253,7 +262,7 @@ func (s *Shelf) Fit(ctx context.Context, org string, in *FitIn) (*Fit, error) {
 	if err := brand.Tenant(org); err != nil {
 		return nil, err
 	}
-	if strings.TrimSpace(in.By) == "" {
+	if in.By.Trim() == "" {
 		return nil, ErrDecider
 	}
 	if s.History == nil {
@@ -263,13 +272,15 @@ func (s *Shelf) Fit(ctx context.Context, org string, in *FitIn) (*Fit, error) {
 	if err != nil {
 		return nil, err
 	}
-	snap, trial, err := topology.Fit(ctx, org, h, in.Topology, in.Options)
+	started := time.Now()
+	snap, trial, err := topology.Fit(ctx, org, h, in.Topology, in.Options, s.Cores)
 	if err != nil {
 		return nil, err
 	}
 
 	fit := &Fit{
-		ID: uuid.NewString(), Org: org, At: s.now(), By: strings.TrimSpace(in.By),
+		ID: uuid.NewString(), Org: org, At: s.now(), By: in.By.Trim(),
+		Elapsed:  time.Since(started),
 		Topology: in.Topology, Digest: trial.Digest, Trial: trial,
 		Adoptable: s.Model != nil && s.Model.Digest() == trial.Digest,
 	}
@@ -280,6 +291,7 @@ func (s *Shelf) Fit(ctx context.Context, org string, in *FitIn) (*Fit, error) {
 	row.Id = fit.ID
 	row.Set(fieldAt, fit.At)
 	row.Set(fieldBy, fit.By)
+	row.Set(fieldElapsed, int64(fit.Elapsed))
 	row.Set(fieldDigest, fit.Digest)
 	for field, v := range map[string]any{fieldTopology: fit.Topology, fieldTrial: fit.Trial, fieldState: snap} {
 		if err := setJSON(row, field, v); err != nil {
@@ -329,7 +341,7 @@ func (s *Shelf) Adopt(ctx context.Context, org string, in *AdoptIn) (*Fit, error
 	if err := brand.Tenant(org); err != nil {
 		return nil, err
 	}
-	if strings.TrimSpace(in.By) == "" {
+	if in.By.Trim() == "" {
 		return nil, ErrDecider
 	}
 	if s.Model == nil {
@@ -361,7 +373,7 @@ func (s *Shelf) Adopt(ctx context.Context, org string, in *AdoptIn) (*Fit, error
 	}
 
 	row.Set(fieldAdopted, s.now())
-	row.Set(fieldAdoptBy, strings.TrimSpace(in.By))
+	row.Set(fieldAdoptBy, in.By.Trim())
 	row.Set(fieldAdoptWhy, strings.TrimSpace(in.Reason))
 	if err := s.app.Save(row); err != nil {
 		return nil, fmt.Errorf("%w: recording the adoption: %w", ErrStore, err)
@@ -369,9 +381,48 @@ func (s *Shelf) Adopt(ctx context.Context, org string, in *AdoptIn) (*Fit, error
 	return s.readFit(org, row)
 }
 
+// Adopted is this tenant's most recently adopted state, if it has one.
+//
+// It is the reload, and it exists because adoption was the one governed act
+// whose EFFECT was not durable. The fit is a row; the adoption is a row; but what
+// adoption does is install learned state into a model that lives in memory, and
+// memory does not survive a rollout — the deployment is one replica with a
+// Recreate strategy — or an eviction, since the live store holds a bounded number
+// of tenants' models at once. A control that was adopted six months ago and
+// silently returned to warming on a Tuesday deploy is exactly the failure a
+// monitoring programme cannot detect from the outside: it reports no alerts,
+// which is what a quiet institution also reports.
+//
+// So the model asks this when it plants a tenant's model (anomaly.Store.Warm),
+// and a control cannot go quiet without somebody deciding it should. It is per
+// tenant, it reads only that tenant's rows, and it is a read: nothing here
+// installs anything, because the installing is the model's own Restore with the
+// model's own digest and mass checks.
+func (s *Shelf) Adopted(org string) (anomaly.Snapshot, bool) {
+	if err := brand.Tenant(org); err != nil {
+		return anomaly.Snapshot{}, false
+	}
+	rows, err := fitKind.Find(s.app, org, fieldAdopted+" != ''", "-"+fieldAdopted, 1, nil)
+	if err != nil || len(rows) == 0 {
+		return anomaly.Snapshot{}, false
+	}
+	var snap anomaly.Snapshot
+	if err := rows[0].UnmarshalJSONField(fieldState, &snap); err != nil {
+		return anomaly.Snapshot{}, false
+	}
+	// The tenant is the row's own scope. A snapshot whose OrgID says otherwise is
+	// not this tenant's state and is not installed into this tenant's model, for
+	// the same reason Adopt refuses one.
+	if snap.OrgID != org {
+		return anomaly.Snapshot{}, false
+	}
+	return snap, true
+}
+
 func (s *Shelf) readFit(org string, row *core.Record) (*Fit, error) {
 	f := &Fit{
 		ID: row.Id, Org: org, At: row.GetDateTime(fieldAt).Time(), By: row.GetString(fieldBy),
+		Elapsed: time.Duration(row.GetInt(fieldElapsed)),
 		Digest:  row.GetString(fieldDigest),
 		Adopted: row.GetDateTime(fieldAdopted).Time(), AdoptedBy: row.GetString(fieldAdoptBy),
 	}

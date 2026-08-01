@@ -37,6 +37,8 @@ import (
 	"net/netip"
 	"strings"
 	"time"
+
+	"github.com/luxfi/aml/pkg/types"
 )
 
 // Kinds. A list decides one of two things, and which it is has to be declared
@@ -165,33 +167,38 @@ type Value struct {
 // The typed operations. Each op is one In struct and one Out struct, so an HTTP
 // face — this repo's Base router, or a zip typed op in the cloud mount — is a
 // decode, a call, and an encode, with no second copy of the contract to drift.
+//
+// By is a [types.Decider] on each op that records a decision: it carries
+// `json:"-"`, so it is not part of that contract at all, and the transport writes
+// the authenticated subject onto it. A list entry is the reason a payment was
+// refused, and who put it there is not something the caller gets to assert.
 type (
 	// DeclareIn declares a list. It is not an upsert: redeclaring an existing
 	// name with a different class would silently reinterpret every value already
 	// on it.
 	DeclareIn struct {
-		Name  string `json:"name"`
-		Kind  string `json:"kind"`
-		Class string `json:"class"`
-		Note  string `json:"note,omitempty"`
-		By    string `json:"by"`
+		Name  string        `json:"name"`
+		Kind  string        `json:"kind"`
+		Class string        `json:"class"`
+		Note  string        `json:"note,omitempty"`
+		By    types.Decider `json:"-"`
 	}
 
 	// AddIn puts values on a list. Adding a value already there restates it: the
 	// row keeps its identity and takes the new reason, decider and window, which
 	// is also how a removed value is put back.
 	AddIn struct {
-		Name   string  `json:"name"`
-		Values []Value `json:"values"`
-		By     string  `json:"by"`
+		Name   string        `json:"name"`
+		Values []Value       `json:"values"`
+		By     types.Decider `json:"-"`
 	}
 
 	// RemoveIn takes a value off a list. The row stays; it stops matching.
 	RemoveIn struct {
-		Name   string `json:"name"`
-		Value  string `json:"value"`
-		Reason string `json:"reason"`
-		By     string `json:"by"`
+		Name   string        `json:"name"`
+		Value  string        `json:"value"`
+		Reason string        `json:"reason"`
+		By     types.Decider `json:"-"`
 	}
 
 	// EntriesIn reads a list. Live restricts the answer to entries that match

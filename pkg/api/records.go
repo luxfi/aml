@@ -88,12 +88,23 @@ func parties(v *token.Vault, of map[token.Domain]string) ([]string, error) {
 // seal marshals and seals what a record has to be able to reconstruct. The whole
 // body is sealed as one piece, which is what keeps protection at rest from
 // becoming redaction: nothing is dropped and nothing is masked.
-func seal(v *token.Vault, class retention.Class, ref string, of any) ([]byte, error) {
+//
+// It returns the fingerprint alongside, because the ledger identifies a retry by
+// what a record SAYS and a seal says it differently every time — see
+// token.Vault.Fingerprint and retention.Record.Fingerprint. Sealing and naming
+// the same bytes happens here, once, so the two cannot be computed over different
+// things.
+func seal(v *token.Vault, class retention.Class, ref string, of any) (body []byte, mark string, err error) {
 	plain, err := json.Marshal(of)
 	if err != nil {
-		return nil, fmt.Errorf("marshal record body: %w", err)
+		return nil, "", fmt.Errorf("marshal record body: %w", err)
 	}
-	return v.Seal(slot(class, ref), plain)
+	at := slot(class, ref)
+	sealed, err := v.Seal(at, plain)
+	if err != nil {
+		return nil, "", err
+	}
+	return sealed, v.Fingerprint(at, plain), nil
 }
 
 // retain writes the record for a transaction the engine has just evaluated.
@@ -140,11 +151,11 @@ func (h *Handler) retain(v *token.Vault, tx types.Transaction, entity types.Enti
 		}
 	}
 
-	body, err := seal(v, record.Class, record.Ref, types.EvalContext{Tx: tx, Entity: entity})
+	body, mark, err := seal(v, record.Class, record.Ref, types.EvalContext{Tx: tx, Entity: entity})
 	if err != nil {
 		return "", err
 	}
-	record.Body = body
+	record.Body, record.Fingerprint = body, mark
 
 	return h.Records.Retain(record)
 }
@@ -260,7 +271,7 @@ func (h *Handler) assess(v *token.Vault, orgID string, c *types.Case, in resolut
 	}
 	decided := time.Now().UTC()
 
-	body, err := seal(v, retention.ClassAssessment, c.ID, map[string]any{
+	body, mark, err := seal(v, retention.ClassAssessment, c.ID, map[string]any{
 		"case":       c,
 		"resolution": in.Resolution,
 	})
@@ -269,20 +280,21 @@ func (h *Handler) assess(v *token.Vault, orgID string, c *types.Case, in resolut
 	}
 
 	return h.Records.Retain(retention.Record{
-		Org:      orgID,
-		Class:    retention.ClassAssessment,
-		Trigger:  retention.TriggerOccasional,
-		Ref:      c.ID,
-		Parties:  party,
-		Occurred: decided,
-		Body:     body,
+		Org:         orgID,
+		Class:       retention.ClassAssessment,
+		Trigger:     retention.TriggerOccasional,
+		Ref:         c.ID,
+		Parties:     party,
+		Occurred:    decided,
+		Body:        body,
+		Fingerprint: mark,
 		Assessment: &retention.Assessment{
 			Alerts:     c.AlertIDs,
 			Case:       c.ID,
 			Considered: in.Considered,
 			Result:     result,
 			Rationale:  in.Rationale,
-			By:         in.By,
+			By:         in.By.Trim(),
 			At:         decided,
 		},
 	})

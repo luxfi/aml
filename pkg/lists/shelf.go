@@ -130,7 +130,7 @@ func (s *Shelf) Declare(ctx context.Context, org string, in *DeclareIn) (*List, 
 		return nil, fmt.Errorf("%w: %q", ErrKind, in.Kind)
 	case !known(Classes, in.Class):
 		return nil, fmt.Errorf("%w: %q", ErrClass, in.Class)
-	case trim(in.By) == "":
+	case in.By.Trim() == "":
 		return nil, ErrDecider
 	}
 	if _, err := s.list(org, name); err == nil {
@@ -144,7 +144,7 @@ func (s *Shelf) Declare(ctx context.Context, org string, in *DeclareIn) (*List, 
 	if err != nil {
 		return nil, fmt.Errorf("%w: %w", ErrStore, err)
 	}
-	l := List{Org: org, Name: name, Kind: in.Kind, Class: in.Class, Note: trim(in.Note), By: trim(in.By), Created: at, Updated: at}
+	l := List{Org: org, Name: name, Kind: in.Kind, Class: in.Class, Note: trim(in.Note), By: in.By.Trim(), Created: at, Updated: at}
 	writeList(row, l)
 	if err := s.app.Save(row); err != nil {
 		return nil, fmt.Errorf("%w: declaring %s: %w", ErrStore, name, err)
@@ -174,7 +174,7 @@ func (s *Shelf) Add(ctx context.Context, org string, in *AddIn) (*List, error) {
 	if err := brand.Tenant(org); err != nil {
 		return nil, err
 	}
-	if trim(in.By) == "" {
+	if in.By.Trim() == "" {
 		return nil, ErrDecider
 	}
 	if len(in.Values) == 0 {
@@ -209,7 +209,7 @@ func (s *Shelf) Add(ctx context.Context, org string, in *AddIn) (*List, error) {
 	}
 
 	at := s.now()
-	by := trim(in.By)
+	by := in.By.Trim()
 	var updated List
 	// The counters are read and written INSIDE the transaction, from the row, so a
 	// transaction the store retries counts once. Carried in from the read above
@@ -276,7 +276,7 @@ func (s *Shelf) Remove(ctx context.Context, org string, in *RemoveIn) (*List, er
 	if err := brand.Tenant(org); err != nil {
 		return nil, err
 	}
-	if trim(in.By) == "" {
+	if in.By.Trim() == "" {
 		return nil, ErrDecider
 	}
 	if trim(in.Reason) == "" {
@@ -312,7 +312,7 @@ func (s *Shelf) Remove(ctx context.Context, org string, in *RemoveIn) (*List, er
 			return fmt.Errorf("%w: %s on %s", ErrRetired, norm, l.Name)
 		}
 		row.Set(fieldOff, at)
-		row.Set(fieldOffBy, trim(in.By))
+		row.Set(fieldOffBy, in.By.Trim())
 		row.Set(fieldOffWhy, trim(in.Reason))
 		if serr := tx.Save(row); serr != nil {
 			return fmt.Errorf("%w: removing %s from %s: %w", ErrStore, norm, l.Name, serr)

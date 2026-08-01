@@ -114,14 +114,14 @@ func fracs(n int) []float64 {
 // exactly what a quiet shape looks like, and choosing a model on the strength of
 // an empty replay is the failure this package exists to prevent.
 func TestEmptyHistoryIsRefused(t *testing.T) {
-	_, err := Search(context.Background(), acme, replay.Slice{}, small(), Options{Seed: 7})
+	_, err := Search(context.Background(), acme, replay.Slice{}, small(), Options{Seed: 7}, nil)
 	if !errors.Is(err, ErrEmpty) {
 		t.Fatalf("an empty history must be refused, got %v", err)
 	}
-	if _, err := Search(context.Background(), "", stream(10, false), small(), Options{Seed: 7}); !errors.Is(err, ErrOrg) {
+	if _, err := Search(context.Background(), "", stream(10, false), small(), Options{Seed: 7}, nil); !errors.Is(err, ErrOrg) {
 		t.Fatalf("a search with no tenant studies nobody's geometry, got %v", err)
 	}
-	if _, err := Search(context.Background(), acme, nil, small(), Options{Seed: 7}); !errors.Is(err, ErrNoHistory) {
+	if _, err := Search(context.Background(), acme, nil, small(), Options{Seed: 7}, nil); !errors.Is(err, ErrNoHistory) {
 		t.Fatalf("no history must be refused, got %v", err)
 	}
 }
@@ -130,7 +130,7 @@ func TestEmptyHistoryIsRefused(t *testing.T) {
 // being a preference. Ranking needs an outcome, and the only honest one is whether
 // a shape separates what a human judged suspicious from what a human dismissed.
 func TestNoWinnerWithoutJudgement(t *testing.T) {
-	report, err := Search(context.Background(), acme, stream(400, false), small(), Options{Seed: 7})
+	report, err := Search(context.Background(), acme, stream(400, false), small(), Options{Seed: 7}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -151,7 +151,7 @@ func TestNoWinnerWithoutJudgement(t *testing.T) {
 // TestSearchReportsTheCurveAndTheAppetite — what a console renders and what a
 // reviewer reads.
 func TestSearchReportsTheCurveAndTheAppetite(t *testing.T) {
-	report, err := Search(context.Background(), acme, stream(600, true), small(), Options{Seed: 7, Curve: 8})
+	report, err := Search(context.Background(), acme, stream(600, true), small(), Options{Seed: 7, Curve: 8}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -191,11 +191,11 @@ func TestSearchReportsTheCurveAndTheAppetite(t *testing.T) {
 // TestSearchIsReproducible. A recommendation nobody can re-run is one nobody can
 // check.
 func TestSearchIsReproducible(t *testing.T) {
-	a, err := Search(context.Background(), acme, stream(400, true), small(), Options{Seed: 11})
+	a, err := Search(context.Background(), acme, stream(400, true), small(), Options{Seed: 11}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	b, err := Search(context.Background(), acme, stream(400, true), small(), Options{Seed: 11})
+	b, err := Search(context.Background(), acme, stream(400, true), small(), Options{Seed: 11}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -207,11 +207,11 @@ func TestSearchIsReproducible(t *testing.T) {
 // TestGeometryIsTheTenants. The detector is seeded from the tenant key, so a
 // search run under a different key studies a different set of trees.
 func TestGeometryIsTheTenants(t *testing.T) {
-	mine, err := Search(context.Background(), acme, stream(400, true), small(), Options{Seed: 11})
+	mine, err := Search(context.Background(), acme, stream(400, true), small(), Options{Seed: 11}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	theirs, err := Search(context.Background(), other, stream(400, true), small(), Options{Seed: 11})
+	theirs, err := Search(context.Background(), other, stream(400, true), small(), Options{Seed: 11}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -230,7 +230,7 @@ func TestGeometryIsTheTenants(t *testing.T) {
 // upward every time a search runs.
 func TestWinnerPrefersSeparationThenTheSmallerModel(t *testing.T) {
 	space := Space{Trees: []int{8, 24}, Depth: []int{6}, Window: []int{16}, Blend: []float64{0.25}, Review: []float64{0.02}}
-	report, err := Search(context.Background(), acme, stream(600, true), space, Options{Seed: 7})
+	report, err := Search(context.Background(), acme, stream(600, true), space, Options{Seed: 7}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -279,7 +279,7 @@ func TestAUCIsHalfWhenNothingIsSeparated(t *testing.T) {
 // underneath it by restoring a file.
 func TestFitProducesRestorableState(t *testing.T) {
 	shape := Topology{Trees: 8, Depth: 6, Window: 16, Blend: 0.25, Review: 0.02}
-	snap, trial, err := Fit(context.Background(), acme, stream(600, true), shape, Options{Seed: 7})
+	snap, trial, err := Fit(context.Background(), acme, stream(600, true), shape, Options{Seed: 7}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

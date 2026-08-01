@@ -33,6 +33,8 @@ package suppress
 import (
 	"errors"
 	"time"
+
+	"github.com/luxfi/aml/pkg/types"
 )
 
 // Errors.
@@ -45,6 +47,7 @@ var (
 	ErrWindow  = errors.New("suppress: the window has already closed, so the suppression would never apply")
 	ErrNotHere = errors.New("suppress: no such suppression")
 	ErrLifted  = errors.New("suppress: already lifted")
+	ErrCrowded = errors.New("suppress: too many suppressions in force on one rule")
 	ErrStore   = errors.New("suppress: store")
 )
 
@@ -115,23 +118,28 @@ func (s Suppression) Reach() int {
 // The typed operations.
 type (
 	// SuppressIn declares a suppression.
+	//
+	// By is a [types.Decider]: it is not on the wire, and the transport writes the
+	// authenticated subject onto it. Suppression is the control whose effect is
+	// silence, so of everything here it is the one whose "on whose authority"
+	// must not be a string the caller chose.
 	SuppressIn struct {
-		Rule   string    `json:"rule,omitempty"`
-		Kind   string    `json:"kind,omitempty"`
-		Value  string    `json:"value,omitempty"`
-		Reason string    `json:"reason"`
-		By     string    `json:"by"`
-		From   time.Time `json:"from,omitzero"`
-		Until  time.Time `json:"until,omitzero"`
+		Rule   string        `json:"rule,omitempty"`
+		Kind   string        `json:"kind,omitempty"`
+		Value  string        `json:"value,omitempty"`
+		Reason string        `json:"reason"`
+		By     types.Decider `json:"-"`
+		From   time.Time     `json:"from,omitzero"`
+		Until  time.Time     `json:"until,omitzero"`
 	}
 
 	// LiftIn ends a suppression. It carries its own reason and decider: ending a
 	// suppression is as much a decision as starting one, and an alert volume that
 	// jumps needs an entry saying why.
 	LiftIn struct {
-		ID     string `json:"id"`
-		Reason string `json:"reason"`
-		By     string `json:"by"`
+		ID     string        `json:"id"`
+		Reason string        `json:"reason"`
+		By     types.Decider `json:"-"`
 	}
 
 	// LedgerIn reads a tenant's suppressions. InForce restricts the answer to the
@@ -167,6 +175,11 @@ type (
 	Cover struct {
 		Covered     bool         `json:"covered"`
 		Suppression *Suppression `json:"suppression,omitempty"`
+		// Partial says the candidates were more than one read may examine, so this
+		// answer is over a bounded page of them and a narrower suppression may
+		// exist beyond it. It is published rather than absorbed, and it is
+		// published rather than raised as an error — see Cover.
+		Partial bool `json:"partial,omitempty"`
 	}
 )
 

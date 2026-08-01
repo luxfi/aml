@@ -335,6 +335,15 @@ const (
 	DefaultWorkers = 4
 )
 
+// MaxWorkers is the widest one study may run, however many the caller asks for.
+//
+// Workers is a caller-supplied number on the wire, and the grid holds up to
+// MaxTrials candidates, so without a ceiling one request names 256 goroutines
+// each replaying fifty thousand events. The ceiling is a bound on ONE study; the
+// bound across every study at once is Budget, which is what keeps the rest of the
+// machine for ingest.
+const MaxWorkers = 4
+
 // auc is the area under the ROC curve of scores against a binary label, by the
 // rank-sum identity: AUC = (R₁ − n₁(n₁+1)/2) / (n₁n₀), where R₁ is the sum of the
 // positives' ranks.

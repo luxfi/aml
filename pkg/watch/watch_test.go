@@ -576,3 +576,257 @@ func TestRestart(t *testing.T) {
 		t.Fatal("a third tenant can read activations after the restart")
 	}
 }
+
+// TestARetriedFiringIsOneActivation.
+//
+// Ingest writes a transaction, then its alerts, then their activations. Anything
+// after the first write that fails answers 503, and a client that retries a 503
+// offers the same firings again. With a fresh id each time the retry writes a
+// SECOND row for the same firing, and the second row is counted in the streak —
+// so a repetition policy fires on a repeat that never happened and the rates
+// report a volume the institution did not have.
+func TestARetriedFiringIsOneActivation(t *testing.T) {
+	s, _ := shelf(t)
+	ctx := context.Background()
+	offer := func() *Activation {
+		a, err := s.Record(ctx, acme, &RecordIn{
+			Rule: "ctr", Action: types.ActionReport, Tx: "tx-1",
+			Subject: Subject{Kind: "account", Value: "acct-1"}, At: noon,
+		})
+		if err != nil {
+			t.Fatalf("record: %v", err)
+		}
+		return a
+	}
+
+	first := offer()
+	again := offer()
+	if first.ID != again.ID {
+		t.Fatalf("the same firing was recorded twice: %s and %s", first.ID, again.ID)
+	}
+	if again.Streak != first.Streak {
+		t.Fatalf("the retry moved the streak from %d to %d", first.Streak, again.Streak)
+	}
+
+	feed, err := s.Feed(ctx, acme, &FeedIn{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(feed.Activations) != 1 {
+		t.Fatalf("%d rows for one firing: %+v", len(feed.Activations), feed.Activations)
+	}
+	rates, err := s.Rates(ctx, acme, &RatesIn{Since: noon.Add(-time.Hour), Until: noon.Add(time.Hour)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rates.Rules) != 1 || rates.Rules[0].Fired != 1 {
+		t.Fatalf("the rate counted the retry: %+v", rates.Rules)
+	}
+}
+
+// TestARetryDoesNotFoldAgainstItself. The sharpest form of the double count: a
+// fold rung reads the streak, so a duplicated row makes the retry of the FIRST
+// firing look like a repeat of itself and silences it.
+func TestARetryDoesNotFoldAgainstItself(t *testing.T) {
+	s, _ := shelf(t)
+	ctx := context.Background()
+	if _, err := s.Declare(ctx, acme, &DeclareIn{
+		Rule: "ctr", Kind: "account", Count: 2, Within: Span(time.Hour), To: Fold,
+		Reason: "one alert an hour per account is enough", By: "a.mensah",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	in := RecordIn{
+		Rule: "ctr", Action: types.ActionReport, Tx: "tx-1",
+		Subject: Subject{Kind: "account", Value: "acct-1"}, At: noon,
+	}
+	first, err := s.Record(ctx, acme, &in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.Suppressed {
+		t.Fatalf("the first firing folded against nothing: %+v", first)
+	}
+	retry, err := s.Record(ctx, acme, &in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if retry.Suppressed || retry.Cause == CauseDuplicate {
+		t.Fatalf("a retry of one firing folded against itself, so the alert went quiet: %+v", retry)
+	}
+
+	// A genuinely different transaction on the same account still folds, so the
+	// rung is not broken by the fix.
+	second := in
+	second.Tx, second.At = "tx-2", noon.Add(time.Minute)
+	repeat, err := s.Record(ctx, acme, &second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !repeat.Suppressed || repeat.Cause != CauseDuplicate {
+		t.Fatalf("a real repeat must still fold: %+v", repeat)
+	}
+}
+
+// TestAFiringIdentityIsPerTenant. The tenant is in the hash and it is first, so
+// two institutions recording the same transaction id, rule and account do not
+// collide — and neither can read or overwrite the other's row.
+func TestAFiringIdentityIsPerTenant(t *testing.T) {
+	s, _ := shelf(t)
+	ctx := context.Background()
+	in := RecordIn{
+		Rule: "ctr", Action: types.ActionReport, Tx: "tx-1",
+		Subject: Subject{Kind: "account", Value: "acct-1"}, At: noon,
+	}
+	mine, err := s.Record(ctx, acme, &in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The same org name under another brand, which is the collision the tenant
+	// key exists to prevent, arrived at through the activation id.
+	theirs, err := s.Record(ctx, other, &in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if mine.ID == theirs.ID {
+		t.Fatal("two tenants' firings share an id: one institution's retry would return the other's row")
+	}
+	for _, tc := range []struct{ org, id string }{{acme, theirs.ID}, {other, mine.ID}} {
+		held, err := s.activation(tc.org, tc.id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if held != nil {
+			t.Fatalf("%s read another tenant's activation by id: %+v", tc.org, held)
+		}
+	}
+	// And the id carries no customer data, however the parts were written.
+	if id := firing(acme, "tx-1", "ctr", Subject{Kind: "account", Value: "GB29NWBK60161331926819"}); strings.Contains(id, "GB29") {
+		t.Fatalf("the activation id carries the subject in the clear: %s", id)
+	}
+}
+
+// TestAnActivationWithNoTransactionKeepsItsOwnIdentity. An operator recording a
+// detection by hand has no natural key, and two of them are two events.
+func TestAnActivationWithNoTransactionKeepsItsOwnIdentity(t *testing.T) {
+	s, _ := shelf(t)
+	ctx := context.Background()
+	in := RecordIn{Rule: "manual", Action: types.ActionReview,
+		Subject: Subject{Kind: "account", Value: "acct-1"}, At: noon}
+	first, err := s.Record(ctx, acme, &in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := s.Record(ctx, acme, &in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.ID == second.ID {
+		t.Fatal("two hand-recorded detections were collapsed into one")
+	}
+}
+
+// TestARungIsBounded.
+//
+// A rung's Count becomes the LIMIT of a read on the ingest path and its Within
+// becomes that read's window, so an unbounded declaration is an unbounded read
+// per activation — asked for by one operator request, paid for by every payment.
+func TestARungIsBounded(t *testing.T) {
+	s, _ := shelf(t)
+	ctx := context.Background()
+	base := DeclareIn{
+		Rule: "ctr", Kind: "account", Count: 2, Within: Span(time.Hour), To: types.ActionBlock,
+		Reason: "two in an hour", By: "a.mensah",
+	}
+
+	deep := base
+	deep.Count = MaxCount + 1
+	if _, err := s.Declare(ctx, acme, &deep); !errors.Is(err, ErrCount) {
+		t.Fatalf("a rung counting past the bound: %v, want ErrCount", err)
+	}
+	huge := base
+	huge.Count = 10_000_000
+	if _, err := s.Declare(ctx, acme, &huge); !errors.Is(err, ErrCount) {
+		t.Fatalf("a rung counting ten million: %v, want ErrCount", err)
+	}
+	wide := base
+	wide.Within = MaxWithin + Span(time.Second)
+	if _, err := s.Declare(ctx, acme, &wide); !errors.Is(err, ErrWithin) {
+		t.Fatalf("a rung spanning past the bound: %v, want ErrWithin", err)
+	}
+	// The bounds themselves are declarable, so the refusals above are about being
+	// PAST them and not about the whole range being refused.
+	at := base
+	at.Count, at.Within = MaxCount, MaxWithin
+	if _, err := s.Declare(ctx, acme, &at); err != nil {
+		t.Fatalf("a rung at the bound must be declarable: %v", err)
+	}
+}
+
+// TestTheStreakReadIsBoundedWhateverTheRowsSay.
+//
+// A bound introduced after a row was written does not reach that row, and the
+// ingest path's guarantee cannot rest on what is in the store. This is the
+// arithmetic that turns rungs into a LIMIT and a window, tested directly.
+func TestTheStreakReadIsBoundedWhateverTheRowsSay(t *testing.T) {
+	widest, deepest := bounds([]Rung{
+		{Count: 3, Within: Span(time.Hour)},
+		{Count: 10_000_000, Within: Span(4000 * 24 * time.Hour)}, // a row from before the bound
+	})
+	if deepest != MaxCount {
+		t.Fatalf("the read would ask for %d rows, want at most %d", deepest, MaxCount)
+	}
+	if widest != MaxWithin.Duration() {
+		t.Fatalf("the read would span %s, want at most %s", widest, MaxWithin)
+	}
+	// And ordinary rungs are untouched: the clamp is a ceiling, not a floor.
+	widest, deepest = bounds([]Rung{{Count: 3, Within: Span(time.Hour)}, {Count: 5, Within: Span(2 * time.Hour)}})
+	if deepest != 5 || widest != 2*time.Hour {
+		t.Fatalf("widest=%s deepest=%d, want the rungs' own", widest, deepest)
+	}
+}
+
+// TestAnIncompleteCoverIsMarkedAndNeverRefusesIngest.
+//
+// The suppression plane answers over a bounded page when a tenant has crowded one
+// rule. That is an answer and the row says so: "not covered" then means "none was
+// found among those read", which is weaker, and the difference is the sort of
+// thing a monitoring plane must not absorb silently.
+func TestAnIncompleteCoverIsMarkedAndNeverRefusesIngest(t *testing.T) {
+	s, _ := shelf(t)
+	s.Cover = partial{}
+	a, err := s.Record(context.Background(), acme, &RecordIn{
+		Rule: "ctr", Action: types.ActionReport, Tx: "tx-1",
+		Subject: Subject{Kind: "account", Value: "acct-1"}, At: noon,
+	})
+	if err != nil {
+		t.Fatalf("an incomplete cover check must not fail the ingest path: %v", err)
+	}
+	if a.Suppressed || a.Response != types.ActionReport {
+		t.Fatalf("an unfound suppression must produce noise and not silence: %+v", a)
+	}
+	if !a.Unchecked {
+		t.Fatal("the row does not record that its suppression check was incomplete")
+	}
+
+	// An ordinary complete answer carries no mark, so the mark means something.
+	s.Cover = nil
+	b, err := s.Record(context.Background(), acme, &RecordIn{
+		Rule: "ctr", Action: types.ActionReport, Tx: "tx-2",
+		Subject: Subject{Kind: "account", Value: "acct-1"}, At: noon,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if b.Unchecked {
+		t.Fatalf("an activation with no crowding was marked: %+v", b)
+	}
+}
+
+// partial is a suppression plane whose answer is over a page of the candidates.
+type partial struct{}
+
+func (partial) Cover(context.Context, string, *suppress.CoverIn) (*suppress.Cover, error) {
+	return &suppress.Cover{Partial: true}, nil
+}

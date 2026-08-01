@@ -124,6 +124,13 @@ type Activation struct {
 
 	// Rung names the declared policy that raised the response, when one did.
 	Rung string `json:"rung,omitempty"`
+	// Unchecked marks an activation whose suppression check could not be answered
+	// over every candidate, so it reached a queue that a suppression beyond the
+	// bound might have kept it out of. It is a marking for the same reason
+	// Suppressed is one: a plane that silently absorbed an incomplete governance
+	// answer could not tell anybody how often it had. Querying for it is how an
+	// institution finds every activation whose answer was partial.
+	Unchecked bool `json:"unchecked,omitempty"`
 	// Streak is how many activations of this rule on this subject fall inside the
 	// widest window any rung declared for it, this one included, counted up to
 	// what the deepest rung asks for. Zero when the tenant has declared no rung,
@@ -234,21 +241,23 @@ type (
 	}
 
 	// DeclareIn declares a rung.
+	//
+	// By is a [types.Decider]: not on the wire, written from the credential.
 	DeclareIn struct {
-		Rule   string `json:"rule"`
-		Kind   string `json:"kind"`
-		Count  int    `json:"count"`
-		Within Span   `json:"within"`
-		To     string `json:"to"`
-		Reason string `json:"reason"`
-		By     string `json:"by"`
+		Rule   string        `json:"rule"`
+		Kind   string        `json:"kind"`
+		Count  int           `json:"count"`
+		Within Span          `json:"within"`
+		To     string        `json:"to"`
+		Reason string        `json:"reason"`
+		By     types.Decider `json:"-"`
 	}
 
 	// RetireIn ends a rung. The row stays.
 	RetireIn struct {
-		ID     string `json:"id"`
-		Reason string `json:"reason"`
-		By     string `json:"by"`
+		ID     string        `json:"id"`
+		Reason string        `json:"reason"`
+		By     types.Decider `json:"-"`
 	}
 
 	// LadderIn reads a tenant's rungs.
@@ -278,6 +287,28 @@ const (
 // no correct partial answer, so reaching it is reported on the answer rather than
 // hidden inside it.
 const MaxExamined = 50_000
+
+// MaxCount and MaxWithin bound what a rung may ask for.
+//
+// A rung's Count becomes the LIMIT of a read on the INGEST path: the streak query
+// reads exactly as many prior activations as the deepest declared rung needs (see
+// priorInWindow), which is a bounded read only if the declaration is bounded.
+// Undeclared, a tenant asking for a count of ten million turns every activation
+// of that rule into a ten-million-row scan of its own store, on the path that
+// must answer before a payment can be taken. The window is bounded for the same
+// reason from the other side: a span of a decade is a scan over the whole plane.
+//
+// Both are refused at declaration, where a refusal costs one operator request,
+// and both are clamped again where they are USED, because a bound introduced
+// after a row was written does not reach that row.
+//
+// The numbers are what a repetition policy plausibly means. A rung that fires on
+// the thousandth repeat inside thirty days is already past the point where the
+// answer is "this rule is wrong", not "escalate".
+const (
+	MaxCount  = 1000
+	MaxWithin = Span(30 * 24 * time.Hour)
+)
 
 // actions are the responses a rung may name, alongside Fold.
 var actions = []string{types.ActionAllow, types.ActionFlag, types.ActionReview, types.ActionReport, types.ActionBlock}

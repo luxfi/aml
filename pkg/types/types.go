@@ -18,6 +18,7 @@ package types
 
 import (
 	"encoding/json"
+	"strings"
 	"time"
 
 	"github.com/luxfi/aml/pkg/standard"
@@ -112,6 +113,31 @@ const (
 	WebhookTradeExecuted = "trade.executed"
 )
 
+// Decider names whose decision a governed record carries.
+//
+// Every control an institution can turn off — a list entry, a suppression, a
+// rung, an adopted model — is asked for a reason and a decider, so that a
+// supervisor asking "who turned this off" has an answer. That answer is worth
+// nothing if the caller writes it: free text in a request body attributes the
+// decision to whoever the caller says, including nobody and including somebody
+// else.
+//
+// So it is a DISTINCT TYPE, and it is the one input a caller does not supply.
+// Fields of this type carry `json:"-"`: the wire has no name for one, the query
+// binder skips it, and the transport writes the authenticated subject onto it
+// after the body is decoded and after the path parameters are overlaid
+// (pkg/api/typed.go, decide). A caller that puts `"by":"the head of compliance"`
+// in a body has written a field that does not exist.
+//
+// The value is the token's SUBJECT rather than a display name, because
+// attribution has to survive a rename: a username can be reassigned to another
+// person and a subject cannot. A console resolves it to a name through IAM.
+type Decider string
+
+// Trim is the decider with surrounding space removed, as a plain string. The
+// planes record text, and this is the one place the conversion happens.
+func (d Decider) Trim() string { return strings.TrimSpace(string(d)) }
+
 // Transaction is an incoming transaction event for AML evaluation.
 type Transaction struct {
 	ID           string  `json:"id"`
@@ -133,14 +159,23 @@ type Transaction struct {
 	// screens and scopes rules by. The previous ingestion path synthesised a
 	// customer from the identifier alone, so every screening rule and every
 	// jurisdiction rule evaluated against an empty name and an empty country.
-	CustomerName         string          `json:"customer_name,omitempty"`
-	CustomerJurisdiction string          `json:"customer_jurisdiction,omitempty"`
-	IPAddress            string          `json:"ip_address,omitempty"`
-	DeviceFingerprint    string          `json:"device_fingerprint,omitempty"`
-	Timestamp            time.Time       `json:"timestamp"`
-	Raw                  json.RawMessage `json:"raw,omitempty"`
-	CreatedAt            time.Time       `json:"created_at"`
-	UpdatedAt            time.Time       `json:"updated_at"`
+	CustomerName         string `json:"customer_name,omitempty"`
+	CustomerJurisdiction string `json:"customer_jurisdiction,omitempty"`
+	IPAddress            string `json:"ip_address,omitempty"`
+	DeviceFingerprint    string `json:"device_fingerprint,omitempty"`
+	// Timestamp is when the transaction happened, and it is the ONLY clock a
+	// transaction carries.
+	//
+	// There was a second one — a created/updated pair the ingest path stamped
+	// from its own wall clock — and it made a retry impossible to recognise. A
+	// retained record is identified by what it SAYS, so a fact restamped on
+	// arrival is a different fact every time it arrives: the second submission of
+	// one transaction read as a conflicting second transaction under one id, and
+	// every further retry conflicted again. When a record was received is the
+	// ledger's own question and the ledger answers it (retention.Record.Written);
+	// a transaction states when it happened and nothing else.
+	Timestamp time.Time       `json:"timestamp"`
+	Raw       json.RawMessage `json:"raw,omitempty"`
 	// USD is Notional converted at ingest and set by the engine on the way in; a
 	// client-supplied value is overwritten. It is frozen at ingest rather than
 	// converted on read so a threshold applied over a window of past transactions
