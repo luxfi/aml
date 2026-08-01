@@ -28,14 +28,19 @@ import (
 	"github.com/luxfi/aml/pkg/anomaly"
 	"github.com/luxfi/aml/pkg/api"
 	"github.com/luxfi/aml/pkg/cases"
+	"github.com/luxfi/aml/pkg/dictionary"
 	"github.com/luxfi/aml/pkg/engine"
 	"github.com/luxfi/aml/pkg/history"
+	"github.com/luxfi/aml/pkg/lists"
+	"github.com/luxfi/aml/pkg/models"
 	"github.com/luxfi/aml/pkg/reference"
 	"github.com/luxfi/aml/pkg/retention"
 	"github.com/luxfi/aml/pkg/rules"
 	"github.com/luxfi/aml/pkg/screen"
+	"github.com/luxfi/aml/pkg/suppress"
 	"github.com/luxfi/aml/pkg/token"
 	"github.com/luxfi/aml/pkg/velocity"
+	"github.com/luxfi/aml/pkg/watch"
 )
 
 var version = "(dev)"
@@ -97,7 +102,7 @@ func main() {
 	// endpoints read it; there is no second store for either to talk to instead —
 	// two stores is how sanctions search came to answer "no match" for every name
 	// while the refresh was loading designations somewhere else.
-	lists := screen.New(listStale, nil)
+	screening := screen.New(listStale, nil)
 
 	// Per-source readiness. The store answers whether screening can be relied on at
 	// all; this answers which publisher is behind it, with a count and a date,
@@ -168,11 +173,34 @@ func main() {
 				return fmt.Errorf("refusing to start, alerts cannot be recorded: %w", err)
 			}
 
+			// The five planes the monitoring programme is operated through:
+			// the institution's own lists, the suppressions it has decided,
+			// every activation as it fires, the catalog of what its payloads
+			// carry, and the studies of its model. Every one is Base-backed
+			// for the same reason the three above are — a control that empties
+			// on a rollout is a control that was off, and from the outside a
+			// silent one is indistinguishable from a quiet institution.
+			for _, ensure := range []func(core.App) error{
+				lists.Ensure, suppress.Ensure, watch.Ensure, dictionary.Ensure, models.Ensure,
+			} {
+				if err := ensure(app); err != nil {
+					return fmt.Errorf("refusing to start, a record plane cannot be created: %w", err)
+				}
+			}
+			deny := lists.NewBase(app)
+			silence := suppress.NewBase(app)
+			monitor := watch.NewBase(app)
+			monitor.Cover = silence
+			catalog := dictionary.NewBase(app)
+			study := models.NewBase(app)
+			study.Model = model
+
 			rates := reference.RatesFromEnv()
 
 			eng := engine.New(engine.Providers{
 				History:   events,
-				Screen:    lists,
+				Lists:     deny,
+				Screen:    screening,
 				Reference: reference.JurisdictionsFromEnv(),
 				Rate:      rates,
 				Zone:      zone,
@@ -206,7 +234,7 @@ func main() {
 				ClientID:  client,
 				Cases:     cases.NewBase(app),
 				Alerts:    api.NewAlertStoreBase(app),
-				Screen:    lists,
+				Screen:    screening,
 				Readiness: readiness,
 				History:   events,
 				Rate:      rates,
@@ -214,10 +242,34 @@ func main() {
 				Keys:      keys,
 				Velocity:  windows,
 				Anomaly:   model,
+				Planes: api.Planes{
+					Lists: deny, Suppress: silence, Watch: monitor,
+					Dictionary: catalog, Models: study,
+				},
 			}
+			// The model plane reads a tenant's history through the same join a
+			// rule replay uses, so a study of the model and a study of a rule
+			// see the same events.
+			study.History = api.Replayed{H: handler}
 			handler.Register(se)
 
-			refresh(app, lists, readiness)
+			// The field catalog accumulates in memory and is written on a
+			// cadence and at shutdown. Both are wired here rather than left to
+			// a caller: an accumulator nobody flushes is a statistic that only
+			// ever reads as pending.
+			app.Cron().Add("dictionary-flush", "*/5 * * * *", func() {
+				if err := catalog.Flush(context.Background()); err != nil {
+					app.Logger().Error("field catalog flush failed", "error", err)
+				}
+			})
+			app.OnTerminate().BindFunc(func(te *core.TerminateEvent) error {
+				if err := catalog.Flush(context.Background()); err != nil {
+					app.Logger().Error("field catalog flush failed at shutdown", "error", err)
+				}
+				return te.Next()
+			})
+
+			refresh(app, screening, readiness)
 
 			// Destroy records whose retention period has run out, daily.
 			retention.Cron(app, records)
@@ -240,7 +292,7 @@ func main() {
 
 // refresh registers the daily sanctions load and runs one immediately, so the
 // process does not serve a whole day with nothing loaded.
-func refresh(app core.App, lists *screen.Store, readiness *screen.Readiness) {
+func refresh(app core.App, screening *screen.Store, readiness *screen.Readiness) {
 	load := func() {
 		results := screen.Fetch(context.Background())
 		for i := range results {
@@ -249,7 +301,7 @@ func refresh(app core.App, lists *screen.Store, readiness *screen.Readiness) {
 				app.Logger().Error("sanctions list load failed", "source", r.Source, "error", r.Err)
 				continue
 			}
-			if err := lists.Load(r.Source, r.Entries); err != nil {
+			if err := screening.Load(r.Source, r.Entries); err != nil {
 				// Recorded on the result too, so readiness reports a rejected list as
 				// unfit rather than as a successful load of nothing.
 				r.Err = err
@@ -259,7 +311,7 @@ func refresh(app core.App, lists *screen.Store, readiness *screen.Readiness) {
 			app.Logger().Info("sanctions list loaded", "source", r.Source, "designations", len(r.Entries))
 		}
 		readiness.Record(results, time.Now().UTC())
-		if err := lists.Ready(); err != nil {
+		if err := screening.Ready(); err != nil {
 			app.Logger().Error("screening is not ready after a refresh", "error", err)
 		}
 	}
