@@ -227,9 +227,14 @@ func Measure(obs []Observation, threshold float64, cost policy.Cost, cal calibra
 		m.F1 = ptr(round6(2 * *m.Precision * *m.Recall / (*m.Precision + *m.Recall)))
 	}
 	if cost.Stated() {
-		m.CostNano = ptrInt(nano(c, cost))
-		best, at := minimum(judged, cost)
-		m.BestNano, m.BestThreshold = ptrInt(best), ptr(round6(at))
+		v, ok := nano(c, cost)
+		best, at, okBest := minimum(judged, cost)
+		if ok && okBest {
+			m.CostNano = ptrInt(v)
+			m.BestNano, m.BestThreshold = ptrInt(best), ptr(round6(at))
+		} else if m.Refusal == "" {
+			m.Refusal = "the stated prices cannot be multiplied by this many observations without overflowing, so no cost is reported"
+		}
 	}
 	if cal.Fitted() {
 		if b, ok := brier(judged, cal); ok {
@@ -264,6 +269,7 @@ func Curve(obs []Observation, cost policy.Cost) []Point {
 		return nil
 	}
 	sort.SliceStable(judged, func(i, j int) bool { return judged[i].Score > judged[j].Score })
+	priced := cost.Stated()
 
 	out := make([]Point, 0, len(judged))
 	var tp, fp float64
@@ -283,13 +289,46 @@ func Curve(obs []Observation, cost policy.Cost) []Point {
 			FalsePositive: round6(fp / neg),
 			Precision:     round6(tp / (tp + fp)),
 		}
-		if cost.Stated() {
-			p.CostNano = nano(Confusion{TP: tp, FP: fp, FN: pos - tp, TN: neg - fp}, cost)
+		if priced {
+			v, ok := nano(Confusion{TP: tp, FP: fp, FN: pos - tp, TN: neg - fp}, cost)
+			if !ok {
+				// One unrepresentable point makes the whole cost dimension
+				// unreadable: a curve with a hole in it plots as a cliff. Drop it
+				// for the sweep and let Metrics carry the refusal.
+				priced = false
+				for k := range out {
+					out[k].CostNano = 0
+				}
+			}
+			p.CostNano = v
 		}
 		out = append(out, p)
 		i = j
 	}
-	return out
+	return sample(out)
+}
+
+// sample bounds what a curve RETURNS without moving where its points sit.
+//
+// The sweep above is over every distinct score and stays that way: Metrics and
+// the cost minimum are exact whatever this does. A curve is a CHART, and the
+// argument that bounds Moved applies unchanged — a person reading one does not
+// need the ten-thousandth point, and a response carrying fifty thousand of them
+// is a megabyte nobody renders.
+//
+// It takes an evenly spaced subsequence and always keeps both ends, so the
+// shape, the extremes and the monotonicity survive. Truncating instead would cut
+// the curve off at one end and describe a model that stops.
+func sample(points []Point) []Point {
+	if len(points) <= Plotted {
+		return points
+	}
+	out := make([]Point, 0, Plotted)
+	last := len(points) - 1
+	for i := range Plotted - 1 {
+		out = append(out, points[i*last/(Plotted-1)])
+	}
+	return append(out, points[last])
 }
 
 // confusionAt counts the four cells at one threshold. Flagged is score >= t, so
@@ -313,15 +352,52 @@ func confusionAt(judged []Observation, t float64) Confusion {
 	return c
 }
 
-// nano prices a confusion. Counts are weighted and therefore float; the
-// MULTIPLICATION is done once, per cell, and rounded to the nearest nano before
-// summing, so the result is an exact integer number of nano-units and two calls
-// on the same counts cannot differ.
-func nano(c Confusion, cost policy.Cost) int64 {
-	miss := int64(math.Round(c.FN)) * cost.Miss
-	alarm := int64(math.Round(c.FP)) * cost.Alarm
-	return miss + alarm
+// nano prices a confusion, and says whether the price is representable.
+//
+// Counts are weighted and therefore float; the MULTIPLICATION is done once, per
+// cell, and rounded to the nearest nano before summing, so the result is an
+// exact integer number of nano-units and two calls on the same counts cannot
+// differ.
+//
+// It returns false rather than a wrapped number. policy.MaxPrice already keeps a
+// sealed ladder's prices inside the range where this cannot happen, but a
+// wrapped cost is the one arithmetic failure here that does not look like a
+// failure — it looks like a recommendation — so the arithmetic refuses on its
+// own account and does not rely on having been called correctly. A policy
+// recorded before that bound existed reads back through this same path.
+func nano(c Confusion, cost policy.Cost) (int64, bool) {
+	miss, ok := mul(int64(math.Round(c.FN)), cost.Miss)
+	if !ok {
+		return 0, false
+	}
+	alarm, ok := mul(int64(math.Round(c.FP)), cost.Alarm)
+	if !ok {
+		return 0, false
+	}
+	sum := miss + alarm
+	if sum < miss {
+		return 0, false
+	}
+	return sum, true
 }
+
+// mul multiplies a count by a price, reporting whether the product fits. Both
+// are non-negative here, so the check is the single division that inverts the
+// multiplication exactly.
+func mul(count, price int64) (int64, bool) {
+	if count <= 0 || price <= 0 {
+		return 0, true
+	}
+	if count > math.MaxInt64/price {
+		return 0, false
+	}
+	return count * price, true
+}
+
+// Plotted bounds how many points a curve returns. A thousand is denser than any
+// screen, and the metrics behind it are computed over every distinct score
+// regardless — this bounds the rendering, never the arithmetic.
+const Plotted = 1000
 
 // minimum sweeps every reachable threshold and returns the lowest cost and where
 // it is reached.
@@ -330,7 +406,7 @@ func nano(c Confusion, cost policy.Cost) int64 {
 // cost the same are not equivalent to the business: the one that stops fewer
 // customers is the one to choose, and leaving the tie to iteration order would
 // make the recommendation move between runs on identical data.
-func minimum(judged []Observation, cost policy.Cost) (int64, float64) {
+func minimum(judged []Observation, cost policy.Cost) (int64, float64, bool) {
 	sorted := append([]Observation(nil), judged...)
 	sort.SliceStable(sorted, func(i, j int) bool { return sorted[i].Score > sorted[j].Score })
 
@@ -344,7 +420,11 @@ func minimum(judged []Observation, cost policy.Cost) (int64, float64) {
 	}
 	// The empty flagged set is a real operating point — flag nothing, pay for
 	// every miss — and it is the right answer when alarms cost more than misses.
-	best, at := nano(Confusion{FN: pos, TN: neg}, cost), math.Nextafter(1, 2)
+	best, ok := nano(Confusion{FN: pos, TN: neg}, cost)
+	if !ok {
+		return 0, 0, false
+	}
+	at := math.Nextafter(1, 2)
 	var tp, fp float64
 	for i := 0; i < len(sorted); {
 		j := i
@@ -356,12 +436,16 @@ func minimum(judged []Observation, cost policy.Cost) (int64, float64) {
 			}
 			j++
 		}
-		if v := nano(Confusion{TP: tp, FP: fp, FN: pos - tp, TN: neg - fp}, cost); v < best {
+		v, ok := nano(Confusion{TP: tp, FP: fp, FN: pos - tp, TN: neg - fp}, cost)
+		if !ok {
+			return 0, 0, false
+		}
+		if v < best {
 			best, at = v, sorted[i].Score
 		}
 		i = j
 	}
-	return best, at
+	return best, at, true
 }
 
 // roc is the area under the receiver-operating curve, by the Mann-Whitney
