@@ -31,19 +31,27 @@ type shelf interface {
 	get(id string) (*types.Case, error)
 	// list returns an org's cases, optionally narrowed to one status.
 	list(org, status string) ([]*types.Case, error)
-	// each visits every case in every org. It is what a sweep is: triage and
-	// eviction ask about cases regardless of whose they are.
-	each(visit func(*types.Case) error) error
+	// each visits ONE org's cases. A sweep names whose cases it is sweeping:
+	// counting, triage and eviction are each a tenant's own, and a sweep that
+	// crossed the boundary read another institution's queue, escalated its
+	// cases, and dropped its closed ones.
+	each(org string, visit func(*types.Case) error) error
 	// appendEvent adds one entry to a case's timeline.
 	appendEvent(e types.CaseEvent) error
 	// events is a case's timeline, oldest first.
 	events(caseID string) ([]types.CaseEvent, error)
-	// drop removes cases and their timelines.
-	drop(ids []string) error
-	// number is the next case number. It is the shelf's because it has to
-	// continue across a restart, and a counter that starts again at one makes
-	// two cases with the same number.
-	number() (int64, error)
+	// drop removes an org's cases and their timelines. The org is not made
+	// redundant by the ids: it is what makes another tenant's case unreachable
+	// from here rather than merely not asked for.
+	drop(org string, ids []string) error
+	// number is the next case number WITHIN an org. It is the shelf's because it
+	// has to continue across a restart, and a counter that starts again at one
+	// makes two cases with the same number.
+	//
+	// Per tenant, because a case number is what a file is referred to by and one
+	// institution's file references should not carry another's volume: a shared
+	// sequence puts gaps in B's numbering that count A's cases.
+	number(org string) (int64, error)
 }
 
 // memory is the shelf tests run against. Nothing in it survives the process, so
@@ -52,13 +60,14 @@ type memory struct {
 	mu       sync.RWMutex
 	cases    map[string]*types.Case
 	timeline map[string][]types.CaseEvent
-	seq      int64
+	seq      map[string]int64
 }
 
 func newMemory() *memory {
 	return &memory{
 		cases:    make(map[string]*types.Case),
 		timeline: make(map[string][]types.CaseEvent),
+		seq:      make(map[string]int64),
 	}
 }
 
@@ -99,10 +108,13 @@ func (m *memory) list(org, status string) ([]*types.Case, error) {
 	return out, nil
 }
 
-func (m *memory) each(visit func(*types.Case) error) error {
+func (m *memory) each(org string, visit func(*types.Case) error) error {
 	m.mu.RLock()
 	ids := make([]*types.Case, 0, len(m.cases))
 	for _, c := range m.cases {
+		if c.OrgID != org {
+			continue
+		}
 		copied := *c
 		ids = append(ids, &copied)
 	}
@@ -128,19 +140,23 @@ func (m *memory) events(caseID string) ([]types.CaseEvent, error) {
 	return append([]types.CaseEvent(nil), m.timeline[caseID]...), nil
 }
 
-func (m *memory) drop(ids []string) error {
+func (m *memory) drop(org string, ids []string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	for _, id := range ids {
+		c, ok := m.cases[id]
+		if !ok || c.OrgID != org {
+			continue
+		}
 		delete(m.cases, id)
 		delete(m.timeline, id)
 	}
 	return nil
 }
 
-func (m *memory) number() (int64, error) {
+func (m *memory) number(org string) (int64, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.seq++
-	return m.seq, nil
+	m.seq[org]++
+	return m.seq[org], nil
 }

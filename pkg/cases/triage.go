@@ -52,9 +52,12 @@ func (s *Store) AutoAssign(c *types.Case, analysts []string, mode string) string
 		assignee = analysts[idx%int64(len(analysts))]
 
 	case "least_loaded":
-		// Count open cases per analyst.
+		// Count open cases per analyst, within the institution the case belongs
+		// to. An analyst's load is what THIS tenant has given them; counting
+		// another institution's queue into it both leaks that queue's size and
+		// assigns on a number that is not about this one.
 		loads := make(map[string]int)
-		_ = s.shelf.each(func(existing *types.Case) error {
+		_ = s.shelf.each(c.OrgID, func(existing *types.Case) error {
 			if existing.Status != types.CaseClosed && existing.AssigneeID != "" {
 				loads[existing.AssigneeID]++
 			}
@@ -142,10 +145,14 @@ func (s *Store) CheckEscalation(c *types.Case, config TriageConfig) bool {
 // so an alert that was raised, never reviewed, and silently closed left no trace of
 // having existed.
 //
+// It sweeps ONE org. Unscoped it escalated every institution's cases on any
+// tenant's cycle, which is a cross-tenant write on the record of another
+// institution's investigation.
+//
 // Escalation is the honest outcome: an alert nobody has looked at is exactly what a
 // compliance officer needs to see, and escalating puts it in front of one instead of
 // deleting the question.
-func (s *Store) AutoEscalateStale(config TriageConfig) int {
+func (s *Store) AutoEscalateStale(orgID string, config TriageConfig) int {
 	if config.StaleAfter <= 0 {
 		return 0
 	}
@@ -157,7 +164,7 @@ func (s *Store) AutoEscalateStale(config TriageConfig) int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	_ = s.shelf.each(func(c *types.Case) error {
+	_ = s.shelf.each(orgID, func(c *types.Case) error {
 		if c.Status == types.CaseClosed || c.Status == types.CaseEscalated {
 			return nil
 		}
@@ -196,7 +203,7 @@ func (s *Store) AutoEscalateStale(config TriageConfig) int {
 // neither is available to a cron.
 func (s *Store) TriageCheck(orgID string, analysts []string, config TriageConfig) (assigned, escalated, stale int) {
 	// Stale first, before assignment refreshes UpdatedAt and hides the staleness.
-	stale = s.AutoEscalateStale(config)
+	stale = s.AutoEscalateStale(orgID, config)
 
 	cases := s.List(orgID, "")
 	for _, c := range cases {

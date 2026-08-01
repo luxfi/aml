@@ -67,8 +67,8 @@ var caseKind = store.Kind{
 		{Name: "case", Fields: []string{store.Org, fieldCase}, Unique: true},
 		// The queue: an org's cases, by status.
 		{Name: "queue", Fields: []string{store.Org, fieldStatus, fieldNumber}},
-		// The next case number, and eviction's cutoff.
-		{Name: "closed", Fields: []string{fieldClosed}},
+		// The next case number, which is the highest one this org has used.
+		{Name: "number", Fields: []string{store.Org, fieldNumber}},
 	},
 }
 
@@ -110,8 +110,15 @@ type durable struct{ app core.App }
 // considered and what was decided (AMLR Art. 77(1)(b); JMLSG 6.32), and a record
 // that a rollout empties is not a record — the question it answers comes back
 // unanswerable at exactly the moment somebody asks it.
+//
+// It takes no bound and there is no constructor that gives it one, so this store
+// never evicts. Surviving the restart was only half of it: a record the case
+// plane deletes on a timer of its own is gone just as completely, and quietly,
+// because nothing about it looks like a failure. Expiry is pkg/retention's,
+// where the clock is five years, the sweep is per tenant, and the disposal is
+// proven.
 func NewBase(app core.App) *Store {
-	return &Store{shelf: durable{app: app}, maxCases: DefaultMaxCases, retention: DefaultClosedCaseRetention}
+	return &Store{shelf: durable{app: app}}
 }
 
 func (d durable) put(c *types.Case) error {
@@ -180,8 +187,8 @@ func (d durable) list(org, status string) ([]*types.Case, error) {
 	return out, nil
 }
 
-func (d durable) each(visit func(*types.Case) error) error {
-	found, err := caseKind.Across(d.app, "", "-"+fieldNumber, 0, nil)
+func (d durable) each(org string, visit func(*types.Case) error) error {
+	found, err := caseKind.Find(d.app, org, "", "-"+fieldNumber, 0, nil)
 	if err != nil {
 		return err
 	}
@@ -238,13 +245,13 @@ func (d durable) events(caseID string) ([]types.CaseEvent, error) {
 	return out, nil
 }
 
-func (d durable) drop(ids []string) error {
+func (d durable) drop(org string, ids []string) error {
 	for _, id := range ids {
-		cs, err := caseKind.Across(d.app, fieldCase+" = {:id}", "", 0, dbx.Params{"id": id})
+		cs, err := caseKind.Find(d.app, org, fieldCase+" = {:id}", "", 0, dbx.Params{"id": id})
 		if err != nil {
 			return err
 		}
-		evs, err := eventKind.Across(d.app, fieldCase+" = {:id}", "", 0, dbx.Params{"id": id})
+		evs, err := eventKind.Find(d.app, org, fieldCase+" = {:id}", "", 0, dbx.Params{"id": id})
 		if err != nil {
 			return err
 		}
@@ -257,11 +264,15 @@ func (d durable) drop(ids []string) error {
 	return nil
 }
 
-// number continues the sequence across a restart by reading the highest one
-// written. A counter that starts again at one gives two cases the same number,
-// and a case number is what a file is referred to by.
-func (d durable) number() (int64, error) {
-	found, err := caseKind.Across(d.app, "", "-"+fieldNumber, 1, nil)
+// number continues the org's sequence across a restart by reading the highest
+// one that org has written. A counter that starts again at one gives two cases
+// the same number, and a case number is what a file is referred to by.
+//
+// Scoped, so the sequence an institution sees is its own. Read across tenants it
+// answered a question nobody asked it — how many cases everyone else has opened
+// — in the gaps between one institution's own case numbers.
+func (d durable) number(org string) (int64, error) {
+	found, err := caseKind.Find(d.app, org, "", "-"+fieldNumber, 1, nil)
 	if err != nil {
 		return 0, err
 	}

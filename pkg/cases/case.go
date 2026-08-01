@@ -10,11 +10,28 @@ import (
 	"github.com/luxfi/aml/pkg/types"
 )
 
-// DefaultClosedCaseRetention is how long a closed case is kept before eviction.
-const DefaultClosedCaseRetention = 90 * 24 * time.Hour // 90 days
-
-// DefaultMaxCases is the point at which eviction runs.
-const DefaultMaxCases = 100_000
+// bound is a cap on what a shelf holds: how many cases before the ones already
+// closed and past the window are dropped, and how long past closure that is.
+//
+// It is the MEMORY shelf's, and only this package's own tests set one. The
+// durable shelf has no bound and [NewBase] takes no argument that could give it
+// one — which is the whole of the fix, stated as a type.
+//
+// A case is the record that an alert was considered and what was decided, kept
+// whichever way the decision went (AMLR Art. 77(1)(b); JMLSG 6.32), for five
+// years (Dir. (EU) 2015/849 Art. 40). The plane that decides when a retained
+// record goes is pkg/retention: it counts in years, per tenant, refuses a date
+// its own clock has not reached, and proves what it destroyed before reporting
+// a count. A second clock here, counting in days, cannot be reconciled with
+// that one — whichever is shorter silently becomes the real retention period,
+// and nobody wrote that one down.
+//
+// The zero value is NO bound. A Store is therefore unbounded unless something
+// in this package asks for one.
+type bound struct {
+	cases     int
+	retention time.Duration
+}
 
 // Store is the case plane: the cases, their timelines, and the decisions that
 // closed them.
@@ -29,45 +46,53 @@ const DefaultMaxCases = 100_000
 // to do it instead — this deployment runs one, which is why one lock is enough
 // and why that is worth stating rather than assuming.
 type Store struct {
-	mu        sync.Mutex
-	shelf     shelf
-	maxCases  int
-	retention time.Duration
+	mu    sync.Mutex
+	shelf shelf
+	bound bound
 }
 
 // NewStore creates an empty in-memory case store. Nothing in it survives the
 // process; [NewBase] is what an instance serves from.
 func NewStore() *Store {
-	return &Store{shelf: newMemory(), maxCases: DefaultMaxCases, retention: DefaultClosedCaseRetention}
+	return &Store{shelf: newMemory()}
 }
 
-// NewStoreWithLimits creates an in-memory case store with explicit limits.
-func NewStoreWithLimits(maxCases int, retention time.Duration) *Store {
-	if maxCases <= 0 {
-		maxCases = DefaultMaxCases
-	}
-	if retention <= 0 {
-		retention = DefaultClosedCaseRetention
-	}
-	return &Store{shelf: newMemory(), maxCases: maxCases, retention: retention}
+// newBounded is an in-memory store that evicts, for the tests that exercise
+// eviction. It is unexported because a bounded case store is not something a
+// deployment may construct: the exported constructors are [NewStore] and
+// [NewBase], and neither of them takes a limit.
+func newBounded(cases int, retention time.Duration) *Store {
+	return &Store{shelf: newMemory(), bound: bound{cases: cases, retention: retention}}
 }
 
-// EvictExpired removes closed cases older than the retention period.
+// EvictExpired removes an org's cases that have been closed for longer than the
+// store's bound allows, and returns how many it removed.
+//
+// On an unbounded store it removes nothing and returns 0. The durable store an
+// instance serves from is unbounded, so there this method cannot destroy a
+// record however it is called — expiry there is pkg/retention's, entirely.
 //
 // It evicts only what has been closed for longer than the window, so an open
 // case is never dropped however many there are: the alternative — capping by
 // count and evicting the oldest — throws away the investigations nobody has
 // finished, which are the ones that matter.
-func (s *Store) EvictExpired() int {
+//
+// It names an org because eviction is a tenant's own. Unscoped, one
+// institution's volume crossed a shared threshold and the sweep that followed
+// did not ask whose evidence it was dropping.
+func (s *Store) EvictExpired(org string) int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.evictLocked()
+	return s.evictLocked(org)
 }
 
-func (s *Store) evictLocked() int {
-	cutoff := time.Now().UTC().Add(-s.retention)
+func (s *Store) evictLocked(org string) int {
+	if s.bound.retention <= 0 {
+		return 0
+	}
+	cutoff := time.Now().UTC().Add(-s.bound.retention)
 	var expired []string
-	_ = s.shelf.each(func(c *types.Case) error {
+	_ = s.shelf.each(org, func(c *types.Case) error {
 		if !stillOpen(c, cutoff) {
 			expired = append(expired, c.ID)
 		}
@@ -76,16 +101,20 @@ func (s *Store) evictLocked() int {
 	if len(expired) == 0 {
 		return 0
 	}
-	if err := s.shelf.drop(expired); err != nil {
+	if err := s.shelf.drop(org, expired); err != nil {
 		return 0
 	}
 	return len(expired)
 }
 
-// Len returns the number of cases held.
-func (s *Store) Len() int {
+// Len is how many cases an org holds.
+//
+// There is no count across orgs, because no answer this plane gives is about
+// more than one institution — and a total was what made a threshold everyone's
+// to cross.
+func (s *Store) Len(org string) int {
 	n := 0
-	_ = s.shelf.each(func(*types.Case) error { n++; return nil })
+	_ = s.shelf.each(org, func(*types.Case) error { n++; return nil })
 	return n
 }
 
@@ -94,7 +123,7 @@ func (s *Store) Create(orgID string, severity string, alertIDs []string, entityI
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	number, err := s.shelf.number()
+	number, err := s.shelf.number(orgID)
 	if err != nil {
 		return nil
 	}
@@ -114,8 +143,16 @@ func (s *Store) Create(orgID string, severity string, alertIDs []string, entityI
 	if err := s.shelf.put(c); err != nil {
 		return nil
 	}
-	if s.Len() > s.maxCases {
-		s.evictLocked()
+	// Only a bounded store evicts, and the durable one is never bounded, so on
+	// the shelf an instance serves from opening a case cannot destroy one.
+	//
+	// It cannot count them either. The total this used to take on every Create
+	// was a full scan of every tenant's cases, under this lock, on the path the
+	// replay gate calls the request that must not wait — and once the threshold
+	// was crossed with nothing old enough to drop, every Create paid two of them
+	// forever.
+	if s.bound.cases > 0 && s.Len(orgID) > s.bound.cases {
+		s.evictLocked(orgID)
 	}
 	return c
 }
