@@ -132,25 +132,38 @@ func TestRankCaps(t *testing.T) {
 	}
 }
 
-// The four explicit sources stay four. A reason minted for every rule a tenant
-// writes would make the vocabulary uncountable, which is the property that makes
-// it defensible.
-func TestExplicitKeepsTheVocabularyClosed(t *testing.T) {
-	r, err := Explicit(Rule, "rule_7f3", "velocity over 24h on this card", 0.4)
-	if err != nil {
-		t.Fatal(err)
+// A reason minted for every rule a tenant writes would make the vocabulary
+// uncountable, which is the property that makes it defensible. The rule goes in
+// Source; the code stays one.
+func TestOfRuleKeepsTheVocabularyClosed(t *testing.T) {
+	a := OfRule("rule_7f3", "velocity over 24h on this card", types.SeverityHigh, 0.4)
+	b := OfRule("rule_ab1", "a denied address", types.SeverityCritical, 0.9)
+	if a.Code != Rule || b.Code != Rule {
+		t.Errorf("two rules minted two codes: %q and %q", a.Code, b.Code)
 	}
-	if r.Code != Rule {
-		t.Errorf("code is %q, want %q — the instrument belongs in Source", r.Code, Rule)
+	if a.Source != "rule_7f3" || b.Source != "rule_ab1" {
+		t.Errorf("the rule id did not reach Source: %q %q", a.Source, b.Source)
 	}
-	if r.Source != "rule_7f3" {
-		t.Errorf("source is %q, want the rule id", r.Source)
+	if !Known(a.Code) {
+		t.Errorf("%q is not in the vocabulary", a.Code)
 	}
-	if !Known(r.Code) {
-		t.Errorf("%q is not in the vocabulary", r.Code)
+	if a.Severity != types.SeverityHigh {
+		t.Errorf("severity is %q, want the rule's own", a.Severity)
 	}
-	if _, err := Explicit("vibes", "x", "y", 1); err == nil {
-		t.Error("an unknown source was accepted, so a reason can be cited under a code nothing publishes")
+	if got := OfRule("rule_x", "", "", 0.1); got.Says != "rule_x" || got.Severity == "" {
+		t.Errorf("a nameless rule produced an unshowable reason: %+v", got)
+	}
+}
+
+// The vocabulary must publish nothing this plane cannot emit. Two sources: the
+// model's own features, and a rule firing.
+func TestVocabularyPublishesOnlyEmittableSources(t *testing.T) {
+	sources := map[string]int{}
+	for _, c := range Codes() {
+		sources[c.Source]++
+	}
+	if len(sources) != 2 || sources["model"] == 0 || sources[Rule] != 1 {
+		t.Fatalf("sources are %v, want exactly {model: many, rule: 1}", sources)
 	}
 }
 

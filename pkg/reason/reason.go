@@ -27,7 +27,6 @@
 package reason
 
 import (
-	"fmt"
 	"sort"
 	"strconv"
 	"strings"
@@ -49,23 +48,23 @@ const (
 	Below = "below"
 )
 
-// Sources that are not the model. Each is a decision a tenant or the platform
-// made explicitly, so each is one code and the specific instrument is named in
-// the reason's Source rather than minted as a new code — otherwise the
-// vocabulary grows by one entry per rule a tenant writes and stops being
-// countable.
-const (
-	// List is a value on one of the tenant's own allow or deny lists.
-	List = "list"
-	// Rule is one of the tenant's own written rules.
-	Rule = "rule"
-	// Control is a platform control standing on the subject: a reserve, a payout
-	// hold, a block.
-	Control = "control"
-	// Agency is what kind of actor this was — undeclared automation reaching a
-	// surface that expects a person, or the reverse.
-	Agency = "agency"
-)
+// Rule is the ONE source that is not the model: one of the tenant's own written
+// rules fired.
+//
+// It is a single code and the specific rule is named in the reason's Source,
+// rather than minting a code per rule — otherwise the vocabulary grows by one
+// entry every time a tenant writes a rule and stops being countable, which is
+// the property that makes it defensible.
+//
+// A rule that reads a list is still a rule. The list is data the rule consults,
+// not a separate authority, and citing "list" beside "rule" for one firing would
+// double-count one piece of evidence.
+//
+// There is deliberately no code for anything this plane cannot emit. A published
+// code nothing can reach is a branch a consumer writes and never runs, which is
+// the same defect as an unreachable direction and is refused for the same
+// reason.
+const Rule = "rule"
 
 // Code is one entry of the vocabulary.
 type Code struct {
@@ -73,8 +72,8 @@ type Code struct {
 	// part of the published contract, so renaming one invalidates every stored
 	// decision that cites it.
 	Code string `json:"code"`
-	// Source is where a reason with this code comes from: a model feature, or
-	// one of the four explicit instruments above.
+	// Source is where a reason with this code comes from: "model" for a feature
+	// the detector reads, or Rule for a rule the tenant wrote.
 	Source string `json:"source"`
 	// Says is the sentence template a person is shown, with no numbers in it. A
 	// Reason fills the numbers in.
@@ -82,7 +81,7 @@ type Code struct {
 	// Typology, Indicator and Citation are the model features' own provenance,
 	// carried through unchanged from anomaly.Inventory so the published reason
 	// and the model's own inventory cannot tell two different stories. Empty for
-	// the four explicit sources, which cite the tenant's instrument instead.
+	// the rule code, which cites the tenant's own detection instead.
 	Typology  string `json:"typology,omitempty"`
 	Indicator string `json:"indicator,omitempty"`
 	Citation  string `json:"citation,omitempty"`
@@ -97,15 +96,14 @@ type Reason struct {
 	// two functions that build the vocabulary.
 	Code string `json:"code"`
 	// Weight is this reason's part of the decision, in [0,1]. For a model reason
-	// it is the exact counterfactual share; for an explicit instrument it is the
-	// weight that instrument carried.
+	// it is the exact counterfactual share; for a rule it is the weight that rule
+	// carried into the combination.
 	Weight float64 `json:"weight"`
 	// Says is the sentence shown to an investigator or to a declined customer,
 	// with this decision's own numbers in it.
 	Says string `json:"says"`
-	// Source names the specific instrument, when the code does not: the rule id,
-	// the list name, the control id. Empty for a model feature, whose code
-	// already names it exactly.
+	// Source names the specific rule, which the code deliberately does not.
+	// Empty for a model feature, whose code already names it exactly.
 	Source string `json:"source,omitempty"`
 	// Severity is the grading.
 	Severity string `json:"severity,omitempty"`
@@ -117,7 +115,7 @@ type Reason struct {
 func codeOf(feature, direction string) string { return feature + "." + direction }
 
 // Codes is the whole vocabulary, in a stable order: every reachable model code
-// first, in the model's own coordinate order, then the four explicit sources.
+// first, in the model's own coordinate order, then the one rule code.
 //
 // Reachability is read off the feature's neutral value rather than listed:
 // a feature neutral at zero is a share or a count that cannot go below it, so
@@ -126,23 +124,17 @@ func codeOf(feature, direction string) string { return feature + "." + direction
 // automatically and correctly.
 func Codes() []Code {
 	inv := anomaly.Inventory()
-	out := make([]Code, 0, 2*anomaly.Dims+4)
+	out := make([]Code, 0, 2*anomaly.Dims+1)
 	for _, f := range inv {
 		out = append(out, feature(f, Above))
 		if f.Neutral > 0 {
 			out = append(out, feature(f, Below))
 		}
 	}
-	return append(out,
-		Code{Code: List, Source: List, Severity: types.SeverityHigh,
-			Says: "a value on one of this organisation's own lists"},
-		Code{Code: Rule, Source: Rule, Severity: types.SeverityMedium,
-			Says: "one of this organisation's own rules"},
-		Code{Code: Control, Source: Control, Severity: types.SeverityHigh,
-			Says: "a control standing on this subject"},
-		Code{Code: Agency, Source: Agency, Severity: types.SeverityMedium,
-			Says: "the kind of actor this request came from"},
-	)
+	return append(out, Code{
+		Code: Rule, Source: Rule, Severity: types.SeverityMedium,
+		Says: "one of this organisation's own rules, named in the reason's source",
+	})
 }
 
 // feature renders one model code from one inventory entry.
@@ -261,24 +253,18 @@ func number(v float64) string {
 	return strings.TrimSuffix(s, ".")
 }
 
-// Explicit builds a reason for one of the four instruments that are not the
-// model. The instrument is named in Source rather than in the code, so the
-// vocabulary stays closed however many rules a tenant writes.
+// OfRule builds the reason for one rule firing. The rule is named in Source and
+// the code stays Rule, so a report can count how often rules decided against how
+// often the model did, and can still say WHICH rule for any one decision.
 //
-// It refuses an unknown source rather than minting a code: a reason cited under
-// a code nothing publishes is exactly as undefendable as free text.
-func Explicit(source, instrument, says string, weight float64) (Reason, error) {
-	switch source {
-	case List, Rule, Control, Agency:
-	default:
-		return Reason{}, fmt.Errorf("reason: %q is not a source in the vocabulary", source)
-	}
-	sev := types.SeverityMedium
-	if source == List || source == Control {
-		sev = types.SeverityHigh
+// says is the rule's own name — the sentence the tenant wrote when it declared
+// the detection, which is the only description of it anyone has agreed to.
+func OfRule(id, says, severity string, weight float64) Reason {
+	if severity == "" {
+		severity = types.SeverityMedium
 	}
 	if says == "" {
-		says = instrument
+		says = id
 	}
-	return Reason{Code: source, Weight: weight, Says: says, Source: instrument, Severity: sev}, nil
+	return Reason{Code: Rule, Weight: weight, Says: says, Source: id, Severity: severity}
 }
