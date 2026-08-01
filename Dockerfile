@@ -7,7 +7,8 @@
 # first recorded, and sum.golang.org is an append-only witness of that zip's
 # hash. go.sum carries the witnessed hashes — see LLM.md, "Dependency pinning".
 # Nothing here is fetched from the git host, so the build needs no credential.
-FROM golang:1.26.4-alpine AS build
+FROM golang:1.26.5-alpine AS build
+ENV GOTOOLCHAIN=auto
 RUN apk add --no-cache git
 ARG VERSION=dev
 
