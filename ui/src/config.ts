@@ -18,29 +18,52 @@
 // authenticates against the wrong application, and every token it obtains is
 // refused by the engine with nothing in the failure that says why.
 
+/** The label this console is served under. Anything else is not this console. */
+const CONSOLE = 'aml'
+
 /**
- * origin is the API this console talks to: the same registrable domain, under
- * the `api` label.
+ * apiOrigin derives the API origin from the host a console is served on: the
+ * same registrable domain, under the `api` label, in place of `aml`.
  *
  *   aml.hanzo.ai    -> https://api.hanzo.ai
  *   aml.lux.network -> https://api.lux.network
  *
- * A host that names no parent domain gets the empty string, which means same
- * origin, which is what the dev server proxies. That covers localhost, a bare
- * two-label domain, and an address literal: 127.0.0.1 has four labels but no
- * parent domain, and deriving api.0.0.1 from it would point the console at a
- * host that does not exist. A registrable domain never ends in a numeric label.
+ * The empty string means same origin, which is what the dev server proxies.
+ * Everything that is not a recognisable `aml.<domain>` gets it:
+ *
+ *   - a first label that is not `aml`. This console is served at aml.<domain>
+ *     and nowhere else, so a host shaped like evil.aml.hanzo.ai — which is a
+ *     four-label host the old rule happily read as api.aml.hanzo.ai — is not one
+ *     of ours and gets no derivation. Nothing today can present that host (the
+ *     certificate is single-name and the ingress rule matches one host), so this
+ *     is not the barrier; it is the barrier not resting on the certificate.
+ *   - an empty label, which is a trailing dot or a doubled separator.
+ *   - fewer than three labels, an address literal, or an IPv6 host. 127.0.0.1
+ *     has four labels but no parent domain, and api.0.0.1 is not a host; a
+ *     registrable domain never ends in a numeric label.
+ *
+ * It takes the host rather than reading it, so the rule can be stated as a
+ * table in a test instead of a claim in a comment. [origin] is the one caller
+ * that reads the window.
  *
  * There is deliberately no override. An override is the setting this exists to
- * remove.
+ * remove: a configurable API origin is a value that points every authenticated
+ * request somewhere, and pointing it at a host somebody else controls hands
+ * over a bearer on the next call.
  */
-export function origin(): string {
-  const host = window.location.hostname
-  if (host.includes(':')) return '' // IPv6 literal
-  const labels = host.split('.')
+export function apiOrigin(protocol: string, hostname: string): string {
+  if (hostname.includes(':')) return '' // IPv6 literal
+  const labels = hostname.split('.')
   if (labels.length < 3) return ''
+  if (labels.some((l) => l === '')) return ''
+  if (labels[0] !== CONSOLE) return ''
   if (/^\d+$/.test(labels[labels.length - 1])) return '' // IPv4 literal
-  return `${window.location.protocol}//api.${labels.slice(1).join('.')}`
+  return `${protocol}//api.${labels.slice(1).join('.')}`
+}
+
+/** origin is [apiOrigin] applied to the host this bundle is being served on. */
+export function origin(): string {
+  return apiOrigin(window.location.protocol, window.location.hostname)
 }
 
 let clientID = ''

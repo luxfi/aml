@@ -128,3 +128,14 @@ jobs:
         run: |
           npm --prefix ui run build
           test -f ui/dist/index.html
+
+      - name: The console under the CSP it is served with, signed in
+        # The policy in ui/csp.txt is the one charts/app/values/hanzo/aml-ui.yaml
+        # sets on the static server, and e2e/serve.mjs sends it verbatim. The kit
+        # styles by inserting rules at runtime, which is the thing a strict
+        # style-src refuses, so whether the arrangement in ui/src/gui.ts holds is
+        # a question only a browser can answer — and the signed-in tree is where
+        # the six screens that do the styling live.
+        run: |
+          npm --prefix ui exec playwright install --with-deps chromium
+          npm --prefix ui run e2e

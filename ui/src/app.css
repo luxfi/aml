@@ -1,25 +1,57 @@
 /*
- * The one stylesheet.
+ * The one stylesheet: the layout this console is arranged in, and the bridge
+ * from the kit's theme to the names the rest of this file uses.
  *
- * Surfaces, ink, radii and type come from @hanzo/tokens — the canonical Hanzo
- * design tokens, the same values @hanzo/ui's theme.css derives from — so this
- * console is the Hanzo identity rather than a lookalike. Nothing here invents a
- * neutral; every one is a token.
+ * Surfaces, ink, radii and type are @hanzo/gui's — the kit puts its theme on
+ * the document as CSS custom properties (see src/gui.ts for how, and why it is
+ * a CSSOM call rather than a <style> element). Every `--hz-*` below is that
+ * theme under the name this stylesheet already used, with a literal fallback so
+ * a kit that renames a variable degrades to the right colour instead of an
+ * unreadable one. Nothing here invents a neutral.
  *
  * State colour is the only palette that is NOT themed: four fixed steps for
  * good / warning / serious / critical, each of which clears 3:1 on this surface
  * and NEVER carries meaning alone — every badge, row accent and dot ships with
- * its label, so a reader who cannot separate the hues reads the same thing.
- * Text always wears an ink token; the colour sits in a mark beside it.
+ * its label, so a reader who cannot separate the hues reads the same thing. A
+ * supervisor's copy of a screenshot has to mean what the screen meant, which a
+ * themed palette cannot promise.
  *
- * There are no inline styles anywhere in this app, so the served CSP needs no
- * 'unsafe-inline' for style-src. Anything that must be sized from data is drawn
- * in SVG, where geometry is an attribute rather than a style.
+ * There are no inline styles anywhere in this app and no style element written
+ * from markup, so the served CSP needs no 'unsafe-inline' for style-src.
+ * Anything that must be sized from data is drawn in SVG, where geometry is an
+ * attribute rather than a style.
  */
 
-@import '@hanzo/tokens/css';
-
 :root {
+  /* The kit's theme, under this file's names. */
+  --hz-background: var(--background, oklch(0.145 0 0));
+  --hz-foreground: var(--color, oklch(0.985 0 0));
+  --hz-muted-foreground: var(--color11, oklch(0.708 0 0));
+  --hz-card: var(--color2, oklch(0.205 0 0));
+  --hz-border: var(--borderColor, oklch(1 0 0 / 12%));
+  --hz-input: var(--color3, oklch(1 0 0 / 8%));
+  --hz-ring: var(--color8, oklch(0.556 0 0));
+  --hz-primary: var(--color, oklch(0.985 0 0));
+  --hz-primary-foreground: var(--background, oklch(0.205 0 0));
+  --hz-accent: var(--color4, oklch(0.269 0 0));
+  --hz-sidebar: var(--color1, oklch(0.175 0 0));
+  --hz-sidebar-accent: var(--color3, oklch(0.24 0 0));
+  --hz-radius: var(--radius-4, 8px);
+  --hz-font-sans: var(--font-body, ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif);
+  --hz-font-mono: var(--font-mono, ui-monospace, SFMono-Regular, 'SF Mono', Menlo, monospace);
+  --hz-text-xs: 11px;
+  --hz-text-sm: 13px;
+  --hz-text-lg: 16px;
+  --hz-text-2xl: 22px;
+  --hz-leading-none: 1;
+  --hz-leading-normal: 1.5;
+  --hz-leading-relaxed: 1.65;
+  --hz-tracking-tight: -0.01em;
+  --hz-tracking-wide: 0.02em;
+  --hz-tracking-wider: 0.06em;
+  --hz-weight-medium: 500;
+  --hz-weight-semibold: 600;
+
   --ink: var(--hz-foreground);
   --ink-2: var(--hz-muted-foreground);
   --ink-3: oklch(0.55 0 0);

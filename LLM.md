@@ -341,9 +341,50 @@ Verified against production IAM: `hanzo.id` reflects `https://aml.hanzo.ai` on
 discovery, token and userinfo, so the flow works cross-origin from the console
 host.
 
-Tech: React 19, wouter, Vite 6, `@hanzo/iam` for auth, `@hanzo/tokens` for the Hanzo design tokens —
-the same values `@hanzo/ui`'s `theme.css` derives from. No runtime style
-injection anywhere, so the served CSP needs no `'unsafe-inline'`.
+Tech: React 19, wouter, Vite 8, `@hanzo/iam` for auth, **`@hanzo/gui`** for the
+kit — the Hanzo design system, so this console wears the fleet's identity rather
+than a lookalike assembled here. Layout, surfaces, controls and type are the
+kit's; the four state colours and the meter are not (`ui/src/ui.tsx` says why).
+The kit is imported at the part (`@hanzogui/stacks`, `@hanzogui/button`, …)
+rather than at the barrel, because the barrel re-exports components built on
+react-native primitives this bundle never renders. One kit, one version pin.
+
+### The console and the CSP
+
+The served policy carries no `'unsafe-inline'`, and the kit styles at runtime.
+That is not a contradiction; it is an arrangement, and it is in one file
+(`ui/src/gui.ts`).
+
+`GuiProvider` would render the config's stylesheet as `<style>{getCSS()}</style>`
+— an inline style element, whose text `style-src` governs. `disableInjectCSS`
+turns that off and the same CSS goes on the document through a **constructed
+stylesheet**. CSP does not govern the CSSOM: the script that called it had
+already passed `script-src`. The kit's per-component rules take the same route,
+into **empty** `<style>` holders, and `'sha256-47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU='`
+— the SHA-256 of the empty string — is what allows those and nothing else.
+
+One style *attribute* survives, on the kit's theme root. It is written through
+`element.style`, which is CSSOM again, so it applies and raises nothing. A style
+attribute **parsed from markup** — the shape an injection takes — is refused,
+and `ui/e2e/console.spec.ts` asserts that too, as a positive control: "no
+violations" proves nothing without evidence that a violation would have been
+noticed.
+
+`ui/csp.txt` is the policy under test, byte-identical to the `HANZO_STATIC_CSP`
+in `charts/app/values/hanzo/aml-ui.yaml`. The two are the one place each side
+states it; changing one means changing the other.
+
+```bash
+npm --prefix ui run e2e     # builds, serves under csp.txt, drives Chromium
+```
+
+The harness signs in before the first script runs, so what it exercises is the
+SIGNED-IN tree — six screens, every control — not the sign-in gate. It walks
+whatever the rail offers rather than a hard-coded list, so a screen added
+without a test is still a screen it covers. It serves the mock API on its own
+origin, which is not a relaxation: a host with no parent domain means same
+origin (`ui/src/config.ts`), so `connect-src 'self'` covers it and the policy
+stays byte-identical to the deployed one.
 
 ## Transaction Ingest Flow
 
