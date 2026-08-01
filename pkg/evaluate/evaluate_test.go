@@ -220,4 +220,67 @@ func TestCurveIsEmptyWithoutBothClasses(t *testing.T) {
 	}
 }
 
+// A price that cannot be multiplied by the count without wrapping produces NO
+// cost and says why. The wrapped number would be negative, would be the minimum
+// of the sweep, and would therefore be returned as the threshold to adopt — an
+// arithmetic failure wearing the shape of a recommendation.
+func TestAnUnrepresentablePriceIsAbsentAndNotWrapped(t *testing.T) {
+	var obsv []Observation
+	for i := range 200 {
+		obsv = append(obsv, obs(float64(i)/200, i%3 == 0))
+	}
+	huge := policy.Cost{Miss: math.MaxInt64 / 4, Alarm: math.MaxInt64 / 4}
+	m := Measure(obsv, 0.5, huge, calibrate.Map{})
+	if m.CostNano != nil {
+		t.Errorf("a cost of %d was reported from a product that does not fit in an int64", *m.CostNano)
+	}
+	if m.BestNano != nil || m.BestThreshold != nil {
+		t.Error("an operating point was recommended from arithmetic that overflowed")
+	}
+	if m.Refusal == "" {
+		t.Error("the cost was dropped in silence, which reads as an unpriced policy")
+	}
+	// The rank statistics are unaffected: they never touch the prices.
+	if m.ROC == nil || m.PR == nil {
+		t.Error("separation went missing because a price did not fit")
+	}
+	// And nowhere on the curve is a wrapped number plotted.
+	for i, p := range Curve(obsv, huge) {
+		if p.CostNano != 0 {
+			t.Fatalf("curve point %d carries %d, a price the arithmetic could not represent", i, p.CostNano)
+		}
+	}
+}
+
+// A curve is a chart and the response carrying it is read by a browser. The
+// metrics behind it stay exact over every distinct score; what is RETURNED is
+// bounded, keeps both ends, and stays descending — a truncated curve would
+// describe a model that stops.
+func TestTheCurveIsBoundedAndKeepsItsEnds(t *testing.T) {
+	n := Plotted * 7
+	var obsv []Observation
+	for i := range n {
+		obsv = append(obsv, obs(float64(i)/float64(n), i%5 == 0))
+	}
+	full := Curve(obsv, policy.Cost{})
+	if len(full) > Plotted {
+		t.Fatalf("the curve returned %d points, above the bound of %d", len(full), Plotted)
+	}
+	if len(full) < Plotted {
+		t.Fatalf("the curve returned %d points from %d distinct scores; it should fill the bound", len(full), n)
+	}
+	last := full[len(full)-1]
+	if last.TruePositive != 1 || last.FalsePositive != 1 {
+		t.Errorf("the sampled curve lost its far end: %+v", last)
+	}
+	if full[0].Threshold <= full[len(full)-1].Threshold {
+		t.Error("the sampled curve is not descending")
+	}
+	for i := 1; i < len(full); i++ {
+		if full[i].TruePositive < full[i-1].TruePositive || full[i].FalsePositive < full[i-1].FalsePositive {
+			t.Fatalf("sampling reordered the curve at %d", i)
+		}
+	}
+}
+
 func at(i int) time.Time { return time.Unix(int64(1_700_000_000+i*60), 0).UTC() }
