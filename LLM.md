@@ -98,6 +98,23 @@ pkg/
   replay/replay.go         -- Rule sandbox: replays a candidate over real history
                               through the engine's own evaluator, writes nothing
   webhook/webhook.go       -- Signed delivery (HMAC-SHA256) with retry + dead-letter
+  lists/                   -- The institution's own allow and deny lists, and the
+                              one rule term over them: Listed(name, value)
+  suppress/                -- The decisions to keep a detection out of a queue:
+                              reason, decider, window, and the narrowest-wins cover
+  watch/                   -- Every activation as it fires, the rungs that raise a
+                              response, the fold that marks a repeat, the live feed
+  dictionary/              -- What a tenant's payloads carry: declared fields by
+                              reflection, the tenant's own Raw keys, fill, blindness
+                              and a distinct count kept as a bitmap and never values
+  topology/                -- The space of model shapes, searched over a tenant's
+                              own history. Pure: no store, nothing it could write to
+  models/                  -- The record of every search and every fitted state, and
+                              the one path that adopts one into the live model
+  api/typed.go             -- One operation shape, two adapters: the tenant is an
+                              argument, the input is one struct, the output another
+  api/planes.go            -- The five planes on the router, and the one place
+                              ingest meets them
   api/routes.go            -- /v1/aml/* HTTP routes + SanctionsStore on Base
   api/records.go           -- The one place retention, token and replay are joined
   api/anomaly.go           -- Model state for governance + candidate scoring
@@ -112,6 +129,8 @@ pkg/
   api/brand.go             -- GET /v1/aml/config: the brand identity of this Host
   brand/brand.go           -- Brand id and request Host -> issuer + domains
                               (HIP-0111; the same registry as hanzoai/cloud brand)
+  brand/tenant.go          -- The tenant key <brand>/<org>: Qualify, Qualified and
+                              the boundary check every record plane calls
 ```
 
 ## Behavioural detection
@@ -195,6 +214,24 @@ scores, learns and reports what it *would* have alerted on, changing nothing.
 | GET | /v1/aml/catalog | Coverage: installed rules, their citations, and the stated gaps |
 | GET | /v1/aml/health | Health check, 503 when records cannot be kept |
 | GET | /v1/aml/config | Brand identity of the request's Host: brand, display name, issuer, domain |
+| GET/POST | /v1/aml/lists | The tenant's declared lists / declare one |
+| GET/POST | /v1/aml/lists/{name}/entries | Read a list / put values on it |
+| POST | /v1/aml/lists/{name}/entries/remove | Take a value off; the row stays |
+| GET | /v1/aml/lists/{name}/lookup | Is this value listed, and on what entry |
+| GET/POST | /v1/aml/suppressions | The suppression ledger / declare one |
+| POST | /v1/aml/suppressions/{id}/lift | End one, with its own reason and decider |
+| GET/POST | /v1/aml/activations | The activation feed / record one |
+| GET | /v1/aml/activations/rates | Per rule: fired, live, silenced, folded, elevated |
+| GET/POST | /v1/aml/rungs | The declared ladder / declare a rung |
+| POST | /v1/aml/rungs/{id}/retire | Retire one; the row stays |
+| GET | /v1/aml/dictionary | What this tenant's payloads carry, and what is blind |
+| GET/POST | /v1/aml/models/runs | Past searches / run one over this tenant's history |
+| GET | /v1/aml/models/runs/{id} | One whole search: every trial, every curve |
+| GET/POST | /v1/aml/models/fits | Fitted states / fit one under a shape |
+| POST | /v1/aml/models/fits/{id}/adopt | Install a fit into the live model |
+
+Every route above is `get(h, <plane>.<Op>)` or `post(h, <plane>.<Op>)` and nothing
+else — see "The five planes" below.
 
 Every route resolves its tenant through `Handler.Identity`. Exactly two do not:
 `/v1/aml/config`, which names the issuer a caller needs in order to obtain a token
@@ -247,6 +284,171 @@ pseudonyms and its sealed records open under the other's tenant.
 The isolation boundary is the deployment: each brand runs its own store, issuer and
 ingress host. Brand-qualifying the key is what makes that boundary something other
 than the only thing standing between two institutions.
+
+## The five planes
+
+Five capabilities an institution operates its monitoring programme through, each
+its own package, each a durable record plane, and none of them able to destroy
+anything: disposal is `pkg/retention`'s decision alone (AMLR Art. 77), per tenant,
+and every one of these packages has a test that reads its own source for a call to
+`Delete`.
+
+| Plane | Package | What it is | What it refuses |
+|---|---|---|---|
+| Lists | `pkg/lists` | The institution's own allow and deny lists, by class, reachable from a rule as `Listed(name, value)` | A list nobody declared, and an empty value — both would be a rule that is catalogued, reported as coverage, and incapable of firing |
+| Suppression | `pkg/suppress` | The decisions to keep a detection out of a queue: reason, decider, window | A suppression naming neither a rule nor a subject: that is a kill switch, not a suppression |
+| Watcher | `pkg/watch` | Every activation as it fires, what became of it, and a live feed over the durable rows | An activation with no subject — it would pool every anonymous detection under one imaginary customer |
+| Dictionary | `pkg/dictionary` | What a tenant's payloads carry: fill, blindness, distinct-count, and the model's own inventory | Nothing. It is a diagnostic and must never be able to refuse a payment |
+| Models | `pkg/topology` + `pkg/models` | The space of model shapes searched over a tenant's own history, and the record of every search and fit | A winner nobody can justify, and a fit installed into a model of another shape |
+
+### Suppression is a marking, never a drop
+
+A detection a suppression covers, or a repeat inside a fold window, is WRITTEN and
+marked with the reason it did not reach a queue. `Action` is what the rule asked
+for; `Response` is what the plane concluded. A monitoring system that discards what
+it decided not to show cannot answer how much it is not showing, and "no alerts"
+then means either a quiet institution or a silent control with no way to tell
+which. Because the suppression's id is on every activation it covered, "how much
+has this silenced" is a query — which is why nothing keeps a counter of it.
+
+### Elevation and folding are one mechanism
+
+A RUNG is a tenant's declared policy: when this rule has fired this many times on
+one subject within this window, do this. `To: watch.Fold` marks the repeat as a
+duplicate; `To: <action>` raises the response. A rung can only RAISE — lowering is
+a suppression by another name, and a suppression is asked for a reason and a
+decider that a rung is not asked for on every activation it touches. Elevation
+beats folding, because an activation that reached an escalation rung IS the
+escalation and not a repeat of one. With no rung declared nothing folds: silence is
+a decision, never a default.
+
+### The dictionary stores no value, ever
+
+A distinct-value count is a bitmap sketch (linear counting, 4096 bits per field per
+tenant), hashed with the tenant in the key so two tenants' bitmaps cannot be
+compared to learn whether they share a customer. Identifiers belong in the retained
+record plane, sealed and purpose-gated; a statistics table does not get a second
+copy of them under a weaker regime. The estimate SATURATES — "at least this many,
+and no longer a count" — rather than drifting down, because a cardinality that
+silently stops rising reads as a field that stopped varying.
+
+The catalog is write-behind: observations accumulate and are written on a cadence
+and at shutdown. That is deliberate — a field statistic is not a compliance record,
+and paying an indexed write per field per transaction would spend the ingest path's
+latency on a diagnostic. What is not acceptable is silence about it, so `Pending`
+is published: a restart loses exactly that many observations and the answer says
+so.
+
+### A search names no winner it cannot justify
+
+Ranking model shapes needs an outcome, and the only honest one is whether a shape
+separates the events a human judged productive from the events a human dismissed
+(the area under the ROC curve of its scores against those dispositions). Where
+nothing has been judged, `topology.Search` reports every trial and NO winner, with
+the reason. A ranking invented from unlabelled data — most alerts, fewest alerts,
+best-behaved threshold — would look like a recommendation and would be a
+preference. Ties go to the smaller model: a shape that ties on evidence and costs
+less is the better answer, and preferring the bigger one drifts the fleet upward
+every time a search runs.
+
+`pkg/topology` has no store and imports nothing that has one, exactly as
+`pkg/replay` does not — and a test reads its imports to keep it that way. A trial
+builds its own detector and its own aggregate store, uses them, and drops them.
+
+`models.Fit` produces learned state, and `anomaly.Restore` will only install it
+into a model of the SAME shape (the digest). That is a governance property, not a
+limitation: a tenant's model shape cannot be swapped underneath it by restoring a
+file. The learned state itself never leaves the store — mass counters describe
+where a tenant's activity is dense, and handing them out over an API would publish
+the shape of an institution's customer behaviour to whoever holds a token.
+
+### One operation shape, two faces
+
+Every operation on every plane is
+
+```go
+func(ctx context.Context, org string, in *In) (*Out, error)
+```
+
+— the tenant is an argument and never something the operation resolves for itself,
+the input is one typed struct, the output is another. `pkg/api/typed.go` is the
+whole of what turns one into an HTTP route: `get` binds the input from the query
+string, `post` from the body, both driven by the same json tags, and the route's
+own path parameters are bound last and win. `pkg/api/planes.go` is then a routing
+table with no handler bodies in it, and a test reads it as source to keep it that
+way.
+
+The point is that the CONTRACT is the pair of Go types and nothing else. The cloud
+mount wraps the same functions as zip typed operations — where the same In and Out
+become the OpenAPI schema, the CLI, the SDKs and the MCP tools — with no line of
+the contract restated. See "A native zip conversion" below for what that costs.
+
+### The tenant key, and where it is checked
+
+`brand.Qualify(brandID, org)` mints `<brand>/<org>` and `brand.Qualified` is
+derived from it, so there is one definition of the shape. `pkg/api/tenant.go`'s
+`qualify`/`qualified` are aliases of those, not a second implementation.
+
+Every one of the five planes calls `brand.Tenant(org)` at its own boundary before
+it writes. The check is in the planes and not only where the key is minted because
+the identity comes from a seam the DEPLOYMENT supplies: this is where the value
+crosses into a store index, and an unqualified org reaching one puts two brands'
+institutions of the same name into one tenant. Each plane has a
+`TestBareOrgIsRefused` over every operation and a `TestTenantIsolation` that uses
+the same org name under a second brand — which is the case a bare-org regression
+collides.
+
+## A native zip conversion
+
+The typed operations above were written so that the cloud mount is a wrap. What a
+full native-zip conversion of this engine would take, measured against the code as
+it stands:
+
+**Already done, and it is most of the work.** The 19 plane routes are typed
+operations over 24 In/Out struct pairs with json tags on every field. A zip face
+over them is one line each:
+
+```go
+zip.Post(g, "/lists", ops.declare, zip.WithOperationID("amlDeclareList"), zip.WithTags("aml"))
+```
+
+where `ops.declare` reads the tenant from the validated principal and calls
+`lists.Shelf.Declare` — the same function this repo's Base router calls. Nothing in
+the contract is restated.
+
+**What is left, and it is the older half.** The 19 pre-existing routes in
+`api/routes.go` are `func(*core.RequestEvent) error` closures that decode an
+anonymous struct inline, so each one's request shape exists only inside its
+handler. Converting them is: lift each anonymous struct to a named In type, lift
+each `e.JSON(...)` literal to a named Out type, and move the body to
+`func(ctx, org, *In) (*Out, error)`. `POST /v1/aml/transactions` is the largest —
+its In is the embedded `types.Transaction` plus `relationship` and `entity`, and
+its Out is the anonymous `EvalResult`+`record` struct at routes.go. Roughly 19
+types to name and 19 handler bodies to move; no logic changes and no behaviour
+changes.
+
+**Three things a conversion must decide rather than discover.**
+
+1. **Schema names are flat across the fleet.** Every type this repo would publish
+   needs a prefix — `amlDeclareListIn`, `amlActivation`, `mlSearchRun` — because a
+   weave refuses one name with two shapes and binds an SDK to whichever it read
+   last. The plane types here are currently named for their package
+   (`lists.DeclareIn`, `watch.DeclareIn`) and are distinct only by import path,
+   which a flat namespace does not have.
+2. **`GET /v1/aml/health` cannot be a typed operation.** A real probe answers 503
+   carrying the degraded report AS ITS BODY (`readiness.go`), and a typed operation
+   reaches a non-2xx only by returning an error, which renders as the framework's
+   envelope and drops the report. It stays untyped, deliberately, and belongs on
+   whatever closed list the mount keeps of routes that are untyped by design.
+3. **The tenant must come from the principal, not from an In field.** Every
+   operation here already takes `org` as its first argument for exactly this
+   reason. A conversion that put the org on the In struct would make it
+   caller-supplied, which is a cross-tenant read the caller asserted for itself.
+
+**What does not convert.** `watch.Shelf.Subscribe` is a channel, not a request. A
+live feed is a transport concern (server-sent events, or a ZAP stream) over the
+same durable rows that `GET /v1/aml/activations` pages; it is not a typed operation
+and should not be made to look like one.
 
 ## Records, tokenisation, and the sandbox
 
@@ -309,6 +511,11 @@ processed.
 | `AML_DEFAULT_ORG` | Label carried by the rule catalog. The catalog is the deployment's, not a tenant's |
 | `AML_BUSINESS_ZONE` | Zone business-day and business-hour rules are answered in. Default UTC |
 | `AML_ANOMALY` | `live` leaves shadow mode. Anything else scores without contributing |
+
+The five planes take no configuration. A list, a suppression and a rung are all
+tenant DECLARATIONS carrying a reason and a decider, so none of them is a switch an
+operator flips in a manifest — which is the point: a control that can be turned off
+by an environment variable has no record of who turned it off.
 
 ## Console (`ui/`)
 
@@ -623,6 +830,11 @@ record-keeping rules make an exception for.
 | Retained records | `aml_retention`, `aml_retention_parties` | `retention.Ensure` + `retention.NewBase` | `TestRetainedRecordsSurviveARestart` |
 | Cases + timelines | `aml_cases`, `aml_case_events` | `cases.Ensure` + `cases.NewBase` | `TestCasesSurviveARestart` |
 | Alerts | `aml_alerts` | `api.EnsureAlerts` + `api.NewAlertStoreBase` | `TestAlertsSurviveARestart` |
+| Lists | `aml_lists`, `aml_list_entries` | `lists.Ensure` + `lists.NewBase` | `lists.TestRestart` |
+| Suppressions | `aml_suppressions` | `suppress.Ensure` + `suppress.NewBase` | `suppress.TestRestart` |
+| Activations + rungs | `aml_activations`, `aml_rungs` | `watch.Ensure` + `watch.NewBase` | `watch.TestRestart` |
+| Field catalog | `aml_fields`, `aml_payloads` | `dictionary.Ensure` + `dictionary.NewBase` | `dictionary.TestRestart` |
+| Model runs + fits | `aml_model_runs`, `aml_model_fits` | `models.Ensure` + `models.NewBase` | `models.TestRestart` |
 
 Each test writes, copies the data directory as it stands, drops the instance,
 opens a second one over those bytes, and asks again — including that the tenant
@@ -662,11 +874,16 @@ v0.3.x tag before v0.3.6 is a tag with nothing behind it for these reasons.
 
 ## Test Coverage
 
-366 Go tests across 18 packages, all green under `-race`, plus 12 browser tests.
+Go tests across 24 packages, all green under `-race`, plus 12 browser tests.
 
 - api: 52 · retention: 43 · cases: 40 · sanctions: 39 · engine: 38 · anomaly: 27
 - measure: 26 · screen: 15 · token: 14 · replay: 14 · rules: 13 · velocity: 11
 - brand: 8 · chain: 7 · workflows: 7 · webhook: 5 · store: 4 · history: 3
+- lists · suppress · watch · dictionary · topology · models — each carries a
+  `TestTenantIsolation` (the same org name under a second brand), a
+  `TestBareOrgIsRefused` over every operation, a `TestNothingDeletes` that reads
+  the package's own source, and a `TestRestart` that opens a second instance over
+  the first one's bytes (`internal/instance`)
 
 The browser suite is `ui/e2e`, run by `npm --prefix ui run e2e` and by CI. It
 builds the bundle, serves it under `ui/csp.txt`, signs in before the first
