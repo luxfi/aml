@@ -307,7 +307,7 @@ func (s *Store) Config() Config {
 // every baseline in the feature set has the transaction removed from it
 // arithmetically so that nothing is measured against itself.
 func (s *Store) Assess(tx types.Transaction, entity types.Entity) (types.RuleHit, bool) {
-	a := s.judge(tx, true)
+	a := s.Learn(tx, entity)
 	if !a.Alert {
 		return types.RuleHit{}, false
 	}
@@ -328,6 +328,20 @@ func (s *Store) Assess(tx types.Transaction, entity types.Entity) (types.RuleHit
 		Match:  true,
 		Causes: a.Causes,
 	}, true
+}
+
+// Learn scores one transaction, lets the model learn from it, and returns the
+// whole assessment.
+//
+// It is what Assess does, with the answer not yet reduced to the engine's Scorer
+// shape. The two cannot disagree about what the model did, because Assess is
+// defined in terms of this and there is no second scoring path — which is the
+// property that lets a study of the model (pkg/topology) replay a tenant's own
+// history through the code that scores production, and read the score of every
+// event as the model learned it, rather than through a copy of the algorithm
+// that would be free to be wrong.
+func (s *Store) Learn(tx types.Transaction, entity types.Entity) Assessment {
+	return s.judge(tx, true)
 }
 
 // Inspect scores one transaction without learning from it, moving any counter, or

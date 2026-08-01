@@ -310,6 +310,26 @@ func (s *scope) Screened(name, class string) (bool, error) {
 	return hit.Matched, nil
 }
 
+// Listed reports whether a value is on one of this institution's own lists.
+//
+// The tenant is the transaction's, never the caller's and never an argument: a
+// rule that could name the org it reads lists from would be a cross-tenant read
+// the rule author asserted for itself.
+//
+// An empty value is an error and not a miss, for the same reason Seen refuses
+// one. A transaction carrying no address must not quietly satisfy — or quietly
+// fail — a rule that checks addresses against a deny list: that reports "nothing
+// to see" for precisely the transactions that withheld the evidence.
+func (s *scope) Listed(name, value string) (bool, error) {
+	if name == "" {
+		return false, fmt.Errorf("Listed: no list named")
+	}
+	if value == "" {
+		return false, fmt.Errorf("Listed: value for list %q is empty", name)
+	}
+	return s.p.Lists.Listed(s.ctx, s.Tx.OrgID, name, value)
+}
+
 // Tier is the published risk tier of a jurisdiction: empty, monitoring, or
 // action.
 func (s *scope) Tier(code string) (string, error) {
