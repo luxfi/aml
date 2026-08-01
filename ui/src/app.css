@@ -22,9 +22,16 @@
  * attribute rather than a style.
  */
 
-/* Values that are the console's own and answer to no theme: the four state
-   steps, the type scale, and the two fixed dimensions of the frame. */
+/* Values that are the console's own and answer to no theme: the typefaces, the
+   four state steps, the type scale, and the two fixed dimensions of the frame.
+   A typeface is not a theme — the same two stacks serve dark and light — so
+   they are declared here, where every element can reach them. They were in the
+   theme bridge below, which is on .shell and .gate; body is outside both, so
+   `font-family: var(--hz-font-sans)` there substituted nothing, the declaration
+   was invalid, and the document fell back to the browser's default serif. */
 :root {
+  --hz-font-sans: ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
+  --hz-font-mono: ui-monospace, SFMono-Regular, 'SF Mono', Menlo, monospace;
   --hz-text-xs: 11px;
   --hz-text-sm: 13px;
   --hz-text-lg: 16px;
@@ -77,8 +84,6 @@
   --hz-sidebar: var(--color1, oklch(0.175 0 0));
   --hz-sidebar-accent: var(--color3, oklch(0.24 0 0));
   --hz-radius: var(--radius-4, 8px);
-  --hz-font-sans: var(--font-body, ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif);
-  --hz-font-mono: var(--font-mono, ui-monospace, SFMono-Regular, 'SF Mono', Menlo, monospace);
 
   --ink: var(--hz-foreground);
   --ink-2: var(--hz-muted-foreground);
