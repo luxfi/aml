@@ -149,6 +149,15 @@ jobs:
         # style-src refuses, so whether the arrangement in ui/src/gui.ts holds is
         # a question only a browser can answer — and the signed-in tree is where
         # the six screens that do the styling live.
+        #
+        # The browser comes from the console's own script. It was `npm --prefix ui
+        # exec playwright install --with-deps chromium`, and npm's parser ate
+        # `--with-deps` before playwright saw it: the browser downloaded, its
+        # shared libraries did not, and every test that opened a page died on
+        # libnspr4.so — 7 of 12, the whole signed-in suite, on the first run this
+        # job ever reached. Same shape as the tsc call above. `npm run` hands a
+        # script's arguments to the script, so the package states the command once
+        # and CI has no second copy to get wrong.
         run: |
-          npm --prefix ui exec playwright install --with-deps chromium
+          npm --prefix ui run e2e:browser
           npm --prefix ui run e2e
