@@ -9,6 +9,17 @@ import react from '@vitejs/plugin-react'
 export default defineConfig({
   plugins: [react()],
   base: '/',
+  // @hanzo/gui is one kit for web and native, so its default configuration
+  // reaches for the react-native animation driver even on this side. The kit
+  // ships the web stand-in for exactly that; pointing the two react-native
+  // specifiers at it keeps one dependency out of a browser bundle that has no
+  // use for it. Nothing in this app imports react-native itself.
+  resolve: {
+    alias: {
+      'react-native': '@hanzogui/fake-react-native',
+      'react-native-web': '@hanzogui/fake-react-native',
+    },
+  },
   build: { outDir: 'dist', emptyOutDir: true, sourcemap: false },
   server: {
     port: 3000,

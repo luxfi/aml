@@ -10,3 +10,5 @@
 ui/dist/
 ui/node_modules/
 ui/tsconfig.tsbuildinfo
+ui/test-results/
+ui/playwright-report/
