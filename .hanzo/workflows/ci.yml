@@ -131,7 +131,12 @@ jobs:
         # is what the image builds.
         run: npm --prefix ui ci
       - name: Typecheck
-        run: npm --prefix ui exec tsc -- --noEmit
+        # The console's own script, the same way every other step here reaches it.
+        # `npm --prefix ui exec tsc -- --noEmit` ran the compiler from the REPO
+        # root, where there is no tsconfig, so tsc printed its help and exited 1 —
+        # this job has never once passed, and the browser suite below it therefore
+        # never ran in CI at all.
+        run: npm --prefix ui run typecheck
       - name: Build the bundle
         run: |
           npm --prefix ui run build
