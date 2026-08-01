@@ -104,26 +104,46 @@ jobs:
         # an unauthenticated read of /v1/aml/cases is refused with 401. The
         # benign-payment-clears check lives in the engine's own tests, where a
         # signed token can be constructed.
+        #
+        # The probe shares THIS job container's network namespace instead of
+        # publishing a port. The step runs inside a job container while the docker
+        # daemon is the runner's own, so `-p 127.0.0.1:…` binds in the runner's
+        # namespace and the loopback here never reaches it — measured, the probe
+        # got no connection at all while the container logged that it was serving.
+        # Sharing the namespace makes the two loopbacks the same one and needs
+        # nothing published.
+        #
+        # The token key is hex from od/tr, not xxd: xxd is not in the runner image,
+        # and the substitution failed quietly to an EMPTY key rather than failing
+        # the step, so the daemon was smoked without the key it is given in
+        # production.
         run: |
           set -euo pipefail
           img="${{ steps.meta.outputs.probe }}"
           docker run --rm --entrypoint sh "$img" -c 'command -v amld'
 
+          self="$(hostname)"
+          docker inspect "$self" >/dev/null 2>&1 \
+            || { echo "::error::cannot resolve this job container ($self) to share its network"; exit 1; }
+
+          key=$(head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n')
+          [ ${#key} -eq 64 ] || { echo "::error::token key is ${#key} hex chars, want 64"; exit 1; }
+
           cid=$(docker run -d \
             -e AML_TENANT_HEADER=X-Org-Id \
             -e AML_CLIENT_ID=aml-release-smoke \
-            -e AML_TOKEN_KEY="$(head -c 32 /dev/urandom | xxd -p -c 64)" \
-            -p 127.0.0.1:8799:8090 "$img")
+            -e AML_TOKEN_KEY="$key" \
+            --network "container:$self" "$img")
           trap 'docker logs "$cid" | tail -60; docker rm -f "$cid" >/dev/null 2>&1 || true' EXIT
 
           ready=""
           for i in $(seq 1 30); do
-            if curl -sf -o /dev/null http://127.0.0.1:8799/v1/aml/health; then ready=1; break; fi
+            if curl -sf -o /dev/null http://127.0.0.1:8090/v1/aml/health; then ready=1; break; fi
             sleep 2
           done
           [ -n "$ready" ] || { echo "::error::amld never answered /v1/aml/health"; exit 1; }
 
-          code=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8799/v1/aml/cases)
+          code=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8090/v1/aml/cases)
           [ "$code" = "401" ] || { echo "::error::unauthenticated read returned $code, want 401"; exit 1; }
 
           echo "serves, and refuses an unauthenticated read"
@@ -239,30 +259,40 @@ jobs:
         # API origin is derived from the host and the clientId comes from the
         # API; and the bundle names no clientId of its own, so the same image is
         # every brand's.
+        #
+        # Same namespace sharing as the daemon's smoke, for the same measured
+        # reason: a published port lands in the runner's network namespace, not
+        # this job container's, so the loopback probe could never reach a console
+        # that was serving perfectly well.
         run: |
           set -euo pipefail
           img="${{ steps.meta.outputs.probe }}"
-          cid=$(docker run -d -p 127.0.0.1:8798:3000 "$img")
+
+          self="$(hostname)"
+          docker inspect "$self" >/dev/null 2>&1 \
+            || { echo "::error::cannot resolve this job container ($self) to share its network"; exit 1; }
+
+          cid=$(docker run -d --network "container:$self" "$img")
           trap 'docker logs "$cid" | tail -40; docker rm -f "$cid" >/dev/null 2>&1 || true' EXIT
 
           ready=""
           for i in $(seq 1 30); do
-            if curl -sf -o /dev/null http://127.0.0.1:8798/healthz; then ready=1; break; fi
+            if curl -sf -o /dev/null http://127.0.0.1:3000/healthz; then ready=1; break; fi
             sleep 1
           done
           [ -n "$ready" ] || { echo "::error::the console never answered /healthz"; exit 1; }
 
-          curl -sf http://127.0.0.1:8798/ | grep -q '<div id="root">' \
+          curl -sf http://127.0.0.1:3000/ | grep -q '<div id="root">' \
             || { echo "::error::/ did not serve the bundle"; exit 1; }
 
-          curl -sf http://127.0.0.1:8798/cases/anything | grep -q '<div id="root">' \
+          curl -sf http://127.0.0.1:3000/cases/anything | grep -q '<div id="root">' \
             || { echo "::error::a deep link did not fall back to index.html"; exit 1; }
 
           # A config.json would mean the API origin is a setting again, and a
           # setting that points every authenticated request somewhere is the one
           # worth attacking. In SPA mode an absent file falls back to index.html,
           # so the check is that it is NOT a config document.
-          if curl -sf http://127.0.0.1:8798/config.json | grep -q '"api"'; then
+          if curl -sf http://127.0.0.1:3000/config.json | grep -q '"api"'; then
             echo "::error::a config.json is being served — the API origin is derived, not configured"; exit 1
           fi
 
