@@ -190,6 +190,11 @@ M = [
   "./pkg/api/", "TestTheDeciderIsTheCredentialAndNotTheBody",
   "a governed record names the verified subject, not the request body"),
 
+ ("case-decider-from-the-body", "pkg/api/routes.go",
+  "\t\t// The decider, from the credential and after the body, exactly as the typed\n\t\t// adapters do it for the record planes.\n\t\tdecide(&in, who.Subject)", "\t\t_ = who",
+  "./pkg/api/", "TestClosingACaseNamesTheCredential",
+  "the retained assessment is signed by the credential, not the request body"),
+
  ("crowding-unbounded", "pkg/suppress/shelf.go",
   "\tif inForce >= s.maxInForce() {", "\tif false {",
   "./pkg/suppress/", "TestCrowdingIsRefusedWhereItCostsARequest",

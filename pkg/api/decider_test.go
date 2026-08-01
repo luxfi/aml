@@ -13,6 +13,7 @@ import (
 	"github.com/luxfi/aml/internal/instance"
 	"github.com/luxfi/aml/pkg/lists"
 	"github.com/luxfi/aml/pkg/models"
+	"github.com/luxfi/aml/pkg/retention"
 	"github.com/luxfi/aml/pkg/suppress"
 	"github.com/luxfi/aml/pkg/types"
 	"github.com/luxfi/aml/pkg/watch"
@@ -233,4 +234,64 @@ func reqWithPath(t *testing.T, key, value string) *http.Request {
 	e, _ := send(http.MethodPost, "/v1/aml/lists/"+value+"/entries", nil)
 	e.Request.SetPathValue(key, value)
 	return e.Request
+}
+
+// TestClosingACaseNamesTheCredential.
+//
+// The case plane is the other governed act, and the oldest one: closing a case is
+// the retained assessment a supervisor reads. The decider on it was free text too,
+// and here the record that carries it is the one an obligation rests on
+// (AMLR Art. 69(2)).
+func TestClosingACaseNamesTheCredential(t *testing.T) {
+	h := plane(t)
+	h.Identity = func(*http.Request) (Caller, error) { return Caller{Tenant: acme, Subject: "u-7"}, nil }
+	c := h.Cases.Create(acme, types.SeverityHigh, []string{"alert-1"}, []string{"ivan-petrov-42"})
+
+	e, rec := send(http.MethodPost, "/v1/aml/cases/"+c.ID+"/resolve", map[string]any{
+		"resolution": types.ResolutionFalsePositive,
+		"considered": []string{"velocity over 30 days", "customer profile"},
+		"rationale":  "salary payments consistent with the profile on file",
+		"by":         "the head of compliance", // the lie
+	})
+	e.Request.SetPathValue("id", c.ID)
+	if err := h.resolveCase()(e); err != nil {
+		t.Fatalf("transport: %v", err)
+	}
+	if rec.Code != http.StatusOK {
+		t.Fatalf("resolve = %d: %s", rec.Code, rec.Body.String())
+	}
+	record := only(t, h, retention.ClassAssessment)
+	if record.Assessment.By != "u-7" {
+		t.Fatalf("the retained assessment is signed %q, want the token's subject u-7", record.Assessment.By)
+	}
+}
+
+// TestACaseCannotBeClosedByNobody. Fail secure at the record that matters: the
+// assessment refuses a decider it does not have, and it refuses as a REFUSAL
+// (400) and not as an outage (503), because 503 reads as "retry" and this one
+// never clears.
+func TestACaseCannotBeClosedByNobody(t *testing.T) {
+	h := plane(t)
+	h.Identity = func(*http.Request) (Caller, error) { return Caller{Tenant: acme}, nil }
+	c := h.Cases.Create(acme, types.SeverityHigh, []string{"alert-1"}, []string{"ivan-petrov-42"})
+
+	e, rec := send(http.MethodPost, "/v1/aml/cases/"+c.ID+"/resolve", map[string]any{
+		"resolution": types.ResolutionFalsePositive,
+		"considered": []string{"velocity over 30 days"},
+		"rationale":  "consistent with the profile on file",
+		"by":         "the head of compliance",
+	})
+	e.Request.SetPathValue("id", c.ID)
+	if err := h.resolveCase()(e); err != nil {
+		t.Fatalf("transport: %v", err)
+	}
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("resolve = %d: %s, want 400", rec.Code, rec.Body.String())
+	}
+	if got := h.Cases.Get(c.ID); got.Status == types.CaseClosed {
+		t.Fatal("a case was closed by nobody")
+	}
+	if held, err := h.Records.Len(); err != nil || held != 0 {
+		t.Fatalf("an assessment signed by nobody was retained: %d (%v)", held, err)
+	}
 }
