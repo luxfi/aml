@@ -109,10 +109,15 @@ pkg/
                               and a distinct count kept as a bitmap and never values
   topology/                -- The space of model shapes, searched over a tenant's
                               own history. Pure: no store, nothing it could write to
+    budget.go              -- The machine's share for study work, so ingest keeps
+                              the rest. Tokens ARE trial workers, taken before the
+                              history is read; the wait is the queue and it cancels
   models/                  -- The record of every search and every fitted state, and
                               the one path that adopts one into the live model
   api/typed.go             -- One operation shape, two adapters: the tenant is an
                               argument, the input is one struct, the output another
+  api/gate.go              -- Admission for the expensive work: one per tenant, and
+                              a deadline, as two combinators over the same shape
   api/planes.go            -- The five planes on the router, and the one place
                               ingest meets them
   api/routes.go            -- /v1/aml/* HTTP routes + SanctionsStore on Base
@@ -301,6 +306,29 @@ and every one of these packages has a test that reads its own source for a call 
 | Dictionary | `pkg/dictionary` | What a tenant's payloads carry: fill, blindness, distinct-count, and the model's own inventory | Nothing. It is a diagnostic and must never be able to refuse a payment |
 | Models | `pkg/topology` + `pkg/models` | The space of model shapes searched over a tenant's own history, and the record of every search and fit | A winner nobody can justify, and a fit installed into a model of another shape |
 
+### The decider is the credential, never the body
+
+Every governed act on these planes — declaring a list, putting a value on one,
+suppressing a detection, lifting a suppression, declaring a rung, retiring one,
+running a search, fitting a shape, adopting a fit, closing a case — is asked for a
+reason and a decider so that a supervisor asking "who turned this off" has an
+answer. That answer is worth nothing if the caller writes it.
+
+So the decider is a DISTINCT TYPE, `types.Decider`, and it is the one input a
+caller does not supply. Fields of that type carry `json:"-"`: the body decoder, the
+query binder and the path overlay all skip it, and `pkg/api/typed.go` (`decide`)
+writes the AUTHENTICATED SUBJECT onto it after the body and after the path. A
+caller that sends `"by":"the head of compliance"` has written a field that does not
+exist. `pkg/api/tenant.go`'s `Caller` is the two projections of one verified
+credential — the tenant that indexes every store, and the subject that names a
+decision — and both come from the same signature (`iam.go`, the token's `sub`).
+
+The value is the SUBJECT rather than a display name, because attribution must
+survive a rename. Where the deployment's identity cannot name one, authentication
+still succeeds — reads and ingest are the tenant's work, not a person's — and every
+operation that would record a decision refuses with the plane's own `ErrDecider`:
+a decision naming nobody is refused rather than recorded.
+
 ### Suppression is a marking, never a drop
 
 A detection a suppression covers, or a repeat inside a fold window, is WRITTEN and
@@ -322,6 +350,43 @@ beats folding, because an activation that reached an escalation rung IS the
 escalation and not a repeat of one. With no rung declared nothing folds: silence is
 a decision, never a default.
 
+A rung's `Count` becomes the LIMIT of a read on the INGEST path — the streak query
+reads exactly as many prior activations as the deepest declared rung needs — so it
+is bounded (`MaxCount`, `MaxWithin`) at declaration, where a refusal costs one
+operator request, and clamped again where it is USED, because a bound introduced
+after a row was written does not reach that row. Undeclared, a count of ten million
+turns every activation of that rule into a ten-million-row scan of the tenant's own
+store, on the path that has to answer before a payment can be taken.
+
+### Ingest degrades; it does not refuse for volume
+
+Two things run on the ingest path once per activation, and neither may be a way for
+a tenant to stop its own payments.
+
+A cover check reads this tenant's suppressions bearing on the rule. Past
+`MaxCandidates` it answers over what it read and MARKS the answer
+(`Cover.Partial`, `Activation.Unchecked`) instead of failing. The crowding is
+refused at DECLARATION instead (`MaxInForce`, `ErrCrowded`), where a refusal costs
+one operator request rather than every payment. Degrading in that direction
+produces an alert a suppression would have silenced — noise, which a reviewer
+dismisses — where refusing produces silence, which nobody sees.
+
+An activation naming a transaction IS one rule firing on one subject in one
+transaction, so its id is derived from `(tenant, transaction, rule, subject)` and
+the row is looked up before anything is computed. Ingest writes the record, then
+the alerts, then the activations; anything after the first write that fails answers
+503, and a client that retries offers the same firings again. With a fresh id each
+time the retry writes a second row, the second row is counted in the streak, and a
+declared repetition policy fires on a repeat that never happened — a payment
+blocked because the client retried. The retained record is idempotent for the same
+reason and by the same means: `token.Vault.Fingerprint` names the plaintext
+deterministically (a seal draws a fresh nonce, so sealed bytes never match), and
+the transaction carries ONE clock — its own. A reception clock stamped at ingest
+made every retry a different fact under one id, which is a conflict that no retry
+could ever clear. A genuine conflict — an id reused for a different transaction —
+answers 409 and not 503, because 503 reads as "retry" and a client retrying a
+permanent refusal retries forever.
+
 ### The dictionary stores no value, ever
 
 A distinct-value count is a bitmap sketch (linear counting, 4096 bits per field per
@@ -332,12 +397,30 @@ copy of them under a weaker regime. The estimate SATURATES — "at least this ma
 and no longer a count" — rather than drifting down, because a cardinality that
 silently stops rising reads as a field that stopped varying.
 
+That holds for numbers too, and numbers are where it is easiest to lose. A minimum
+IS a payload value, exactly, at any volume; at a count of one so are the sum and
+the mean derived from it. A DECLARED number is a measurement of the transaction
+model this engine defines — a notional, a converted amount, a score — and its range
+is the statistic a reviewer asks for, so it keeps its moments. A CUSTOM number is
+whatever the institution put under its own key, and nothing here knows whether that
+is an amount or a national identifier, so it gets the sketch and nothing else: min,
+max, mean and deviation are ABSENT rather than zero.
+
 The catalog is write-behind: observations accumulate and are written on a cadence
 and at shutdown. That is deliberate — a field statistic is not a compliance record,
 and paying an indexed write per field per transaction would spend the ingest path's
 latency on a diagnostic. What is not acceptable is silence about it, so `Pending`
 is published: a restart loses exactly that many observations and the answer says
 so.
+
+The vocabulary is bounded PER TENANT (`MaxCustom`), in the accumulator and in the
+stored rows alike. `MaxKeys` bounds one payload used as a bag; it does not bound a
+tenant that sends a different key on every transaction, and that tenant's growth is
+in the memory every other institution's ingest runs in. Reaching the bound degrades
+only the tenant that reached it — no error, no refused payload, the names it
+already has keep measuring — and `Crowded` publishes the readings turned away,
+because a catalog that quietly stopped taking names would report a payload surface
+the institution does not have.
 
 ### A search names no winner it cannot justify
 
@@ -361,6 +444,48 @@ limitation: a tenant's model shape cannot be swapped underneath it by restoring 
 file. The learned state itself never leaves the store — mass counters describe
 where a tenant's activity is dense, and handing them out over an API would publish
 the shape of an institution's customer behaviour to whoever holds a token.
+
+### A study is admitted, bounded, cancellable — and ingest keeps the machine
+
+A search replays a tenant's history through up to `MaxTrials` candidate detectors
+and a fit replays it through one. Either is minutes of arithmetic asked for by one
+request, on a single-replica process that also has to answer ingest, and a
+transaction that cannot be recorded cannot be processed. Four bounds, each doing
+one thing:
+
+| Bound | Where | What it stops |
+|---|---|---|
+| One study per tenant | `api.gate`, `one(...)` | a tenant queueing studies against itself. Per tenant and never global: one institution's study is never refused because another is studying, and nothing is ever evicted from the map |
+| A deadline (`maxStudy`, 2 min) | `api.within(...)` | a legitimate space whose total is hours. Derived from the REQUEST's context, so a client that goes away cancels the work |
+| `topology.Budget` | wired in `cmd/amld` | every study together taking the machine. Tokens ARE trial workers, taken BEFORE the history is read, so CPU, the events held in memory, and the queue are one mechanism. Half the cores, so the other half is ingest's. The wait is the queue and it is cancellable |
+| `MaxWorkers`, `MaxTrials`, `MaxEvents` | `pkg/topology` | one request naming the width of its own study |
+
+The budget is a bound on the PROCESS and is the one thing here that is not per
+tenant — deliberately, because the CPU is shared however it is modelled, and
+waiting for the machine is not the same as being refused because of another
+tenant. A rule replay is admitted the same way: one per tenant, and the same
+deadline.
+
+Every fit records what it cost (`Fit.Elapsed`), as every run already did
+(`Report.Elapsed`), so a tenant's spend on the expensive plane is answerable from
+what was kept rather than from a counter a restart resets.
+
+### An adopted control cannot go quiet on its own
+
+Adoption is the one governed act whose EFFECT was not durable. The fit is a row and
+the adoption is a row, but what adoption DOES is install learned state into a model
+that lives in memory — and this deployment is one replica with a Recreate strategy,
+so a rollout empties it, and the live store holds a bounded number of tenants'
+models at once, so an idle institution's can be dropped for a busy one's. Neither
+is a decision anybody took, and both return the tenant to warming, which reports no
+alerts, which is what a quiet institution also reports.
+
+So `anomaly.Store` asks `models.Shelf.Adopted` when it plants a tenant's model:
+per tenant, one indexed read, at most once per planting, and the installing is the
+model's own `Restore` with its own digest and mass checks. `State.Planted` and
+`State.Restored` publish the rest — when the model a tenant is being scored by
+started, and whether it started from an adoption — so a reset is visible from
+outside instead of being inferred from a silence.
 
 ### One operation shape, two faces
 
@@ -427,7 +552,7 @@ its Out is the anonymous `EvalResult`+`record` struct at routes.go. Roughly 19
 types to name and 19 handler bodies to move; no logic changes and no behaviour
 changes.
 
-**Three things a conversion must decide rather than discover.**
+**Four things a conversion must decide rather than discover.**
 
 1. **Schema names are flat across the fleet.** Every type this repo would publish
    needs a prefix — `amlDeclareListIn`, `amlActivation`, `mlSearchRun` — because a
@@ -444,6 +569,13 @@ changes.
    operation here already takes `org` as its first argument for exactly this
    reason. A conversion that put the org on the In struct would make it
    caller-supplied, which is a cross-tenant read the caller asserted for itself.
+4. **So must the decider, and it already is.** `types.Decider` fields carry
+   `json:"-"`, so they are not part of the published schema and no generated CLI,
+   SDK or MCP tool offers a `by` argument — which is correct, because there is
+   nothing for a caller to pass. The mount does what `pkg/api/typed.go` does:
+   decode, overlay the path, then write the validated principal's subject onto
+   every decider field. A conversion that published `by` would put the field back
+   on the wire in the generated surface even though this engine ignores it.
 
 **What does not convert.** `watch.Shelf.Subscribe` is a channel, not a request. A
 live feed is a transport concern (server-sent events, or a ZAP stream) over the
@@ -717,15 +849,13 @@ Webhook events: `aml.flagged`, `aml.cleared`, `kyc.approved`, `trade.executed`.
   different Source and not a different design; today one root is derived per org
   by HKDF, which means no cross-org correlation but one blast radius.
 - Exposing `Ledger.Extend` over HTTP. The cap and the refusals are implemented and
-  tested; there is no route, because the decider's identity would be
-  client-asserted (see below).
+  tested; there is no route yet. The reason there was none is closed —
+  `types.Decider` makes the decider the credential's — so this is now a route to
+  write rather than a design to decide.
 - Tokenising the operational transaction store. `pkg/engine/basestore.go` still
   writes `user_id`, `counterparty` and `ip_address` in the clear for its aggregate
   queries; the retention ledger holds pseudonyms and sealed bodies, so the two
   planes do not agree yet.
-- Attribution. Every decider (`by` on a resolution) is client-asserted: the
-  service has a tenant identity but no user identity, so "who dismissed this
-  alert" is not authenticated.
 - `cases.AutoClose` closes low-severity cases on inactivity without a retained
   assessment — the one path that closes a case without a recorded decision. Needs
   a compliance decision: escalate instead of closing, or record a system rationale.
@@ -843,6 +973,15 @@ boundary still holds and that case numbering continues rather than restarting.
 The memory implementations remain, and are for tests. `cases.NewStore()` and
 `api.NewAlertStore()` are not what an instance serves from.
 
+**What is deliberately in memory, and what brings it back.** The behavioural
+model's learned state is a cache: its durable home is the adopted fit
+(`aml_model_fits`), and `anomaly.Store` reloads it when it plants a tenant's model
+(`models.Shelf.Adopted`), so a rollout of a Recreate-at-1-replica deployment or an
+eviction to make room for another tenant costs a read and not a control.
+`State.Planted` and `State.Restored` say which happened. The field catalog's
+accumulator is in memory by design and `Catalog.Pending` publishes what a restart
+would lose. Nothing else an obligation covers is held in memory at all.
+
 ## Deployment
 
 - Single binary: `amld serve --http=0.0.0.0:8090`
@@ -876,14 +1015,23 @@ v0.3.x tag before v0.3.6 is a tag with nothing behind it for these reasons.
 
 Go tests across 24 packages, all green under `-race`, plus 12 browser tests.
 
-- api: 52 · retention: 43 · cases: 40 · sanctions: 39 · engine: 38 · anomaly: 27
-- measure: 26 · screen: 15 · token: 14 · replay: 14 · rules: 13 · velocity: 11
-- brand: 8 · chain: 7 · workflows: 7 · webhook: 5 · store: 4 · history: 3
+- api: 76 · retention: 43 · cases: 40 · sanctions: 39 · engine: 38 · anomaly: 27
+- measure: 26 · watch: 22 · dictionary: 17 · topology: 16 · screen: 15 · token: 14
+- replay: 14 · models: 14 · suppress: 13 · rules: 13 · lists: 13 · velocity: 11
+- brand: 11 · chain: 7 · workflows: 7 · webhook: 5 · store: 4 · history: 3
 - lists · suppress · watch · dictionary · topology · models — each carries a
   `TestTenantIsolation` (the same org name under a second brand), a
   `TestBareOrgIsRefused` over every operation, a `TestNothingDeletes` that reads
   the package's own source, and a `TestRestart` that opens a second instance over
   the first one's bytes (`internal/instance`)
+
+**Mutation harness.** `python3 tools/mutate.py` breaks one guard at a time and
+reports whether a test noticed: ANCHOR MISS, COMPILE FAIL, SURVIVED, or KILLED. A
+property with no mutation is a property nobody has seen fail, and a SURVIVED is a
+test that cannot fail. Every bound and every gate above carries one — the study
+gate, the worker clamp, the decider binding, the crowding refusal, the partial
+cover marking, the firing identity, the record fingerprint, the rung bounds, the
+custom-number moments, the vocabulary bound at both ends, and the adoption reload.
 
 The browser suite is `ui/e2e`, run by `npm --prefix ui run e2e` and by CI. It
 builds the bundle, serves it under `ui/csp.txt`, signs in before the first

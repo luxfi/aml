@@ -283,3 +283,106 @@ func TestRestart(t *testing.T) {
 		t.Fatal("a third tenant is covered after the restart")
 	}
 }
+
+// TestCrowdingIsRefusedWhereItCostsARequest.
+//
+// The bound on how many suppressions bear on one rule is enforced at
+// DECLARATION, where a refusal costs one operator request. The same crowding met
+// on the ingest path would cost a payment: Cover runs once per activation and its
+// caller cannot process a transaction it cannot record, so an error there is a
+// tenant-triggerable outage of that tenant's own payments — and the retry of a
+// failed ingest is what turns one incomplete read into a double-counted one.
+func TestCrowdingIsRefusedWhereItCostsARequest(t *testing.T) {
+	s := shelf(t)
+	s.inForceMax = 3
+	ctx := context.Background()
+
+	for i := range 3 {
+		suppressed(t, s, acme, &SuppressIn{Rule: "ctr", Kind: "account", Value: string(rune('a' + i))})
+	}
+	_, err := s.Suppress(ctx, acme, &SuppressIn{
+		Rule: "ctr", Kind: "account", Value: "one-too-many",
+		Reason: "another one", By: "a.mensah",
+	})
+	if !errors.Is(err, ErrCrowded) {
+		t.Fatalf("declaring past the bound: %v, want ErrCrowded", err)
+	}
+
+	// A rule that is not crowded is unaffected, and so is another tenant. A bound
+	// one institution reached must never refuse another's work.
+	suppressed(t, s, acme, &SuppressIn{Rule: "structuring", Kind: "account", Value: "acct-1"})
+	for i := range 3 {
+		suppressed(t, s, rival, &SuppressIn{Rule: "ctr", Kind: "account", Value: string(rune('a' + i))})
+	}
+
+	// Lifting makes room: the bound counts what is IN FORCE, not what the ledger
+	// holds, so an institution is never refused for its own history.
+	ledger, err := s.Ledger(ctx, acme, &LedgerIn{Rule: "ctr"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Lift(ctx, acme, &LiftIn{ID: ledger.Suppressions[0].ID, Reason: "reviewed", By: "a.mensah"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Suppress(ctx, acme, &SuppressIn{
+		Rule: "ctr", Kind: "account", Value: "room-now", Reason: "another one", By: "a.mensah",
+	}); err != nil {
+		t.Fatalf("lifting one did not make room: %v", err)
+	}
+}
+
+// TestACrowdedCoverDegradesAndSaysSo.
+//
+// The read bound is the second line, and reaching it must not fail the ingest
+// path. The answer is over what was read and it is MARKED, so an incomplete
+// governance answer is visible rather than absorbed. Degrading in this direction
+// produces an alert nobody wanted; refusing produces silence, and silence is what
+// an unmonitored institution also looks like.
+func TestACrowdedCoverDegradesAndSaysSo(t *testing.T) {
+	s := shelf(t)
+	s.candidates, s.inForceMax = 2, 100
+	ctx := context.Background()
+
+	for i := range 4 {
+		suppressed(t, s, acme, &SuppressIn{Rule: "ctr", Kind: "account", Value: string(rune('a' + i))})
+	}
+	cover, err := s.Cover(ctx, acme, &CoverIn{Rule: "ctr", Kind: "account", Value: "a", At: noon})
+	if err != nil {
+		t.Fatalf("a crowded cover check must degrade, not refuse: %v", err)
+	}
+	if !cover.Partial {
+		t.Fatal("the answer was over a page of the candidates and did not say so")
+	}
+
+	// A tenant under the bound gets a complete answer, so Partial is a real
+	// finding and not something every answer carries.
+	suppressed(t, s, rival, &SuppressIn{Rule: "ctr", Kind: "account", Value: "acct-1"})
+	clean, err := s.Cover(ctx, rival, &CoverIn{Rule: "ctr", Kind: "account", Value: "acct-1", At: noon})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if clean.Partial || !clean.Covered {
+		t.Fatalf("an uncrowded tenant: %+v", clean)
+	}
+}
+
+// TestCoverNeverRefusesForVolume reads the source: the ingest path's one question
+// must have no error return that a tenant can reach by declaring rows. The
+// property is easy to reintroduce by hand, and a comment does not hold it.
+func TestCoverNeverRefusesForVolume(t *testing.T) {
+	raw, err := os.ReadFile("shelf.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _, found := strings.Cut(string(raw), "// better breaks the tie")
+	if !found {
+		t.Fatal("could not find the end of Cover in the source")
+	}
+	_, cover, found := strings.Cut(body, "func (s *Shelf) Cover(")
+	if !found {
+		t.Fatal("could not find Cover in the source")
+	}
+	if strings.Contains(cover, "ErrStore, s.maxCandidates()") || strings.Contains(cover, "cannot be answered completely") {
+		t.Fatal("Cover refuses on volume again: a tenant can stop its own ingest by declaring suppressions")
+	}
+}

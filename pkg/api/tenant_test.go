@@ -93,11 +93,13 @@ func TestOneOrgNameUnderTwoBrandsIsTwoTenants(t *testing.T) {
 	luxTok := rs256(t, jwt.MapClaims{"iss": "https://lux.id", "owner": "acme", "orgs": orgs("acme")})
 	zooTok := rs256(t, jwt.MapClaims{"iss": "https://zoolabs.id", "owner": "acme", "orgs": orgs("acme")})
 
-	lux, err := h.Identity(bearing("api.lux.network", luxTok))
+	luxWho, err := h.Identity(bearing("api.lux.network", luxTok))
+	lux := luxWho.Tenant
 	if err != nil {
 		t.Fatalf("lux: %v", err)
 	}
-	zoo, err := h.Identity(bearing("api.zoo.ngo", zooTok))
+	zooWho, err := h.Identity(bearing("api.zoo.ngo", zooTok))
+	zoo := zooWho.Tenant
 	if err != nil {
 		t.Fatalf("zoo: %v", err)
 	}
@@ -258,7 +260,7 @@ func TestOneOrgNameUnderTwoBrandsIsTwoTenants(t *testing.T) {
 // inconvenience.
 func TestBothIdentitiesAgreeOnTheTenantKey(t *testing.T) {
 	iam := identity()
-	proxy := TrustedProxyHeader("X-Org-Id")
+	proxy := TrustedProxyHeader("X-Org-Id", "X-User-Id")
 
 	for _, tc := range []struct{ host, issuer, org string }{
 		{"api.hanzo.ai", "https://hanzo.id", "acme"},

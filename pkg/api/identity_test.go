@@ -67,8 +67,8 @@ func TestForgedTenantHeaderIsRefused(t *testing.T) {
 	// request reaching a service that requires one.
 	h := &Handler{
 		Alerts: alerts,
-		Identity: func(*http.Request) (string, error) {
-			return "", errors.New("no credential presented")
+		Identity: func(*http.Request) (Caller, error) {
+			return Caller{}, errors.New("no credential presented")
 		},
 	}
 
@@ -94,7 +94,7 @@ func TestAuthenticatedTenantCannotReadAnotherTenant(t *testing.T) {
 	// Authenticated as "attacker", asking for a transaction it shares an id with.
 	h := &Handler{
 		Alerts:   alerts,
-		Identity: func(*http.Request) (string, error) { return "hanzo/attacker", nil },
+		Identity: func(*http.Request) (Caller, error) { return Caller{Tenant: "hanzo/attacker"}, nil },
 	}
 
 	e, rec := event(http.MethodGet, "/v1/aml/transactions/tx-1/alerts",
@@ -118,7 +118,7 @@ func TestAuthenticatedTenantCannotReadAnotherTenant(t *testing.T) {
 // The identity, not the header, decides the tenant. If the header could override
 // it, authenticating would not bound anything.
 func TestHeaderDoesNotOverrideIdentity(t *testing.T) {
-	h := &Handler{Identity: func(*http.Request) (string, error) { return "hanzo/real", nil }}
+	h := &Handler{Identity: func(*http.Request) (Caller, error) { return Caller{Tenant: "hanzo/real"}, nil }}
 	e, _ := event(http.MethodGet, "/v1/aml/x", map[string]string{"X-Org-Id": "spoofed"})
 
 	got, err := h.tenant(e)
@@ -155,7 +155,7 @@ func TestUnqualifiedTenantIsRefused(t *testing.T) {
 		"hanzo:acme",    // another wrong separator
 		"hanzo/ acme  ", // padding around the org
 	} {
-		h := &Handler{Identity: func(*http.Request) (string, error) { return resolved, nil }}
+		h := &Handler{Identity: func(*http.Request) (Caller, error) { return Caller{Tenant: resolved}, nil }}
 		e, _ := event(http.MethodGet, "/v1/aml/x", nil)
 		if got, err := h.tenant(e); err == nil {
 			t.Errorf("an identity resolving %q was accepted as tenant %q", resolved, got)
@@ -163,7 +163,7 @@ func TestUnqualifiedTenantIsRefused(t *testing.T) {
 	}
 	// And the canonical form is accepted, so the rows above fail for their own
 	// reason and not because everything fails.
-	h := &Handler{Identity: func(*http.Request) (string, error) { return "hanzo/acme", nil }}
+	h := &Handler{Identity: func(*http.Request) (Caller, error) { return Caller{Tenant: "hanzo/acme"}, nil }}
 	e, _ := event(http.MethodGet, "/v1/aml/x", nil)
 	if got, err := h.tenant(e); err != nil || got != "hanzo/acme" {
 		t.Fatalf("tenant = %q, %v; want hanzo/acme", got, err)
@@ -174,7 +174,7 @@ func TestUnqualifiedTenantIsRefused(t *testing.T) {
 // the two Identity implementations produce the same key and a deployment cannot
 // take the brand from a header a client can write.
 func TestTrustedProxyHeaderQualifiesWithTheHost(t *testing.T) {
-	id := TrustedProxyHeader("X-Org-Id")
+	id := TrustedProxyHeader("X-Org-Id", "X-User-Id")
 
 	proxied := func(host, org string) *http.Request {
 		r := httptest.NewRequest(http.MethodGet, "/", nil)
@@ -190,7 +190,8 @@ func TestTrustedProxyHeaderQualifiesWithTheHost(t *testing.T) {
 		{"api.lux.network", "acme", "lux/acme"},
 		{"console.zoo.cloud", "acme", "zoo/acme"},
 	} {
-		got, err := id(proxied(tc.host, tc.org))
+		who, err := id(proxied(tc.host, tc.org))
+		got := who.Tenant
 		if err != nil {
 			t.Fatalf("%s: %v", tc.host, err)
 		}
@@ -212,8 +213,8 @@ func TestTrustedProxyHeaderQualifiesWithTheHost(t *testing.T) {
 		{"no host at all", "", "acme"},
 		{"a lookalike domain", "a.zoo.ngo.attacker.example", "acme"},
 	} {
-		if got, err := id(proxied(tc.host, tc.org)); err == nil {
-			t.Errorf("%s resolved to tenant %q", tc.name, got)
+		if who, err := id(proxied(tc.host, tc.org)); err == nil {
+			t.Errorf("%s resolved to tenant %q", tc.name, who.Tenant)
 		}
 	}
 }

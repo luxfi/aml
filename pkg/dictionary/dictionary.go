@@ -34,6 +34,13 @@
 // plane, sealed and purpose-gated; a statistics table does not get a second copy
 // of them under a weaker regime.
 //
+// That holds for numbers too, and numbers are where it is easiest to lose: a
+// minimum IS a payload value, and at a count of one so is a sum. The moments are
+// therefore kept only for DECLARED fields — the transaction model this engine
+// defines, whose numbers are amounts and scores — and a CUSTOM field, which holds
+// whatever the institution put under its own key, gets the sketch and nothing
+// else. See stat.observe.
+//
 // # Write-behind, and it says so
 //
 // Observations accumulate in memory and are written on Flush and on Close.
@@ -82,12 +89,30 @@ const Prefix = "raw."
 // ErrStore is what a catalog read or write returns when the store refuses.
 var ErrStore = errors.New("dictionary: store")
 
-// MaxKeys bounds how many top-level keys of one Raw payload are catalogued.
+// MaxKeys bounds how many top-level keys of one Raw payload are catalogued, and
+// MaxCustom bounds how many DISTINCT custom keys one tenant's catalog holds
+// altogether.
 //
-// A payload with thousands of distinct keys is not a payload with a vocabulary,
-// it is a map used as a bag, and cataloguing it would grow one row per key per
-// tenant without bound. The excess is counted and reported rather than absorbed.
-const MaxKeys = 256
+// The two are one bound seen over one payload and over all of them. MaxKeys alone
+// bounds a single map used as a bag; it does not bound a tenant that sends a
+// different key on every transaction, and that tenant's vocabulary grows for as
+// long as it keeps sending — an accumulator in memory, on a single-replica
+// process, which every other institution's ingest also runs in. A per-payload
+// bound with no lifetime bound is not a bound.
+//
+// So the vocabulary is bounded PER TENANT, and reaching it degrades only the
+// tenant that reached it: its catalog stops taking new names, keeps measuring the
+// ones it has, and publishes how many it turned away (Catalog.Crowded). It is
+// never an error, because this is a diagnostic and a diagnostic must not be able
+// to refuse a payment.
+//
+// A thousand distinct payload keys is already past the point where the answer is
+// "this institution has a schema"; the declared fields are a fixed set beside it
+// and are never turned away.
+const (
+	MaxKeys   = 256
+	MaxCustom = 1024
+)
 
 // Field is one entry in the catalog.
 type Field struct {
@@ -111,8 +136,11 @@ type Field struct {
 	Distinct  int64 `json:"distinct"`
 	Saturated bool  `json:"saturated,omitempty"`
 
-	// Numbers only. Absent — not zero — for a field that is not a number, because
-	// a mean of 0.0 over an identifier reads as a fact.
+	// Declared numbers only. Absent — not zero — for a field that is not a
+	// number, because a mean of 0.0 over an identifier reads as a fact, and
+	// absent for a CUSTOM number whatever its shape, because a minimum is a
+	// payload value and nothing here knows what the institution put under its own
+	// key. See stat.observe.
 	Min       *float64 `json:"min,omitempty"`
 	Max       *float64 `json:"max,omitempty"`
 	Mean      *float64 `json:"mean,omitempty"`
@@ -140,6 +168,11 @@ type (
 		Pending int64 `json:"pending"`
 		// Skipped counts payload keys past MaxKeys that were not catalogued.
 		Skipped int64 `json:"skipped"`
+		// Crowded counts readings of a custom key this tenant's catalog had no
+		// room for, its vocabulary being at MaxCustom. Published for the same
+		// reason Skipped is: a catalog that quietly stopped taking names would
+		// report a payload surface the institution does not have.
+		Crowded int64 `json:"crowded"`
 
 		Fields []Field `json:"fields"`
 		// Features is the model's own inventory, carried whole. Its statistics are

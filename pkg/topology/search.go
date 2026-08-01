@@ -31,7 +31,12 @@ const reportLimit = 10_000.0
 // seeded from it (anomaly mix), so a search run under a different key studies a
 // different set of trees than the one the tenant would get. It is required for
 // the same reason a history window refuses an empty tenant.
-func Search(ctx context.Context, org string, h replay.History, space Space, opt Options) (Report, error) {
+//
+// cores is the machine's share (see Budget). The search takes its workers from it
+// BEFORE it reads a single event, so a study that is waiting for the machine is
+// also not holding a tenant's history in memory. A nil budget is unbounded and is
+// for tests.
+func Search(ctx context.Context, org string, h replay.History, space Space, opt Options, cores *Budget) (Report, error) {
 	if org == "" {
 		return Report{}, ErrOrg
 	}
@@ -42,6 +47,13 @@ func Search(ctx context.Context, org string, h replay.History, space Space, opt 
 	if err != nil {
 		return Report{}, err
 	}
+
+	workers, release, err := cores.take(ctx, want(opt.Workers, len(grid)))
+	if err != nil {
+		return Report{}, err
+	}
+	defer release()
+
 	events, cut, from, to, judged, err := collect(h, opt.Events)
 	if err != nil {
 		return Report{}, err
@@ -55,11 +67,6 @@ func Search(ctx context.Context, org string, h replay.History, space Space, opt 
 	report := Report{
 		Events: len(events), From: from, To: to, Judged: judged, Cut: cut, Seed: seed,
 		Trials: make([]Trial, len(grid)),
-	}
-
-	workers := opt.Workers
-	if workers <= 0 {
-		workers = DefaultWorkers
 	}
 	if workers > len(grid) {
 		workers = len(grid)
@@ -109,6 +116,25 @@ func Search(ctx context.Context, org string, h replay.History, space Space, opt 
 	return report, nil
 }
 
+// want is how many workers a study asks the machine for: the caller's number, or
+// the default, clamped to MaxWorkers and to the number of candidates there are.
+//
+// The clamp is the point. Workers arrives on the wire, and without a ceiling a
+// caller names the width of its own study — a grid of MaxTrials with one worker
+// per candidate is 256 goroutines of pure arithmetic from one request.
+func want(asked, candidates int) int {
+	if asked <= 0 {
+		asked = DefaultWorkers
+	}
+	if asked > MaxWorkers {
+		asked = MaxWorkers
+	}
+	if candidates > 0 && asked > candidates {
+		asked = candidates
+	}
+	return asked
+}
+
 // Fit builds one shape's learned state from a tenant's own history and hands back
 // a snapshot of it.
 //
@@ -118,7 +144,10 @@ func Search(ctx context.Context, org string, h replay.History, space Space, opt 
 // model's shape being changed underneath a tenant by restoring a file, and it is
 // why a search's winner is a recommendation to a deployment rather than something
 // this package can install.
-func Fit(ctx context.Context, org string, h replay.History, t Topology, opt Options) (anomaly.Snapshot, Trial, error) {
+//
+// One candidate, so one worker's worth of the machine (see Budget), taken before
+// the history is read.
+func Fit(ctx context.Context, org string, h replay.History, t Topology, opt Options, cores *Budget) (anomaly.Snapshot, Trial, error) {
 	if org == "" {
 		return anomaly.Snapshot{}, Trial{}, ErrOrg
 	}
@@ -128,6 +157,12 @@ func Fit(ctx context.Context, org string, h replay.History, t Topology, opt Opti
 	if err := t.Valid(); err != nil {
 		return anomaly.Snapshot{}, Trial{}, err
 	}
+	_, release, err := cores.take(ctx, 1)
+	if err != nil {
+		return anomaly.Snapshot{}, Trial{}, err
+	}
+	defer release()
+
 	events, _, _, _, _, err := collect(h, opt.Events)
 	if err != nil {
 		return anomaly.Snapshot{}, Trial{}, err

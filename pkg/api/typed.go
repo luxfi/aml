@@ -45,6 +45,7 @@ import (
 	"github.com/luxfi/aml/pkg/models"
 	"github.com/luxfi/aml/pkg/suppress"
 	"github.com/luxfi/aml/pkg/topology"
+	"github.com/luxfi/aml/pkg/types"
 	"github.com/luxfi/aml/pkg/watch"
 )
 
@@ -59,7 +60,7 @@ const maxBody = 1 << 20
 // post adapts an operation to a route that reads its input from the body.
 func post[In, Out any](h *Handler, fn op[In, Out], created bool) func(*core.RequestEvent) error {
 	return func(e *core.RequestEvent) error {
-		orgID, err := h.tenant(e)
+		who, err := h.caller(e)
 		if err != nil {
 			return refuse(e, err)
 		}
@@ -74,7 +75,9 @@ func post[In, Out any](h *Handler, fn op[In, Out], created bool) func(*core.Requ
 		if err := path(e.Request, &in); err != nil {
 			return fail(e, http.StatusBadRequest, err.Error())
 		}
-		out, err := fn(e.Request.Context(), orgID, &in)
+		// And the decider is written after both, from the credential.
+		decide(&in, who.Subject)
+		out, err := fn(e.Request.Context(), who.Tenant, &in)
 		if err != nil {
 			return answer(e, err)
 		}
@@ -89,7 +92,7 @@ func post[In, Out any](h *Handler, fn op[In, Out], created bool) func(*core.Requ
 // get adapts an operation to a route that reads its input from the query string.
 func get[In, Out any](h *Handler, fn op[In, Out]) func(*core.RequestEvent) error {
 	return func(e *core.RequestEvent) error {
-		orgID, err := h.tenant(e)
+		who, err := h.caller(e)
 		if err != nil {
 			return refuse(e, err)
 		}
@@ -100,11 +103,37 @@ func get[In, Out any](h *Handler, fn op[In, Out]) func(*core.RequestEvent) error
 		if err := path(e.Request, &in); err != nil {
 			return fail(e, http.StatusBadRequest, err.Error())
 		}
-		out, err := fn(e.Request.Context(), orgID, &in)
+		decide(&in, who.Subject)
+		out, err := fn(e.Request.Context(), who.Tenant, &in)
 		if err != nil {
 			return answer(e, err)
 		}
 		return e.JSON(http.StatusOK, out)
+	}
+}
+
+// deciderType is the one type a caller may not fill.
+var deciderType = reflect.TypeOf(types.Decider(""))
+
+// decide writes the authenticated subject onto every decider field of a typed
+// input, after the body and after the path.
+//
+// This is the whole of the binding, and it is the reason every plane's "reason
+// and decider" refusal means something. The value is not merged with, defaulted
+// from or preferred over anything the caller sent: fields of this type carry
+// `json:"-"`, so nothing the caller sent ever reached one. An empty subject
+// writes an empty decider, which every governed operation refuses — a decision
+// that names nobody is refused rather than recorded.
+func decide(target any, subject string) {
+	v := reflect.ValueOf(target).Elem()
+	if v.Kind() != reflect.Struct {
+		return
+	}
+	t := v.Type()
+	for i := 0; i < t.NumField(); i++ {
+		if t.Field(i).Type == deciderType {
+			v.Field(i).SetString(subject)
+		}
 	}
 }
 
@@ -214,6 +243,11 @@ func answer(e *core.RequestEvent, err error) error {
 			return fail(e, http.StatusConflict, err.Error())
 		}
 	}
+	for _, known := range busy {
+		if errors.Is(err, known) {
+			return fail(e, http.StatusTooManyRequests, err.Error())
+		}
+	}
 	for _, known := range refused {
 		if errors.Is(err, known) {
 			return fail(e, http.StatusBadRequest, err.Error())
@@ -250,16 +284,19 @@ var (
 		watch.ErrRetired,
 		models.ErrAdopted,
 	}
+	// A refusal that says "not now, and not because of anything you sent".
+	busy    = []error{ErrBusy}
 	refused = []error{
 		lists.ErrName, lists.ErrKind, lists.ErrClass, lists.ErrValue, lists.ErrEmpty,
 		lists.ErrDecider, lists.ErrReason, lists.ErrCrowded, lists.ErrMaxValues,
 		suppress.ErrReason, suppress.ErrDecider, suppress.ErrBroad, suppress.ErrKind,
-		suppress.ErrSubject, suppress.ErrWindow,
+		suppress.ErrSubject, suppress.ErrWindow, suppress.ErrCrowded,
 		watch.ErrRule, watch.ErrSubject, watch.ErrKind, watch.ErrAction, watch.ErrTo,
 		watch.ErrCount, watch.ErrWithin, watch.ErrReason, watch.ErrDecider,
 		models.ErrDecider, models.ErrShape, models.ErrNoModel, models.ErrNoHistory,
 		topology.ErrEmptySpace, topology.ErrHuge, topology.ErrEmpty, topology.ErrShape,
 		topology.ErrOrg, topology.ErrNoHistory,
+		ErrTooLong,
 	}
 	broken = []error{
 		lists.ErrStore, suppress.ErrStore, watch.ErrStore,

@@ -193,16 +193,19 @@ func TestWhiteLabelByHost(t *testing.T) {
 	// A Lux-issued token: its own host authenticates it, every other brand's host
 	// refuses it, and the signature is valid in both cases.
 	lux := rs256(t, jwt.MapClaims{"iss": "https://lux.id", "owner": "acme", "sub": "u-1"})
-	tenant, err := h.Identity(bearing("api.lux.network", lux))
+	who, err := h.Identity(bearing("api.lux.network", lux))
 	if err != nil {
 		t.Fatalf("a Lux token on a Lux host was refused: %v", err)
 	}
-	if tenant != "lux/acme" {
-		t.Errorf("tenant = %q, want lux/acme", tenant)
+	if who.Tenant != "lux/acme" {
+		t.Errorf("tenant = %q, want lux/acme", who.Tenant)
+	}
+	if who.Subject != "u-1" {
+		t.Errorf("subject = %q, want the token's sub", who.Subject)
 	}
 	for _, host := range []string{"api.zoo.ngo", "console.zoo.cloud", "api.hanzo.ai", "aml.pars.network", "aml.internal"} {
-		if tenant, err := h.Identity(bearing(host, lux)); err == nil {
-			t.Errorf("a Lux token authenticated as %q on %s — brand tenancy is not enforced", tenant, host)
+		if who, err := h.Identity(bearing(host, lux)); err == nil {
+			t.Errorf("a Lux token authenticated as %q on %s — brand tenancy is not enforced", who.Tenant, host)
 		}
 	}
 
@@ -240,7 +243,8 @@ func TestIAMIdentityYieldsTheQualifiedTenant(t *testing.T) {
 		{"console.zoo.cloud", "https://zoolabs.id", "acme", "zoo/acme"},
 	} {
 		tok := rs256(t, jwt.MapClaims{"iss": tc.issuer, "owner": tc.org, "sub": "u-1", "isAdmin": true})
-		got, err := id(bearing(tc.host, tok))
+		who, err := id(bearing(tc.host, tok))
+		got := who.Tenant
 		if err != nil {
 			t.Fatalf("%s: refused a valid token: %v", tc.host, err)
 		}
@@ -277,8 +281,8 @@ func TestIAMIdentityRefusesAnUnnamedHost(t *testing.T) {
 		"hanzo.ai.attacker.example",
 		"aml.internal",
 	} {
-		if tenant, err := id(bearing(host, tok)); err == nil {
-			t.Errorf("a hanzo.id token authenticated as %q on %q", tenant, host)
+		if who, err := id(bearing(host, tok)); err == nil {
+			t.Errorf("a hanzo.id token authenticated as %q on %q", who.Tenant, host)
 		}
 	}
 
@@ -330,8 +334,8 @@ func TestAudienceIsThisApplication(t *testing.T) {
 		{"an unrecognised tokenType", rs256(t, with("tokenType", "refresh-token"))},
 		{"an empty tokenType", rs256(t, with("tokenType", ""))},
 	} {
-		if tenant, err := id(bearing("api.hanzo.ai", tc.token)); err == nil {
-			t.Errorf("%s authenticated as %q", tc.name, tenant)
+		if who, err := id(bearing("api.hanzo.ai", tc.token)); err == nil {
+			t.Errorf("%s authenticated as %q", tc.name, who.Tenant)
 		}
 	}
 
@@ -354,8 +358,8 @@ func TestAudienceIsThisApplication(t *testing.T) {
 			asked.Add(1)
 			return published(issuer)
 		}
-		if tenant, err := IAMIdentity(counted, unpinned)(bearing("api.hanzo.ai", rs256(t, base()))); err == nil {
-			t.Errorf("with audience %q configured, a token authenticated as %q", unpinned, tenant)
+		if who, err := IAMIdentity(counted, unpinned)(bearing("api.hanzo.ai", rs256(t, base()))); err == nil {
+			t.Errorf("with audience %q configured, a token authenticated as %q", unpinned, who.Tenant)
 		}
 		if n := asked.Load(); n != 0 {
 			t.Errorf("with audience %q configured, a request cost %d issuer fetches, want 0", unpinned, n)
@@ -411,7 +415,8 @@ func TestTenantIsAnOrgTheCallerBelongsTo(t *testing.T) {
 			"hanzo/acme",
 		},
 	} {
-		got, err := id(bearing("api.hanzo.ai", tc.token))
+		found, err := id(bearing("api.hanzo.ai", tc.token))
+		got := found.Tenant
 		if err != nil {
 			t.Errorf("%s was refused: %v", tc.name, err)
 			continue
@@ -437,8 +442,8 @@ func TestTenantIsAnOrgTheCallerBelongsTo(t *testing.T) {
 			rs256(t, jwt.MapClaims{"iss": hanzo, "owner": "acme", "orgs": []any{map[string]any{"role": "member"}}}),
 		},
 	} {
-		if tenant, err := id(bearing("api.hanzo.ai", tc.token)); err == nil {
-			t.Errorf("%s authenticated as %q", tc.name, tenant)
+		if who, err := id(bearing("api.hanzo.ai", tc.token)); err == nil {
+			t.Errorf("%s authenticated as %q", tc.name, who.Tenant)
 		}
 	}
 }
@@ -486,8 +491,8 @@ func TestIAMIdentityRefusesEveryDoubt(t *testing.T) {
 		{"an owner carrying the tenant separator", "api.hanzo.ai", rs256(t, jwt.MapClaims{"iss": hanzo, "owner": "zoo/acme"})},
 		{"not a token", "api.hanzo.ai", "not.a.token"},
 	} {
-		if tenant, err := id(bearing(tc.host, tc.token)); err == nil {
-			t.Errorf("%s authenticated as %q", tc.name, tenant)
+		if who, err := id(bearing(tc.host, tc.token)); err == nil {
+			t.Errorf("%s authenticated as %q", tc.name, who.Tenant)
 		}
 	}
 
@@ -520,8 +525,8 @@ func TestIAMIdentityRefusesEveryDoubt(t *testing.T) {
 			return r
 		}(),
 	} {
-		if tenant, err := id(r); err == nil {
-			t.Errorf("a token outside the bearer header authenticated as %q", tenant)
+		if who, err := id(r); err == nil {
+			t.Errorf("a token outside the bearer header authenticated as %q", who.Tenant)
 		}
 	}
 }
@@ -554,8 +559,8 @@ func TestGarbageBearerCostsNoIssuerFetch(t *testing.T) {
 		"YQ.e30.sig",                             // a header that is not JSON
 		strings.Repeat("A", maxToken+1) + ".b.c", // longer than any token
 	} {
-		if tenant, err := id(bearing("api.hanzo.ai", garbage)); err == nil {
-			t.Errorf("%q authenticated as %q", garbage, tenant)
+		if who, err := id(bearing("api.hanzo.ai", garbage)); err == nil {
+			t.Errorf("%q authenticated as %q", garbage, who.Tenant)
 		}
 	}
 	if n := asked.Load(); n != 0 {
@@ -584,8 +589,8 @@ func TestIAMIdentityRefusesWithoutKeys(t *testing.T) {
 		{"unreachable issuer", func(string) (Keyset, error) { return nil, fmt.Errorf("dial: refused") }},
 		{"an empty keyset", func(string) (Keyset, error) { return Keyset{}, nil }},
 	} {
-		if tenant, err := IAMIdentity(tc.jwks, aud)(bearing("api.hanzo.ai", tok)); err == nil {
-			t.Errorf("%s authenticated as %q", tc.name, tenant)
+		if who, err := IAMIdentity(tc.jwks, aud)(bearing("api.hanzo.ai", tok)); err == nil {
+			t.Errorf("%s authenticated as %q", tc.name, who.Tenant)
 		}
 	}
 }
@@ -627,8 +632,8 @@ func TestRotationKeepsLiveTokensValid(t *testing.T) {
 	// Naming one published key while being signed by another is a key substitution.
 	// The kid binds: that key must be the one that verifies it.
 	substituted := mint(t, next, jwt.SigningMethodRS256, jwt.MapClaims{"iss": "https://hanzo.id", "owner": "acme"}) // kid "iam", signed by next
-	if tenant, err := id(bearing("api.hanzo.ai", substituted)); err == nil {
-		t.Errorf("a token labelled kid=iam but signed by another key authenticated as %q", tenant)
+	if who, err := id(bearing("api.hanzo.ai", substituted)); err == nil {
+		t.Errorf("a token labelled kid=iam but signed by another key authenticated as %q", who.Tenant)
 	}
 }
 

@@ -40,6 +40,7 @@ const (
 
 	fieldPayloads = "payloads"
 	fieldSkipped  = "skipped"
+	fieldCrowded  = "crowded"
 )
 
 var fieldKind = store.Kind{
@@ -68,6 +69,7 @@ var censusKind = store.Kind{
 	Fields: []core.Field{
 		&core.NumberField{Name: fieldPayloads},
 		&core.NumberField{Name: fieldSkipped},
+		&core.NumberField{Name: fieldCrowded},
 		&core.DateField{Name: fieldFirst},
 		&core.DateField{Name: fieldLast},
 	},
@@ -102,6 +104,29 @@ type stat struct {
 	last   time.Time
 }
 
+// observe folds one payload's reading of one field into the accumulator.
+//
+// # A number is only measured where the number is ours
+//
+// The catalog's invariant is that no payload value is ever stored, and the
+// distinct count honours it by keeping a bitmap sketch rather than values. The
+// numeric moments do not: min and max ARE payload values, exactly, at any volume
+// — and at a count of one, so are sum, square and the mean derived from them. A
+// column holding them is a second copy of the payload, in a statistics table,
+// unsealed and outside the purpose gate that governs the retained record.
+//
+// For a DECLARED field that is a measurement of the transaction model this engine
+// defines — a notional, a converted amount, a score — and its range is the
+// statistic a reviewer is asking for. For a CUSTOM field it is whatever the
+// institution put in its own payload under its own key: a national identifier, a
+// date of birth as a number, a card range, an internal customer number. Nothing
+// here knows which, and a catalog that could not say what it was storing stored
+// it anyway.
+//
+// So a custom field gets the sketch and nothing else — how often it is filled and
+// how much it varies, which is the whole of what the catalog is for — and its
+// min, max, mean and deviation are ABSENT rather than zero, because a zero reads
+// as a fact. Declared fields keep their moments.
 func (s *stat) observe(org, name string, r reading, at time.Time) {
 	if !r.filled {
 		return
@@ -112,14 +137,16 @@ func (s *stat) observe(org, name string, r reading, at time.Time) {
 	}
 	if r.isNum {
 		s.bits.add(org, name, strconv.FormatFloat(r.num, 'g', -1, 64))
-		s.count++
-		s.sum += r.num
-		s.square += r.num * r.num
-		if s.count == 1 || r.num < s.min {
-			s.min = r.num
-		}
-		if s.count == 1 || r.num > s.max {
-			s.max = r.num
+		if s.origin == Declared {
+			s.count++
+			s.sum += r.num
+			s.square += r.num * r.num
+			if s.count == 1 || r.num < s.min {
+				s.min = r.num
+			}
+			if s.count == 1 || r.num > s.max {
+				s.max = r.num
+			}
 		}
 	}
 	if s.first.IsZero() || at.Before(s.first) {
@@ -134,8 +161,16 @@ type census struct {
 	fields   map[string]*stat
 	payloads int64
 	skipped  int64
-	first    time.Time
-	last     time.Time
+	// crowded counts readings of a custom key there was no room for. See
+	// MaxCustom: the vocabulary is bounded per tenant, and a tenant that reaches
+	// its bound degrades its own catalog and nobody else's.
+	crowded int64
+	// names is how many distinct CUSTOM names this census holds, maintained where
+	// a name is added and nowhere else. Declared fields are a fixed set and are
+	// never counted against the bound.
+	names int
+	first time.Time
+	last  time.Time
 }
 
 // Shelf is the durable catalog, with the accumulator in front of it.
@@ -150,6 +185,19 @@ type Shelf struct {
 	// every tenant. It is published on every catalog so a reader can see how much
 	// of the answer a restart would lose.
 	count int64
+	// vocab is the per-tenant vocabulary bound, at zero meaning MaxCustom. It is
+	// UNEXPORTED and no constructor sets it, so a deployment cannot lower a
+	// diagnostic's bound into something that hides an institution's payload
+	// surface. It is here for the tests: proving what happens at the bound needs
+	// to reach it, and a bound nobody has seen work is a bound nobody has.
+	vocab int
+}
+
+func (s *Shelf) maxCustom() int {
+	if s.vocab > 0 {
+		return s.vocab
+	}
+	return MaxCustom
 }
 
 // NewBase returns the durable catalog. Ensure has to have run first.
@@ -202,24 +250,46 @@ func (s *Shelf) Observe(org string, tx types.Transaction) error {
 		c.last = at
 	}
 	for _, spec := range declared {
-		st := c.field(spec.name, Declared, spec.shape)
-		st.observe(org, spec.name, read(v, spec), at)
+		c.field(spec.name, Declared, spec.shape, s.maxCustom()).observe(org, spec.name, read(v, spec), at)
 	}
 	for name, r := range extra {
-		st := c.field(name, Custom, shapeText(top[name[len(Prefix):]]))
-		st.shape = shapeText(top[name[len(Prefix):]])
+		shape := shapeText(top[name[len(Prefix):]])
+		// MaxCustom bounds the ACCUMULATOR here, which is what keeps a tenant's
+		// vocabulary out of the memory every other tenant's ingest runs in. The
+		// same bound is applied to the stored rows at write, because a bound over
+		// what is in flight is not a bound over what is kept.
+		st := c.field(name, Custom, shape, s.maxCustom())
+		if st == nil {
+			continue
+		}
+		st.shape = shape
 		st.observe(org, name, r, at)
 	}
 	s.count++
 	return nil
 }
 
-func (c *census) field(name, origin, shape string) *stat {
+// field is this census's accumulator for one name, created on first sight.
+//
+// A new CUSTOM name is refused once the tenant's vocabulary is full, and nil is
+// what a refusal looks like: the reading is counted as crowded and dropped. It is
+// a refusal of a NAME and never of a payload — the payload is still counted, every
+// name already in the vocabulary still measures it, and nothing anywhere returns
+// an error. See MaxCustom.
+func (c *census) field(name, origin, shape string, room int) *stat {
 	st := c.fields[name]
-	if st == nil {
-		st = &stat{origin: origin, shape: shape}
-		c.fields[name] = st
+	if st != nil {
+		return st
 	}
+	if origin == Custom {
+		if c.names >= room {
+			c.crowded++
+			return nil
+		}
+		c.names++
+	}
+	st = &stat{origin: origin, shape: shape}
+	c.fields[name] = st
 	return st
 }
 
@@ -254,7 +324,10 @@ func (s *Shelf) Flush(ctx context.Context) error {
 	return failed
 }
 
-// restore folds an unwritten census back into the accumulator.
+// restore folds an unwritten census back into the accumulator. The vocabulary
+// bound is not re-applied here: these are names this tenant already had room for,
+// and refusing them on the way back would lose measurements the accumulator was
+// holding rather than bound anything.
 func (s *Shelf) restore(org string, c *census) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -271,6 +344,7 @@ func (s *Shelf) restore(org string, c *census) {
 func merge(into, from *census) {
 	into.payloads += from.payloads
 	into.skipped += from.skipped
+	into.crowded += from.crowded
 	if into.first.IsZero() || (!from.first.IsZero() && from.first.Before(into.first)) {
 		into.first = from.first
 	}
@@ -281,6 +355,9 @@ func merge(into, from *census) {
 		held := into.fields[name]
 		if held == nil {
 			into.fields[name] = st
+			if st.origin == Custom {
+				into.names++
+			}
 			continue
 		}
 		held.seen += st.seen
@@ -310,6 +387,12 @@ func (s *Shelf) write(org string, c *census) error {
 		return err
 	}
 	return s.app.RunInTransaction(func(tx core.App) error {
+		// Room in this tenant's vocabulary, read once and only if a new custom
+		// name actually needs it. It is this tenant's own row count against this
+		// tenant's own bound: another institution's vocabulary is neither read nor
+		// counted, and cannot take room from this one.
+		room := -1
+		crowded := c.crowded
 		for name, st := range c.fields {
 			rows, err := fieldKind.Find(tx, org, fieldName+" = {:name}", "", 1, dbx.Params{"name": name})
 			if err != nil {
@@ -321,6 +404,23 @@ func (s *Shelf) write(org string, c *census) error {
 				row = rows[0]
 				held = readStat(row)
 			} else {
+				if st.origin == Custom {
+					if room < 0 {
+						n, err := vocabulary(tx, org, s.maxCustom())
+						if err != nil {
+							return err
+						}
+						room = s.maxCustom() - n
+					}
+					if room <= 0 {
+						// No room for another name. The readings are counted and the
+						// name is dropped; the tenant's existing fields keep measuring
+						// and no payload is refused. See MaxCustom.
+						crowded += st.seen
+						continue
+					}
+					room--
+				}
 				row, err = fieldKind.New(tx, org)
 				if err != nil {
 					return fmt.Errorf("%w: %w", ErrStore, err)
@@ -340,12 +440,13 @@ func (s *Shelf) write(org string, c *census) error {
 			return fmt.Errorf("%w: %w", ErrStore, err)
 		}
 		var row *core.Record
-		var payloads, skipped int64
+		var payloads, skipped, held int64
 		var first, last time.Time
 		if len(rows) > 0 {
 			row = rows[0]
 			payloads = int64(row.GetInt(fieldPayloads))
 			skipped = int64(row.GetInt(fieldSkipped))
+			held = int64(row.GetInt(fieldCrowded))
 			first = row.GetDateTime(fieldFirst).Time()
 			last = row.GetDateTime(fieldLast).Time()
 		} else {
@@ -356,6 +457,7 @@ func (s *Shelf) write(org string, c *census) error {
 		}
 		payloads += c.payloads
 		skipped += c.skipped
+		held += crowded
 		if first.IsZero() || (!c.first.IsZero() && c.first.Before(first)) {
 			first = c.first
 		}
@@ -364,6 +466,7 @@ func (s *Shelf) write(org string, c *census) error {
 		}
 		row.Set(fieldPayloads, payloads)
 		row.Set(fieldSkipped, skipped)
+		row.Set(fieldCrowded, held)
 		row.Set(fieldFirst, first.UTC())
 		row.Set(fieldLast, last.UTC())
 		if err := tx.Save(row); err != nil {
@@ -371,6 +474,18 @@ func (s *Shelf) write(org string, c *census) error {
 		}
 		return nil
 	})
+}
+
+// vocabulary is how many custom names this tenant's catalog already holds,
+// counted no further than the bound: what a caller of this needs is whether there
+// is room, and reading a whole overgrown catalog to answer that would be the cost
+// the bound exists to avoid.
+func vocabulary(app core.App, org string, bound int) (int, error) {
+	rows, err := fieldKind.Find(app, org, fieldOrigin+" = {:origin}", "", bound, dbx.Params{"origin": Custom})
+	if err != nil {
+		return 0, fmt.Errorf("%w: %w", ErrStore, err)
+	}
+	return len(rows), nil
 }
 
 // fold merges an accumulated stat into the stored one. Every accumulator here is
@@ -417,6 +532,9 @@ func (s *Shelf) Catalog(ctx context.Context, org string, _ *CatalogIn) (*Catalog
 		st.origin = row.GetString(fieldOrigin)
 		st.shape = row.GetString(fieldShape)
 		held.fields[row.GetString(fieldName)] = st
+		if st.origin == Custom {
+			held.names++
+		}
 	}
 	crows, err := censusKind.Find(s.app, org, "", "", 1, nil)
 	if err != nil {
@@ -425,6 +543,7 @@ func (s *Shelf) Catalog(ctx context.Context, org string, _ *CatalogIn) (*Catalog
 	if len(crows) > 0 {
 		held.payloads = int64(crows[0].GetInt(fieldPayloads))
 		held.skipped = int64(crows[0].GetInt(fieldSkipped))
+		held.crowded = int64(crows[0].GetInt(fieldCrowded))
 		held.first = crows[0].GetDateTime(fieldFirst).Time()
 		held.last = crows[0].GetDateTime(fieldLast).Time()
 	}
@@ -439,7 +558,7 @@ func (s *Shelf) Catalog(ctx context.Context, org string, _ *CatalogIn) (*Catalog
 
 	out := &Catalog{
 		Payloads: held.payloads, First: held.first, Last: held.last,
-		Pending: pending, Skipped: held.skipped,
+		Pending: pending, Skipped: held.skipped, Crowded: held.crowded,
 		Fields:   make([]Field, 0, len(held.fields)+len(declared)),
 		Features: inventory(),
 	}
@@ -462,7 +581,8 @@ func (s *Shelf) Catalog(ctx context.Context, org string, _ *CatalogIn) (*Catalog
 // into an answer cannot race the next Observe.
 func copyCensus(c *census) *census {
 	out := &census{fields: make(map[string]*stat, len(c.fields)),
-		payloads: c.payloads, skipped: c.skipped, first: c.first, last: c.last}
+		payloads: c.payloads, skipped: c.skipped, crowded: c.crowded,
+		names: c.names, first: c.first, last: c.last}
 	for name, st := range c.fields {
 		copied := *st
 		out.fields[name] = &copied

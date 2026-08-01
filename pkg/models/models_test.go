@@ -375,3 +375,185 @@ func TestRestart(t *testing.T) {
 		t.Fatalf("the tenant boundary did not survive the restart: %d fits", len(mine.Fits))
 	}
 }
+
+// TestAnAdoptedControlDoesNotGoQuietOnItsOwn.
+//
+// The fit is durable and the adoption is durable, but what an adoption DOES is
+// install learned state into a model that lives in memory — and memory does not
+// survive a rollout (one replica, Recreate) or an eviction (the live store holds
+// a bounded number of tenants' models). Neither is a decision anybody took, and
+// both silently return the tenant to warming, which reports no alerts, which is
+// what a quiet institution also reports.
+//
+// So the model asks the plane what this tenant last adopted when it plants a
+// model for it, and the control comes back by itself.
+func TestAnAdoptedControlDoesNotGoQuietOnItsOwn(t *testing.T) {
+	s := shelf(t)
+	ctx := context.Background()
+	fit, err := s.Fit(ctx, acme, &FitIn{Topology: shape, Options: topology.Options{Seed: 7}, By: "a.mensah"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Adopt(ctx, acme, &AdoptIn{ID: fit.ID, Reason: "the search recommended it", By: "r.okafor"}); err != nil {
+		t.Fatal(err)
+	}
+
+	// What a rollout produces: the same durable rows, a brand new blind model.
+	fresh := live(t, shape, 7)
+	if st := fresh.State(acme); st.Learned != 0 {
+		t.Fatal("the fresh model is not blind, so this is not testing a rollout")
+	}
+	fresh.SetAdopted(s.Adopted)
+
+	// The first transaction after the rollout plants the tenant's model, and
+	// planting is where the adoption comes back.
+	fresh.Learn(types.Transaction{
+		ID: "tx-after", OrgID: acme, UserID: "u1", AccountID: "acct-1",
+		Currency: "USD", Notional: 100, USD: 100, Direction: "in",
+		Timestamp: noon.Add(time.Hour),
+	}, types.Entity{ID: "u1", OrgID: acme})
+
+	st := fresh.State(acme)
+	if st.Learned <= 1 {
+		t.Fatalf("the adopted state did not come back: learned = %d", st.Learned)
+	}
+	// And it SAYS it came back. A model that reset and recovered and a model that
+	// never reset read the same from the outside otherwise, so the two things a
+	// reviewer needs — when this model started, and whether it started from an
+	// adoption — are on the state.
+	if !st.Restored {
+		t.Fatal("the model came back from an adoption and does not say so")
+	}
+	if st.Planted.IsZero() {
+		t.Fatal("the model does not say when it started, so a reset is invisible")
+	}
+
+	// The negative control: a tenant with no adoption plants blind, and says that
+	// too. Without this the assertion above would pass on a state that reported
+	// Restored for everything.
+	fresh.Learn(types.Transaction{
+		ID: "tx-other", OrgID: rival, UserID: "u1", AccountID: "acct-1",
+		Currency: "USD", Notional: 100, USD: 100, Direction: "in",
+		Timestamp: noon.Add(time.Hour),
+	}, types.Entity{ID: "u1", OrgID: rival})
+	blind := fresh.State(rival)
+	if blind.Restored {
+		t.Fatal("a tenant that adopted nothing reports a restored model")
+	}
+	if blind.Planted.IsZero() {
+		t.Fatal("a blind model does not say when it started either")
+	}
+}
+
+// TestAnotherTenantsAdoptionIsNeverReloaded. The reload is a per-tenant read of a
+// per-tenant row, and the snapshot's own tenant is checked against the row's
+// scope on the way out — the same refusal Adopt makes, made again where nobody is
+// watching.
+func TestAnotherTenantsAdoptionIsNeverReloaded(t *testing.T) {
+	s := shelf(t)
+	ctx := context.Background()
+	fit, err := s.Fit(ctx, acme, &FitIn{Topology: shape, Options: topology.Options{Seed: 7}, By: "a.mensah"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Adopt(ctx, acme, &AdoptIn{ID: fit.ID, Reason: "adopted", By: "r.okafor"}); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, ok := s.Adopted(acme); !ok {
+		t.Fatal("the tenant's own adoption was not found")
+	}
+	// A third tenant, and the SAME org name under another brand — the collision
+	// the tenant key exists to prevent.
+	for _, stranger := range []string{rival, other} {
+		if snap, ok := s.Adopted(stranger); ok {
+			t.Fatalf("%s reloaded another tenant's adopted state: %+v", stranger, snap.OrgID)
+		}
+	}
+	// And a bare org names no tenant at all.
+	if _, ok := s.Adopted("acme"); ok {
+		t.Fatal("a bare org reloaded state")
+	}
+}
+
+// TestOnlyAnAdoptionIsReloaded. A fit that nobody adopted is a recommendation,
+// and a recommendation must not install itself.
+func TestOnlyAnAdoptionIsReloaded(t *testing.T) {
+	s := shelf(t)
+	ctx := context.Background()
+	if _, err := s.Fit(ctx, acme, &FitIn{Topology: shape, Options: topology.Options{Seed: 7}, By: "a.mensah"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := s.Adopted(acme); ok {
+		t.Fatal("an unadopted fit installed itself")
+	}
+}
+
+// TestTheMostRecentAdoptionWins. Adoption is a sequence of decisions and the last
+// one is the one in force; coming back as an earlier one would be a control
+// quietly reverting.
+func TestTheMostRecentAdoptionWins(t *testing.T) {
+	s := shelf(t)
+	ctx := context.Background()
+	var last string
+	for i, at := range []time.Time{noon, noon.Add(time.Hour), noon.Add(2 * time.Hour)} {
+		s.Now = func() time.Time { return at }
+		fit, err := s.Fit(ctx, acme, &FitIn{
+			Topology: shape,
+			Options:  topology.Options{Seed: uint64(7 + i)},
+			By:       "a.mensah",
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := s.Adopt(ctx, acme, &AdoptIn{ID: fit.ID, Reason: "rolling forward", By: "r.okafor"}); err != nil {
+			t.Fatal(err)
+		}
+		last = fit.ID
+	}
+	snap, ok := s.Adopted(acme)
+	if !ok {
+		t.Fatal("nothing came back")
+	}
+	fits, err := s.Fits(ctx, acme, &FitsIn{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, f := range fits.Fits {
+		if f.ID == last && f.Adopted.IsZero() {
+			t.Fatal("the last adoption was not recorded")
+		}
+	}
+	if snap.OrgID != acme {
+		t.Fatalf("the reloaded state belongs to %q", snap.OrgID)
+	}
+	if snap.Seed == 0 {
+		t.Fatal("the reloaded snapshot carries no seed, so it is not real state")
+	}
+}
+
+// TestAFitRecordsWhatItCost. The model plane is the expensive one, so a tenant's
+// spend on it has to be answerable from what was kept rather than from a counter
+// a restart resets.
+func TestAFitRecordsWhatItCost(t *testing.T) {
+	s := shelf(t)
+	fit, err := s.Fit(context.Background(), acme, &FitIn{
+		Topology: shape, Options: topology.Options{Seed: 7}, By: "a.mensah",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fit.Elapsed <= 0 {
+		t.Fatalf("a fit records no cost: %+v", fit.Elapsed)
+	}
+	fits, err := s.Fits(context.Background(), acme, &FitsIn{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(fits.Fits) != 1 || fits.Fits[0].Elapsed != fit.Elapsed {
+		t.Fatalf("the cost did not survive the write: %+v", fits.Fits)
+	}
+	if fit.Trial.Events == 0 {
+		t.Fatal("a fit records how much history it read")
+	}
+}
