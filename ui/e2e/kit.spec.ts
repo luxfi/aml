@@ -21,6 +21,10 @@
 //      - A custom property is substituted where it is DECLARED. The theme bridge
 //        sat at `:root`, which the kit's `:root .t_dark` can never reach, so a
 //        control took a white ground and white text and disappeared into itself.
+//      - The kit's default families are `System` and `Heading`, which are React
+//        Native names no browser resolves, and the sans stack was declared in
+//        the theme bridge that `body` is outside of. Both fall back to the
+//        default serif, so the console shipped set in Times New Roman.
 //
 //    Each is silent, each is a lie about what the screen says, and each has an
 //    assertion below. They are written as invariants rather than as three
@@ -138,6 +142,29 @@ test.describe('the kit reaches the screens', () => {
       on[0].bg !== off[0].bg || on[0].color !== off[0].color,
       'the selected segment is indistinguishable from the unselected ones',
     ).toBe(true)
+  })
+
+  test("the type is the console's typeface, not the browser's default", async ({ page }) => {
+    await signIn(page)
+    await page.goto('/cases')
+    await expect(page.locator('nav.rail')).toBeVisible()
+
+    // A family the browser cannot resolve is not an error: it silently takes
+    // the default, which is a serif, and the screen still renders. So the
+    // assertion names the two stacks this console declares and refuses
+    // everything else — a kit family that means nothing here (`System`), and a
+    // variable substituted in a scope that does not hold it, both land outside
+    // them. It reads the resolved family off elements the kit owns and elements
+    // it does not, because the two are dressed on opposite sides of the seam.
+    const families = await page
+      .locator('body, nav.rail, h1, h2, button, input, select, td, .grid .id, code')
+      .evaluateAll((els) =>
+        [...new Set(els.map((el) => getComputedStyle(el).fontFamily))].sort(),
+      )
+
+    expect(families.length, 'nothing was measured').toBeGreaterThan(0)
+    const stray = families.filter((f) => !/^ui-sans-serif,|^ui-monospace,/.test(f))
+    expect(stray, `type is set in ${stray.join(' / ')}`).toEqual([])
   })
 
   test('nothing is invisible against itself', async ({ page }) => {

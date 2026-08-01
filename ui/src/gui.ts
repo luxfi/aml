@@ -27,7 +27,32 @@
 import { getDefaultGuiConfig } from '@hanzogui/config-default'
 import { createGui } from '@hanzogui/core'
 
-export const config = createGui(getDefaultGuiConfig('web'))
+/**
+ * The typeface, spelled the way the web spells it.
+ *
+ * The kit's default config names its families `System` and `Heading`. Those are
+ * React Native family names: on that platform the OS resolves them, and on this
+ * one nothing does. The kit emits the name verbatim as `--f-family`, every
+ * component reads `font-family: var(--f-family)`, and a family no browser knows
+ * falls back to the default serif — so the whole console rendered in Times New
+ * Roman while the build, the typecheck, the CSP run and the render tests all
+ * passed. One stack, given to both roles, is what `System` was asking for.
+ *
+ * It is the same list as `--hz-font-sans` in app.css, which dresses the plain
+ * elements the kit does not own; the two are the console's one typeface stated
+ * on each side of the seam.
+ */
+const sans = 'ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif'
+
+const base = getDefaultGuiConfig('web')
+
+export const config = createGui({
+  ...base,
+  fonts: {
+    body: { ...base.fonts.body, family: sans },
+    heading: { ...base.fonts.heading, family: sans },
+  },
+})
 export default config
 
 /**
