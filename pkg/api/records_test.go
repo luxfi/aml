@@ -129,8 +129,8 @@ func TestIngestRefusesWithoutKeyMaterial(t *testing.T) {
 	if h.Alerts.Len() != 0 {
 		t.Errorf("alert store holds %d transactions", h.Alerts.Len())
 	}
-	if h.Cases.Len() != 0 {
-		t.Errorf("case store holds %d cases", h.Cases.Len())
+	if h.Cases.Len(acme) != 0 {
+		t.Errorf("case store holds %d cases", h.Cases.Len(acme))
 	}
 }
 
@@ -573,7 +573,7 @@ func TestSandboxReplaysTheEngineOverRetainedHistory(t *testing.T) {
 			t.Fatalf("ingest %v: status %d: %s", notional, rec.Code, rec.Body.String())
 		}
 	}
-	records, opened := ledgerLen(t, h), h.Cases.Len()
+	records, opened := ledgerLen(t, h), h.Cases.Len(acme)
 
 	e, rec := send(http.MethodPost, "/v1/aml/rules/test", map[string]any{
 		"dsl":       "Tx.Notional >= 9000.0 && Tx.Notional < 10000.0",
@@ -614,8 +614,8 @@ func TestSandboxReplaysTheEngineOverRetainedHistory(t *testing.T) {
 	if held := ledgerLen(t, h); held != records {
 		t.Errorf("the replay changed the ledger: %d records, was %d", held, records)
 	}
-	if h.Cases.Len() != opened {
-		t.Errorf("the replay opened %d cases", h.Cases.Len()-opened)
+	if h.Cases.Len(acme) != opened {
+		t.Errorf("the replay opened %d cases", h.Cases.Len(acme)-opened)
 	}
 }
 

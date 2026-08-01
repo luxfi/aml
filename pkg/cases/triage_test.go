@@ -129,7 +129,7 @@ func TestAStaleCaseIsEscalatedNotClosed(t *testing.T) {
 	// the less — the old path swept only low severity, which had it the wrong way up.
 	critical := stale(types.SeverityCritical)
 
-	if n := s.AutoEscalateStale(DefaultTriageConfig()); n != 2 {
+	if n := s.AutoEscalateStale("org1", DefaultTriageConfig()); n != 2 {
 		t.Fatalf("escalated %d stale cases, want 2 — every severity, not only low", n)
 	}
 
@@ -159,7 +159,7 @@ func TestNoTimerPathCanCloseACase(t *testing.T) {
 	age(t, s, c.ID, time.Time{}, time.Now().UTC().Add(-365*24*time.Hour))
 	s.mu.Unlock()
 
-	s.AutoEscalateStale(DefaultTriageConfig())
+	s.AutoEscalateStale("org1", DefaultTriageConfig())
 	s.TriageCheck("org1", []string{"analyst-1"}, DefaultTriageConfig())
 
 	if got := s.Get(c.ID); got.Status == types.CaseClosed {
@@ -177,7 +177,7 @@ func TestRecentActivityIsNotStale(t *testing.T) {
 	s := NewStore()
 	c := s.Create("org1", types.SeverityLow, nil, nil)
 
-	if n := s.AutoEscalateStale(DefaultTriageConfig()); n != 0 {
+	if n := s.AutoEscalateStale("org1", DefaultTriageConfig()); n != 0 {
 		t.Errorf("escalated %d cases, want 0 — this one was just created", n)
 	}
 	if got := s.Get(c.ID); got.Status != types.CaseOpen {
