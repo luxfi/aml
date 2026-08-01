@@ -81,6 +81,12 @@ const skew = 2 * time.Minute
 const accessToken = "access-token"
 
 // claims is the part of an IAM access token this engine reads.
+//
+// RegisteredClaims carries Subject (`sub`), which is the caller's own identifier
+// and the value a governed record names as its decider. It is read from the token
+// rather than from a request body for the reason [types.Decider] states, and it
+// is the SUBJECT rather than a display name because attribution has to survive a
+// rename.
 type claims struct {
 	jwt.RegisteredClaims
 	// Owner is the org the token acts for — IAM's tenant claim, which every layer
@@ -136,12 +142,12 @@ func (c *claims) member(org string) bool {
 // will not serve, because it answers with another tenant's records and looks
 // healthy doing it.
 func IAMIdentity(jwks Keysets, audience string) Identity {
-	return func(r *http.Request) (string, error) {
+	return func(r *http.Request) (Caller, error) {
 		if jwks == nil {
-			return "", errors.New("no keyset source configured, so no token can be verified")
+			return Caller{}, errors.New("no keyset source configured, so no token can be verified")
 		}
 		if strings.TrimSpace(audience) == "" {
-			return "", errors.New("no audience configured, so any application's token would be a credential here")
+			return Caller{}, errors.New("no audience configured, so any application's token would be a credential here")
 		}
 
 		// The Host, not a forwarding header: an intermediary's claim about the
@@ -154,7 +160,7 @@ func IAMIdentity(jwks Keysets, audience string) Identity {
 		// the authenticator of record for all of them.
 		id, ok := brand.ForHostOK(r.Host)
 		if !ok {
-			return "", fmt.Errorf("host %q names no brand, so nothing is trusted to have signed this", r.Host)
+			return Caller{}, fmt.Errorf("host %q names no brand, so nothing is trusted to have signed this", r.Host)
 		}
 		b, _ := brand.For(id)
 		// An empty expectation does not loosen the issuer check, it removes it:
@@ -162,26 +168,26 @@ func IAMIdentity(jwks Keysets, audience string) Identity {
 		// v.expectedIss != ""`). A brand row without an issuer would therefore admit
 		// every brand's tokens on that host, so it admits none.
 		if b.IAMIssuer == "" {
-			return "", fmt.Errorf("brand %s states no issuer, so nothing is trusted to have signed this", id)
+			return Caller{}, fmt.Errorf("brand %s states no issuer, so nothing is trusted to have signed this", id)
 		}
 
 		raw, err := bearer(r)
 		if err != nil {
-			return "", err
+			return Caller{}, err
 		}
 		// Shape before keys. Resolving a keyset can cost a request to the issuer, and
 		// an unauthenticated caller must not be able to spend one by putting a word in
 		// the Authorization header.
 		if err := compact(raw); err != nil {
-			return "", err
+			return Caller{}, err
 		}
 
 		set, err := jwks(b.IAMIssuer)
 		if err != nil {
-			return "", fmt.Errorf("keys for issuer %s: %w", b.IAMIssuer, err)
+			return Caller{}, fmt.Errorf("keys for issuer %s: %w", b.IAMIssuer, err)
 		}
 		if len(set) == 0 {
-			return "", fmt.Errorf("issuer %s published no signing key", b.IAMIssuer)
+			return Caller{}, fmt.Errorf("issuer %s published no signing key", b.IAMIssuer)
 		}
 
 		var c claims
@@ -192,23 +198,35 @@ func IAMIdentity(jwks Keysets, audience string) Identity {
 			jwt.WithExpirationRequired(),
 			jwt.WithLeeway(skew),
 		); err != nil {
-			return "", fmt.Errorf("token on a %s host: %w", id, err)
+			return Caller{}, fmt.Errorf("token on a %s host: %w", id, err)
 		}
 
 		if c.TokenType != accessToken {
-			return "", fmt.Errorf("token is a %q and not an %s", c.TokenType, accessToken)
+			return Caller{}, fmt.Errorf("token is a %q and not an %s", c.TokenType, accessToken)
 		}
 		owner := strings.TrimSpace(c.Owner)
 		if owner == "" {
-			return "", errors.New("token names no owner, so it acts for no tenant")
+			return Caller{}, errors.New("token names no owner, so it acts for no tenant")
 		}
 		if !c.member(owner) {
 			// The application minted a token naming an org its caller is not in, which
 			// is what a shared or org-choice application does. Serving it would make
 			// every one of that application's users one tenant: the app owner's.
-			return "", fmt.Errorf("token acts for org %q, which the caller is not a member of", owner)
+			return Caller{}, fmt.Errorf("token acts for org %q, which the caller is not a member of", owner)
 		}
-		return qualify(id, owner)
+		tenant, err := qualify(id, owner)
+		if err != nil {
+			return Caller{}, err
+		}
+		// The subject, verified by the same signature that named the tenant. It is
+		// what a governed record records as its decider, and taking it from the
+		// token is the whole of the difference between "somebody turned this off"
+		// and "this identity turned this off".
+		//
+		// A token with no `sub` still authenticates: reads and ingest belong to the
+		// tenant and not to a person. It records no decision, because Caller.Subject
+		// is empty and every governed operation refuses an empty decider.
+		return Caller{Tenant: tenant, Subject: strings.TrimSpace(c.Subject)}, nil
 	}
 }
 

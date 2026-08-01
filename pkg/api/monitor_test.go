@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
+	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -229,5 +231,197 @@ func TestARuleReadsTheTenantsOwnDenyList(t *testing.T) {
 	}
 	if out.Action != types.ActionAllow {
 		t.Fatalf("an address nobody listed must pass, got %q", out.Action)
+	}
+}
+
+// TestARetriedTransactionIsCountedOnce.
+//
+// Ingest records a transaction, then its alerts, then their activations. Anything
+// after the first write that fails answers 503, and a client that retries a 503
+// sends the whole transaction again — so every plane that ingest writes has to be
+// able to see the same transaction twice and record it once. The activation plane
+// is the one this track added, and a duplicated activation is worse than a
+// duplicated row: it is counted in the streak, so a declared repetition policy
+// fires on a repeat that never happened.
+func TestARetriedTransactionIsCountedOnce(t *testing.T) {
+	h := monitored(t)
+	ctx := context.Background()
+
+	body := payment("tx-1", 25_000)
+	for range 3 {
+		if rec := ingest(t, h, body); rec.Code != http.StatusOK {
+			t.Fatalf("ingest = %d: %s", rec.Code, rec.Body.String())
+		}
+	}
+
+	feed, err := h.Planes.Watch.Feed(ctx, acme, &watch.FeedIn{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(feed.Activations) != 1 {
+		t.Fatalf("three offers of one transaction wrote %d activations: %+v", len(feed.Activations), feed.Activations)
+	}
+	rates, err := h.Planes.Watch.Rates(ctx, acme, &watch.RatesIn{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rates.Rules) != 1 || rates.Rules[0].Fired != 1 {
+		t.Fatalf("the rates counted the retries: %+v", rates.Rules)
+	}
+
+	// And a different transaction is still a different activation, so the fix is
+	// not "record nothing twice".
+	if rec := ingest(t, h, payment("tx-2", 25_000)); rec.Code != http.StatusOK {
+		t.Fatalf("ingest = %d: %s", rec.Code, rec.Body.String())
+	}
+	feed, err = h.Planes.Watch.Feed(ctx, acme, &watch.FeedIn{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(feed.Activations) != 2 {
+		t.Fatalf("a second transaction did not produce a second activation: %+v", feed.Activations)
+	}
+}
+
+// TestARetriedTransactionDoesNotEscalateItself.
+//
+// The sharpest form: a rung raises the response on the second firing, so a
+// duplicated activation makes the RETRY of a single transaction escalate itself —
+// a payment blocked because the client retried a 503.
+func TestARetriedTransactionDoesNotEscalateItself(t *testing.T) {
+	h := monitored(t)
+	if _, err := h.Planes.Watch.Declare(context.Background(), acme, &watch.DeclareIn{
+		Rule: "ctr", Kind: "account", Count: 2, Within: watch.Span(time.Hour), To: types.ActionBlock,
+		Reason: "two reportable transactions in an hour on one account", By: "a.mensah",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	body := payment("tx-1", 25_000)
+	var out types.EvalResult
+	for range 2 {
+		rec := ingest(t, h, body)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("ingest = %d: %s", rec.Code, rec.Body.String())
+		}
+		if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if out.Action == types.ActionBlock {
+		t.Fatal("retrying one transaction escalated it against itself")
+	}
+
+	// A genuinely second transaction still escalates, so the rung still works.
+	rec := ingest(t, h, payment("tx-2", 25_000))
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+		t.Fatal(err)
+	}
+	if out.Action != types.ActionBlock {
+		t.Fatalf("the declared escalation stopped working: %q", out.Action)
+	}
+}
+
+// TestOneTenantsSuppressionsAreNeverAnothersIngest.
+//
+// The isolation invariant, at the seam this track changed. A tenant that has
+// crowded one rule with suppressions degrades ITS OWN cover check and nothing
+// else: another institution's ingest is unaffected, its cover check is complete,
+// and neither reads the other's rows.
+func TestOneTenantsSuppressionsAreNeverAnothersIngest(t *testing.T) {
+	h := monitored(t)
+	ctx := context.Background()
+	const rival = "hanzo/rival"
+
+	for i := range 6 {
+		if _, err := h.Planes.Suppress.Suppress(ctx, acme, &suppress.SuppressIn{
+			Rule: "ctr", Kind: "account", Value: "acct-" + string(rune('a'+i)),
+			Reason: "reviewed and agreed", By: "a.mensah",
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// The other institution's own suppression still covers its own activation, and
+	// this institution's six do not appear anywhere in its answer.
+	if _, err := h.Planes.Suppress.Suppress(ctx, rival, &suppress.SuppressIn{
+		Rule: "ctr", Kind: "account", Value: "acct-1", Reason: "their own decision", By: "b.tran",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	cover, err := h.Planes.Suppress.Cover(ctx, rival, &suppress.CoverIn{Rule: "ctr", Kind: "account", Value: "acct-1"})
+	if err != nil {
+		t.Fatalf("the other tenant's cover check failed: %v", err)
+	}
+	if !cover.Covered || cover.Partial {
+		t.Fatalf("the other tenant's answer was affected by this one's volume: %+v", cover)
+	}
+	ledger, err := h.Planes.Suppress.Ledger(ctx, rival, &suppress.LedgerIn{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ledger.Suppressions) != 1 {
+		t.Fatalf("the other tenant reads %d suppressions, want only its own", len(ledger.Suppressions))
+	}
+
+	// And this institution's ingest still works, which is the self-DoS half.
+	if rec := ingest(t, h, payment("tx-1", 25_000)); rec.Code != http.StatusOK {
+		t.Fatalf("ingest = %d: %s", rec.Code, rec.Body.String())
+	}
+	feed, err := h.Planes.Watch.Feed(ctx, rival, &watch.FeedIn{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(feed.Activations) != 0 {
+		t.Fatalf("one tenant's ingest wrote into another's activation plane: %+v", feed.Activations)
+	}
+}
+
+// TestARealConflictIsAConflictAndNotAnOutage.
+//
+// The other half of making a retry work: an id reused for a DIFFERENT
+// transaction is refused, and the refusal says which kind it is. 503 means "the
+// engine could not, try again" and a client that retries a permanent refusal
+// retries forever — which is the loop that turns one caller's mistake into a
+// queue of transactions that never clears.
+func TestARealConflictIsAConflictAndNotAnOutage(t *testing.T) {
+	h := monitored(t)
+
+	first := payment("tx-1", 25_000)
+	if rec := ingest(t, h, first); rec.Code != http.StatusOK {
+		t.Fatalf("ingest = %d: %s", rec.Code, rec.Body.String())
+	}
+	// Same id, a different amount. That is a different fact, and the ledger has
+	// one under this name already.
+	second := payment("tx-1", 90_000)
+	second["timestamp"] = first["timestamp"]
+	rec := ingest(t, h, second)
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("a reused id with a different transaction = %d: %s, want 409", rec.Code, rec.Body.String())
+	}
+
+	// And the first record stands: a conflict refuses the second submission, it
+	// does not overwrite what was retained.
+	feed, err := h.Planes.Watch.Feed(context.Background(), acme, &watch.FeedIn{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(feed.Activations) != 1 {
+		t.Fatalf("the conflicting submission left %d activations: %+v", len(feed.Activations), feed.Activations)
+	}
+}
+
+// TestIngestStampsNoClockOfItsOwn reads the source. A reception clock written
+// onto the transaction is what made the retry above impossible to recognise, and
+// it is one line to reintroduce.
+func TestIngestStampsNoClockOfItsOwn(t *testing.T) {
+	raw, err := os.ReadFile("routes.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, banned := range []string{"tx.CreatedAt =", "tx.UpdatedAt ="} {
+		if strings.Contains(string(raw), banned) {
+			t.Fatalf("%s: ingest stamps its own clock into the retained fact again, so no retry can be recognised", banned)
+		}
 	}
 }

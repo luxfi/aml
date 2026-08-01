@@ -71,11 +71,17 @@ func (h *Handler) registerPlanes(se *core.ServeEvent) {
 		se.Router.GET("/v1/aml/dictionary", get(h, d.Catalog))
 	}
 	if m := h.Planes.Models; m != nil {
+		// The two that cost the machine are admitted one per tenant and bounded in
+		// time. A search replays a tenant's history through up to MaxTrials
+		// candidate detectors and a fit replays it through one; either is minutes
+		// of pure arithmetic asked for by one request, on a single-replica engine
+		// that also has to answer ingest. See gate.go, and topology.Budget for the
+		// share of the machine every study together may take.
 		se.Router.GET("/v1/aml/models/runs", get(h, m.Runs))
-		se.Router.POST("/v1/aml/models/runs", post(h, m.Search, true))
+		se.Router.POST("/v1/aml/models/runs", post(h, one(&h.studies, within(maxStudy, m.Search)), true))
 		se.Router.GET("/v1/aml/models/runs/{id}", get(h, m.Run))
 		se.Router.GET("/v1/aml/models/fits", get(h, m.Fits))
-		se.Router.POST("/v1/aml/models/fits", post(h, m.Fit, true))
+		se.Router.POST("/v1/aml/models/fits", post(h, one(&h.studies, within(maxStudy, m.Fit)), true))
 		se.Router.POST("/v1/aml/models/fits/{id}/adopt", post(h, m.Adopt, false))
 	}
 }

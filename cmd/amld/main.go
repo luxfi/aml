@@ -39,6 +39,7 @@ import (
 	"github.com/luxfi/aml/pkg/screen"
 	"github.com/luxfi/aml/pkg/suppress"
 	"github.com/luxfi/aml/pkg/token"
+	"github.com/luxfi/aml/pkg/topology"
 	"github.com/luxfi/aml/pkg/velocity"
 	"github.com/luxfi/aml/pkg/watch"
 )
@@ -194,6 +195,15 @@ func main() {
 			catalog := dictionary.NewBase(app)
 			study := models.NewBase(app)
 			study.Model = model
+			// Half the machine, at most, for every study together — the other half
+			// is ingest's, and a transaction that cannot be recorded cannot be
+			// processed. See topology.Budget.
+			study.Cores = topology.NewBudget(0)
+			// And the reload: a model planted after a rollout or an eviction asks
+			// the model plane what this tenant last adopted, so an adopted control
+			// cannot go quiet without somebody deciding it should. Wired here,
+			// before anything serves.
+			model.SetAdopted(study.Adopted)
 
 			rates := reference.RatesFromEnv()
 

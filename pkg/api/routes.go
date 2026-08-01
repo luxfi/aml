@@ -5,6 +5,7 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"log"
@@ -87,6 +88,13 @@ type Handler struct {
 	// jurisdiction is known — see the entity resolver above, which does not
 	// have one yet.
 	Limit float64
+
+	// The expensive work, admitted one at a time per tenant. They are fields and
+	// not package state so that two handlers in one process are two deployments,
+	// and they are two gates and not one so that a rule replay and a model study
+	// do not exclude each other. See gate.go.
+	replays gate
+	studies gate
 }
 
 // reportLimit is the fallback reporting limit, in the unit the aggregates are
@@ -302,11 +310,13 @@ func (h *Handler) ingestTransaction() func(e *core.RequestEvent) error {
 			tx.ID = uuid.NewString()
 		}
 		tx.OrgID = orgID
-		now := time.Now().UTC()
-		tx.CreatedAt = now
-		tx.UpdatedAt = now
+		// One clock, and it is the transaction's own. A reception clock stamped
+		// here would go into the retained body, and the retained body is what
+		// identifies the fact — so the same transaction offered twice would be two
+		// different facts under one id and the retry would conflict forever. The
+		// ledger records when it took a record; see types.Transaction.Timestamp.
 		if tx.Timestamp.IsZero() {
-			tx.Timestamp = now
+			tx.Timestamp = time.Now().UTC()
 		}
 
 		// Normalise the value once, here, and overwrite whatever the caller sent.
@@ -407,6 +417,12 @@ func (h *Handler) ingestTransaction() func(e *core.RequestEvent) error {
 			return fail(e, http.StatusBadRequest, "transaction names no party to retain it under")
 		case errors.Is(err, retention.ErrRelationship):
 			return fail(e, http.StatusBadRequest, "unknown relationship")
+		case errors.Is(err, retention.ErrConflict):
+			// A different transaction under an id this tenant has already used. It
+			// is the caller's to resolve and it will never clear on its own, so it
+			// is a conflict and not an outage: answered 503 it reads as "retry",
+			// and a client that retries a permanent refusal retries forever.
+			return fail(e, http.StatusConflict, "a different transaction is already retained under this id")
 		case err != nil:
 			return unavailable(e, "retain transaction", err)
 		}
@@ -549,11 +565,16 @@ func (h *Handler) addCaseEvent() func(e *core.RequestEvent) error {
 
 // resolution is a decision to close a case, and it carries what Art. 69(2)
 // requires of one.
+//
+// By is the analyst who took it, and it is a [types.Decider]: not on the wire,
+// written from the verified credential. Closing a case is the decision this whole
+// plane exists to record, and one attributed to whatever name a request body
+// carried is a retained assessment signed by nobody.
 type resolution struct {
-	Resolution string   `json:"resolution"`
-	Considered []string `json:"considered"`
-	Rationale  string   `json:"rationale"`
-	By         string   `json:"by"`
+	Resolution string        `json:"resolution"`
+	Considered []string      `json:"considered"`
+	Rationale  string        `json:"rationale"`
+	By         types.Decider `json:"-"`
 }
 
 // resolveCase closes a case against a retained assessment.
@@ -564,6 +585,10 @@ type resolution struct {
 // (AMLR Art. 77(1)(b); JMLSG 6.32), not a deleted row.
 func (h *Handler) resolveCase() func(e *core.RequestEvent) error {
 	return func(e *core.RequestEvent) error {
+		who, err := h.caller(e)
+		if err != nil {
+			return refuse(e, err)
+		}
 		c, orgID, err := h.caseOf(e)
 		switch {
 		case errors.Is(err, errNoCase):
@@ -576,6 +601,9 @@ func (h *Handler) resolveCase() func(e *core.RequestEvent) error {
 		if err := json.NewDecoder(e.Request.Body).Decode(&in); err != nil {
 			return fail(e, http.StatusBadRequest, "invalid request body")
 		}
+		// The decider, from the credential and after the body, exactly as the typed
+		// adapters do it for the record planes.
+		decide(&in, who.Subject)
 		if in.Resolution == "" {
 			return fail(e, http.StatusBadRequest, "resolution is required")
 		}
@@ -595,7 +623,7 @@ func (h *Handler) resolveCase() func(e *core.RequestEvent) error {
 			return unavailable(e, "retain assessment", err)
 		}
 
-		if err := h.Cases.Resolve(orgID, c.ID, in.Resolution, in.By, assessment); err != nil {
+		if err := h.Cases.Resolve(orgID, c.ID, in.Resolution, in.By.Trim(), assessment); err != nil {
 			return fail(e, http.StatusBadRequest, err.Error())
 		}
 		return e.JSON(http.StatusOK, map[string]string{
@@ -712,10 +740,10 @@ func (h *Handler) testRule() func(e *core.RequestEvent) error {
 		// One replay at a time per tenant. Rejecting is the honest answer: the
 		// caller asked for work that is already running, and queueing it would
 		// hold a connection open while the engine falls behind on ingest.
-		if !startReplay(orgID) {
+		if !h.replays.enter(orgID) {
 			return fail(e, http.StatusTooManyRequests, "a replay is already running for this tenant")
 		}
-		defer endReplay(orgID)
+		defer h.replays.leave(orgID)
 
 		var req struct {
 			DSL       string         `json:"dsl"`
@@ -762,8 +790,16 @@ func (h *Handler) testRule() func(e *core.RequestEvent) error {
 		}
 
 		candidate := types.Rule{ID: "candidate", Name: "candidate", DSL: req.DSL}
-		report, err := replay.Run(e.Request.Context(), h.Engine.Evaluator(), history, candidate, incumbent)
+		// The same budget a model study runs under, for the same reason: a replay
+		// over a whole retained history is minutes of arithmetic asked for by one
+		// request, on the process that also has to answer ingest. It is derived
+		// from the request's own context, so a client that goes away cancels it.
+		ctx, stop := context.WithTimeout(e.Request.Context(), maxStudy)
+		defer stop()
+		report, err := replay.Run(ctx, h.Engine.Evaluator(), history, candidate, incumbent)
 		switch {
+		case errors.Is(err, context.DeadlineExceeded), errors.Is(ctx.Err(), context.DeadlineExceeded):
+			return fail(e, http.StatusBadRequest, "the replay did not finish inside its budget; replay a sample instead")
 		case errors.Is(err, replay.ErrEmpty):
 			return fail(e, http.StatusConflict, "no history to replay against")
 		case errors.Is(err, replay.ErrNoRule):
@@ -818,20 +854,21 @@ func (h *Handler) openRelationship() func(e *core.RequestEvent) error {
 			return fail(e, http.StatusBadRequest, "relationship names no party")
 		}
 
-		body, err := seal(vault, retention.ClassRelationship, in.Ref, in)
+		body, mark, err := seal(vault, retention.ClassRelationship, in.Ref, in)
 		if err != nil {
 			return unavailable(e, "seal relationship", err)
 		}
 
 		id, err := h.Records.Retain(retention.Record{
-			Org:      orgID,
-			Class:    retention.ClassRelationship,
-			Trigger:  retention.TriggerRelationshipEnd,
-			Ref:      in.Ref,
-			Nature:   in.Nature,
-			Parties:  party,
-			Occurred: in.Opened,
-			Body:     body,
+			Org:         orgID,
+			Class:       retention.ClassRelationship,
+			Trigger:     retention.TriggerRelationshipEnd,
+			Ref:         in.Ref,
+			Nature:      in.Nature,
+			Parties:     party,
+			Occurred:    in.Opened,
+			Body:        body,
+			Fingerprint: mark,
 		})
 		switch {
 		case errors.Is(err, retention.ErrNature):

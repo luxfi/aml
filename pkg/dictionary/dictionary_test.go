@@ -10,6 +10,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/hanzoai/dbx"
+
 	"github.com/luxfi/aml/internal/instance"
 	"github.com/luxfi/aml/pkg/types"
 )
@@ -143,9 +145,14 @@ func TestCustomFieldsAreTheTenantsOwnVocabulary(t *testing.T) {
 	if channel.Origin != Custom || channel.Shape != Text || channel.Seen != 1 {
 		t.Fatalf("a payload key is catalogued as the tenant's own: %+v", channel)
 	}
+	// A numeric payload key is catalogued as a number, is counted, and is COUNTED
+	// DISTINCT — and carries no moment. See TestACustomNumberIsNeverStored.
 	terminal := field(t, cat, Prefix+"terminal")
-	if terminal.Shape != Number || terminal.Mean == nil || *terminal.Mean != 42 {
-		t.Fatalf("a numeric payload key carries its statistics: %+v", terminal)
+	if terminal.Shape != Number || terminal.Seen != 1 || terminal.Distinct != 1 {
+		t.Fatalf("a numeric payload key is catalogued and counted: %+v", terminal)
+	}
+	if terminal.Min != nil || terminal.Max != nil || terminal.Mean != nil || terminal.Deviation != nil {
+		t.Fatalf("a custom number's moments are the value itself: %+v", terminal)
 	}
 	reversed := field(t, cat, Prefix+"reversed")
 	if reversed.Shape != Bool || reversed.Seen != 1 {
@@ -472,4 +479,227 @@ func TestRestart(t *testing.T) {
 	if theirs.Payloads != 1 {
 		t.Fatalf("the tenant boundary did not survive the restart: %d", theirs.Payloads)
 	}
+}
+
+// TestACustomNumberIsNeverStored.
+//
+// "No payload value is ever stored" is the catalog's invariant, and the numeric
+// moments are where it is easiest to lose: a minimum IS a value, exactly, at any
+// volume, and at a count of one so are the sum and the mean derived from it. A
+// custom key holds whatever the institution put under its own name — a national
+// identifier, a date of birth written as a number, a card range — and nothing
+// here knows which.
+//
+// So this reads the DURABLE ROW rather than the answer: the value must not be in
+// any column of it, under any encoding a number takes.
+func TestACustomNumberIsNeverStored(t *testing.T) {
+	s := shelf(t)
+	ctx := context.Background()
+	// A number that is unmistakably an identifier rather than an amount.
+	if err := s.Observe(acme, payment("u1", 100, `{"born":19750321}`)); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Flush(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	rows, err := fieldKind.Find(s.app, acme, fieldName+" = {:name}", "", 1,
+		dbx.Params{"name": Prefix + "born"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("the field was not catalogued at all: %d rows", len(rows))
+	}
+	row := rows[0]
+	for _, column := range []string{fieldMin, fieldMax, fieldSum, fieldSquare, fieldCount} {
+		if v := row.GetFloat(column); v != 0 {
+			t.Errorf("%s = %v: a custom payload value is in the catalog", column, v)
+		}
+	}
+	serialised := dump(t, s, acme)
+	for _, form := range []string{"19750321", "1.9750321e+07"} {
+		if strings.Contains(serialised, form) {
+			t.Fatalf("the value %s survives in the stored rows: %s", form, serialised)
+		}
+	}
+
+	// What the catalog DOES keep is the shape, the fill and the variation — the
+	// whole of what it is for — and the answer says the moments are absent rather
+	// than zero.
+	cat, err := s.Catalog(ctx, acme, &CatalogIn{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	born := field(t, cat, Prefix+"born")
+	if born.Shape != Number || born.Seen != 1 || born.Distinct != 1 || born.Fill != 1 {
+		t.Fatalf("a custom number is still measured: %+v", born)
+	}
+	if born.Min != nil || born.Max != nil || born.Mean != nil || born.Deviation != nil {
+		t.Fatalf("a custom number carries a moment: %+v", born)
+	}
+
+	// The positive control: a DECLARED number is the transaction model's own, its
+	// range is the statistic a reviewer asks for, and it keeps its moments. Without
+	// this the test above would pass on a catalog that had stopped measuring.
+	usd := field(t, cat, "usd")
+	if usd.Min == nil || usd.Max == nil || usd.Mean == nil || *usd.Mean != 100 {
+		t.Fatalf("a declared number lost its statistics: %+v", usd)
+	}
+}
+
+// TestACustomNumberStillCountsDistinct. The sketch is what a custom number gets,
+// and it has to keep working: a bitmap over hashed values, per tenant, which is
+// the whole reason the moments can go.
+func TestACustomNumberStillCountsDistinct(t *testing.T) {
+	s := shelf(t)
+	for _, v := range []string{`{"born":1}`, `{"born":2}`, `{"born":3}`, `{"born":3}`} {
+		if err := s.Observe(acme, payment("u1", 100, v)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	cat, err := s.Catalog(context.Background(), acme, &CatalogIn{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	born := field(t, cat, Prefix+"born")
+	if born.Seen != 4 || born.Distinct != 3 {
+		t.Fatalf("seen=%d distinct=%d, want 4 and 3", born.Seen, born.Distinct)
+	}
+}
+
+// TestAVocabularyIsBoundedPerTenant.
+//
+// The accumulator is in memory, in the one process every institution's ingest
+// runs in, and a tenant chooses its own payload keys. A per-payload bound
+// (MaxKeys) does not bound a tenant that sends a DIFFERENT key on every
+// transaction: that tenant's vocabulary grows for as long as it keeps sending,
+// and what it exhausts is shared.
+//
+// So the vocabulary is bounded per tenant, and reaching it may only degrade the
+// tenant that reached it: no error, no refused payload, the fields it already has
+// keep measuring, and the readings it turned away are published.
+func TestAVocabularyIsBoundedPerTenant(t *testing.T) {
+	s := shelf(t)
+	s.vocab = 4
+	ctx := context.Background()
+
+	// Twenty distinct keys, one per payload, against a vocabulary of four.
+	for i := range 20 {
+		if err := s.Observe(acme, payment("u1", 100, fmt.Sprintf(`{"k%d":"v"}`, i))); err != nil {
+			t.Fatalf("a payload past the bound was refused: %v", err)
+		}
+	}
+
+	// BEFORE the flush, because the accumulator is the half that matters: it is
+	// in memory, in the process every institution's ingest runs in, and a bound
+	// applied only when the rows are written would let it grow between flushes.
+	held := s.pending[acme]
+	if held == nil || held.names != 4 {
+		t.Fatalf("the accumulator holds %v custom names against a bound of 4", held)
+	}
+	if kept(t, s, ctx, acme) != 4 {
+		t.Fatal("the un-flushed answer is over more names than the bound")
+	}
+
+	if err := s.Flush(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	cat, err := s.Catalog(ctx, acme, &CatalogIn{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n := kept(t, s, ctx, acme); n != 4 {
+		t.Fatalf("the catalog holds %d custom names against a bound of 4", n)
+	}
+	if cat.Crowded != 16 {
+		t.Fatalf("crowded = %d, want the 16 readings there was no room for", cat.Crowded)
+	}
+	// Every payload was still counted, and the declared fields still measure.
+	if cat.Payloads != 20 {
+		t.Fatalf("payloads = %d: the bound refused a payload", cat.Payloads)
+	}
+	if usd := field(t, cat, "usd"); usd.Seen != 20 {
+		t.Fatalf("a declared field stopped measuring at the bound: %+v", usd)
+	}
+
+	// The bound holds ACROSS flushes, which is the half a bound on the
+	// accumulator alone would miss: the rows are what grow without one.
+	for i := 20; i < 40; i++ {
+		if err := s.Observe(acme, payment("u1", 100, fmt.Sprintf(`{"k%d":"v"}`, i))); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := s.Flush(ctx); err != nil {
+		t.Fatal(err)
+	}
+	rows, err := fieldKind.Find(s.app, acme, fieldOrigin+" = {:o}", "", 0, dbx.Params{"o": Custom})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 4 {
+		t.Fatalf("%d custom rows are stored after a second flush, want 4", len(rows))
+	}
+}
+
+// TestOneTenantsVocabularyIsNeverAnothersBound. The isolation half: the bound is
+// this institution's own row count against its own bound, so a tenant that has
+// filled its vocabulary takes no room from anybody else's.
+func TestOneTenantsVocabularyIsNeverAnothersBound(t *testing.T) {
+	s := shelf(t)
+	s.vocab = 2
+	ctx := context.Background()
+
+	for i := range 10 {
+		if err := s.Observe(acme, payment("u1", 100, fmt.Sprintf(`{"k%d":"v"}`, i))); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// A second institution, and the SAME org name under a second brand.
+	for _, stranger := range []string{rival, other} {
+		if err := s.Observe(stranger, payment("u1", 100, `{"channel":"atm"}`)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := s.Flush(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, stranger := range []string{rival, other} {
+		cat, err := s.Catalog(ctx, stranger, &CatalogIn{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if cat.Crowded != 0 {
+			t.Fatalf("%s was crowded out by another tenant's vocabulary: %d", stranger, cat.Crowded)
+		}
+		if f := field(t, cat, Prefix+"channel"); f.Seen != 1 {
+			t.Fatalf("%s lost its own field to another tenant's volume: %+v", stranger, f)
+		}
+	}
+	// And the tenant that filled its own vocabulary is the one that is degraded.
+	mine, err := s.Catalog(ctx, acme, &CatalogIn{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if mine.Crowded == 0 {
+		t.Fatal("the tenant that reached its bound reports nothing about it")
+	}
+}
+
+// kept is how many custom names a tenant's catalog answer carries.
+func kept(t *testing.T, s *Shelf, ctx context.Context, org string) int {
+	t.Helper()
+	cat, err := s.Catalog(ctx, org, &CatalogIn{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	n := 0
+	for _, f := range cat.Fields {
+		if f.Origin == Custom {
+			n++
+		}
+	}
+	return n
 }

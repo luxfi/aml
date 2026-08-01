@@ -19,13 +19,32 @@ import (
 	"github.com/luxfi/aml/pkg/brand"
 )
 
-// Identity resolves the tenant a request is authenticated to act on, or returns
-// an error if it is not authenticated.
+// Caller is who a request is authenticated as: the tenant it acts for, and the
+// subject that authenticated.
+//
+// Two projections of ONE verified credential, because they are read for two
+// different reasons and both are read from the same signature. Tenant indexes
+// every store; Subject is what a governed record names as its decider, and it is
+// the answer to "who turned this off". A design that took the second from the
+// request body would be attributing the institution's decisions to whatever text
+// a caller sent.
+//
+// Subject may be empty where the deployment's identity cannot name one. That is
+// not an authentication failure — reads and ingest are the tenant's work, not a
+// person's — but it refuses every operation that records a decision, because a
+// decision naming nobody is the state this type exists to prevent.
+type Caller struct {
+	Tenant  string
+	Subject string
+}
+
+// Identity resolves who a request is authenticated as, or returns an error if it
+// is not authenticated.
 //
 // It is a seam rather than an implementation because this package must not be the
 // second place that decides what a valid credential is. The deployment supplies
 // one, and every route asks it the same question.
-type Identity func(*http.Request) (tenant string, err error)
+type Identity func(*http.Request) (Caller, error)
 
 // ErrNoIdentity is returned when no Identity is configured.
 var ErrNoIdentity = errors.New("no identity configured, so no request can be attributed to a tenant")
@@ -47,11 +66,14 @@ var (
 )
 
 // TrustedProxyHeader resolves the tenant's org from a header written by an
-// authenticating proxy, and its brand from the request's own Host.
+// authenticating proxy, and its brand from the request's own Host. subject names
+// the header carrying the authenticated user, which is what a governed record
+// records as its decider; an empty name means the proxy states none, and every
+// operation that records a decision then refuses.
 //
-// This is only sound where the proxy authenticates the caller, sets this header
-// from the verified token, strips any client-supplied copy of it, and is the sole
-// route to this service. Where the service is directly reachable, the header is
+// This is only sound where the proxy authenticates the caller, sets these headers
+// from the verified token, strips any client-supplied copy of them, and is the
+// sole route to this service. Where the service is directly reachable, a header is
 // an unauthenticated assertion and anyone can name any tenant — so this
 // constructor exists to make that assumption something a deployment states out
 // loud rather than something a reader has to infer from a comment.
@@ -60,21 +82,29 @@ var (
 // forwards a client's own X-Forwarded-Host would otherwise let the caller choose
 // which brand's tenant space its org lands in, which is the same cross-brand
 // collision qualify exists to prevent, arrived at from the other side.
-func TrustedProxyHeader(name string) Identity {
-	return func(r *http.Request) (string, error) {
+func TrustedProxyHeader(name, subject string) Identity {
+	return func(r *http.Request) (Caller, error) {
 		brandID, ok := brand.ForHostOK(r.Host)
 		if !ok {
-			return "", fmt.Errorf("host %q names no brand, so there is no tenant space to place an org in", r.Host)
+			return Caller{}, fmt.Errorf("host %q names no brand, so there is no tenant space to place an org in", r.Host)
 		}
 		org := r.Header.Get(name)
 		if strings.TrimSpace(org) == "" {
-			return "", fmt.Errorf("header %s is absent, so the caller named no tenant", name)
+			return Caller{}, fmt.Errorf("header %s is absent, so the caller named no tenant", name)
 		}
-		return qualify(brandID, org)
+		tenant, err := qualify(brandID, org)
+		if err != nil {
+			return Caller{}, err
+		}
+		who := Caller{Tenant: tenant}
+		if subject != "" {
+			who.Subject = strings.TrimSpace(r.Header.Get(subject))
+		}
+		return who, nil
 	}
 }
 
-// tenant returns the authenticated tenant for a request.
+// caller returns who a request is authenticated as.
 //
 // With no Identity configured it refuses. A compliance product that falls back to
 // trusting a client-supplied tenant header is worse than one that will not serve:
@@ -86,16 +116,23 @@ func TrustedProxyHeader(name string) Identity {
 // into the store index, the history column and the vault salt, and an unqualified
 // org reaching any of those is the cross-brand collision. An Identity that returns
 // a bare org authenticates nobody.
-func (h *Handler) tenant(e *core.RequestEvent) (string, error) {
+func (h *Handler) caller(e *core.RequestEvent) (Caller, error) {
 	if h.Identity == nil {
-		return "", ErrNoIdentity
+		return Caller{}, ErrNoIdentity
 	}
-	id, err := h.Identity(e.Request)
+	who, err := h.Identity(e.Request)
 	if err != nil {
-		return "", err
+		return Caller{}, err
 	}
-	if !qualified(id) {
-		return "", fmt.Errorf("identity resolved %q, which is not a <brand>%s<org> tenant", id, sep)
+	if !qualified(who.Tenant) {
+		return Caller{}, fmt.Errorf("identity resolved %q, which is not a <brand>%s<org> tenant", who.Tenant, sep)
 	}
-	return id, nil
+	return who, nil
+}
+
+// tenant is the caller's tenant, for the routes that need nothing else. It is a
+// projection of caller and not a second resolution of the credential.
+func (h *Handler) tenant(e *core.RequestEvent) (string, error) {
+	who, err := h.caller(e)
+	return who.Tenant, err
 }

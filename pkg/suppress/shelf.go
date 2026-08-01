@@ -62,14 +62,30 @@ var kind = store.Kind{
 // start.
 func Ensure(app core.App) error { return kind.Ensure(app) }
 
-// MaxCandidates bounds the rows one Cover reads.
+// MaxCandidates bounds the rows one Cover reads, and MaxInForce bounds how many
+// suppressions a tenant may have in force on one rule.
 //
-// The read is already narrowed to this tenant and to the rule named plus the
-// blanket ones, so reaching this bound means an institution has declared more
-// suppressions against one rule than anybody could review. It is reported rather
-// than silently truncated, because a truncated cover check answers "not
-// suppressed" for a detection that was.
-const MaxCandidates = 2000
+// The two are one mechanism seen from both ends, and the smaller one is the one
+// that matters. A cover check runs on the INGEST path, once per activation, and
+// ingest is the request that must not fail: a transaction that cannot be
+// processed is a payment that does not happen. So the bound is enforced where a
+// refusal costs a tenant an operator request — at declaration, against that
+// tenant's own suppressions on that rule, answered with ErrCrowded — and not
+// where a refusal costs it every payment.
+//
+// MaxInForce is well below MaxCandidates so that the read bound is unreachable by
+// declaring; it stays as a second line, and reaching it degrades (Cover.Partial)
+// rather than refusing. Degrading in this direction is safe in the way that
+// matters for a monitoring control: an unfound suppression produces an alert
+// nobody wanted, and an ingest failure produces silence. Noise is recoverable and
+// silence is not.
+//
+// Both are per tenant. One institution's suppressions are never read by another's
+// cover check and can never crowd it out.
+const (
+	MaxCandidates = 2000
+	MaxInForce    = 500
+)
 
 // Shelf is the durable suppression plane. There is no memory implementation: a
 // suppression that vanishes on a rollout turns a governed silence into a
@@ -78,6 +94,29 @@ type Shelf struct {
 	app core.App
 	// Now supplies the instant a window is judged against. Tests set it.
 	Now func() time.Time
+
+	// The two bounds, at zero meaning the constants above. They are UNEXPORTED
+	// and there is no constructor that sets them, so a deployment cannot lower
+	// MaxInForce into a control that refuses ordinary work, nor raise
+	// MaxCandidates into a read that costs the ingest path a scan. What they are
+	// for is the tests: proving the crowding behaviour needs thousands of rows at
+	// the real numbers, and a bound whose behaviour is untested is a bound
+	// nobody has seen work.
+	candidates, inForceMax int
+}
+
+func (s *Shelf) maxCandidates() int {
+	if s.candidates > 0 {
+		return s.candidates
+	}
+	return MaxCandidates
+}
+
+func (s *Shelf) maxInForce() int {
+	if s.inForceMax > 0 {
+		return s.inForceMax
+	}
+	return MaxInForce
 }
 
 // NewBase returns the durable shelf. Ensure has to have run first.
@@ -99,7 +138,7 @@ func (s *Shelf) Suppress(ctx context.Context, org string, in *SuppressIn) (*Supp
 	switch {
 	case strings.TrimSpace(in.Reason) == "":
 		return nil, ErrReason
-	case strings.TrimSpace(in.By) == "":
+	case in.By.Trim() == "":
 		return nil, ErrDecider
 	case rule == "" && value == "":
 		return nil, ErrBroad
@@ -113,7 +152,7 @@ func (s *Shelf) Suppress(ctx context.Context, org string, in *SuppressIn) (*Supp
 	sup := Suppression{
 		ID: uuid.NewString(), Org: org,
 		Rule: rule, Kind: kindName, Value: value,
-		Reason: strings.TrimSpace(in.Reason), By: strings.TrimSpace(in.By),
+		Reason: strings.TrimSpace(in.Reason), By: in.By.Trim(),
 		From: in.From.UTC(), Until: in.Until.UTC(),
 	}
 	if sup.From.IsZero() {
@@ -124,6 +163,17 @@ func (s *Shelf) Suppress(ctx context.Context, org string, in *SuppressIn) (*Supp
 	}
 	if !sup.Until.IsZero() && !sup.Until.After(at) {
 		return nil, fmt.Errorf("%w: until %s has passed", ErrWindow, sup.Until)
+	}
+
+	// The crowding bound, checked here because here is where a refusal costs one
+	// operator request. The same crowding met on the ingest path costs a payment.
+	inForce, err := s.inForce(org, rule, at)
+	if err != nil {
+		return nil, err
+	}
+	if inForce >= s.maxInForce() {
+		return nil, fmt.Errorf("%w: %d in force on %s, at most %d; lift one before declaring another",
+			ErrCrowded, inForce, ruleName(rule), s.maxInForce())
 	}
 
 	row, err := kind.New(s.app, org)
@@ -138,6 +188,33 @@ func (s *Shelf) Suppress(ctx context.Context, org string, in *SuppressIn) (*Supp
 	return &sup, nil
 }
 
+// inForce counts this tenant's suppressions that would be candidates for a cover
+// check of this rule — the ones naming it, plus the blanket ones — and that are
+// in force now. Lifted and expired rows are not candidates and are not counted:
+// the ledger keeps them forever and a bound over the ledger would eventually
+// refuse an institution for its own history.
+func (s *Shelf) inForce(org, rule string, at time.Time) (int, error) {
+	rows, err := kind.Find(s.app, org, fieldRule+" = {:rule} || "+fieldRule+" = ''", "", s.maxCandidates()+1,
+		dbx.Params{"rule": rule})
+	if err != nil {
+		return 0, fmt.Errorf("%w: %w", ErrStore, err)
+	}
+	n := 0
+	for _, row := range rows {
+		if read(row).InForce(at) {
+			n++
+		}
+	}
+	return n, nil
+}
+
+func ruleName(rule string) string {
+	if rule == "" {
+		return "every rule"
+	}
+	return "rule " + rule
+}
+
 // Lift ends a suppression. The row stays and records who ended it and why.
 func (s *Shelf) Lift(ctx context.Context, org string, in *LiftIn) (*Suppression, error) {
 	if err := brand.Tenant(org); err != nil {
@@ -146,7 +223,7 @@ func (s *Shelf) Lift(ctx context.Context, org string, in *LiftIn) (*Suppression,
 	if strings.TrimSpace(in.Reason) == "" {
 		return nil, ErrReason
 	}
-	if strings.TrimSpace(in.By) == "" {
+	if in.By.Trim() == "" {
 		return nil, ErrDecider
 	}
 	// Scoped by the tenant, so naming another institution's suppression id reads
@@ -163,7 +240,7 @@ func (s *Shelf) Lift(ctx context.Context, org string, in *LiftIn) (*Suppression,
 		return nil, fmt.Errorf("%w: %s", ErrLifted, sup.ID)
 	}
 	sup.Lifted = s.now()
-	sup.LiftedBy = strings.TrimSpace(in.By)
+	sup.LiftedBy = in.By.Trim()
 	sup.LiftWhy = strings.TrimSpace(in.Reason)
 	write(rows[0], sup)
 	if err := s.app.Save(rows[0]); err != nil {
@@ -210,6 +287,21 @@ func (s *Shelf) Ledger(ctx context.Context, org string, in *LedgerIn) (*Ledger, 
 // The narrowest wins. A tenant that has suppressed a whole rule and then made a
 // specific decision about one account should see the specific one named on the
 // activation, because that is the decision a reviewer will be asked about.
+//
+// # It degrades and never refuses
+//
+// This runs on the ingest path, once per activation, and its caller cannot
+// process a transaction it cannot record. An error here would therefore be a
+// tenant-triggerable outage of its OWN payments — declare enough suppressions on
+// one rule and every transaction that fires it stops — and the retry of a failed
+// ingest is what turns one incomplete read into a double-counted one.
+//
+// So a read that hits its bound answers from what it read and says so
+// (Cover.Partial). The failure that produces is an alert that a suppression
+// beyond the page would have silenced: noise, which a reviewer dismisses, rather
+// than silence, which nobody sees. Declaring past the bound is refused at
+// [Shelf.Suppress] where a refusal costs one request, so a tenant that reaches
+// this state has to have been let there.
 func (s *Shelf) Cover(ctx context.Context, org string, in *CoverIn) (*Cover, error) {
 	if err := brand.Tenant(org); err != nil {
 		return nil, err
@@ -222,14 +314,14 @@ func (s *Shelf) Cover(ctx context.Context, org string, in *CoverIn) (*Cover, err
 
 	// The candidates are this tenant's suppressions naming this rule, plus the
 	// blanket ones. Both halves are bound parameters; neither is interpolated.
-	rows, err := kind.Find(s.app, org, fieldRule+" = {:rule} || "+fieldRule+" = ''", "", MaxCandidates+1,
+	rows, err := kind.Find(s.app, org, fieldRule+" = {:rule} || "+fieldRule+" = ''", "", s.maxCandidates()+1,
 		dbx.Params{"rule": rule})
 	if err != nil {
 		return nil, fmt.Errorf("%w: %w", ErrStore, err)
 	}
-	if len(rows) > MaxCandidates {
-		return nil, fmt.Errorf("%w: more than %d suppressions bear on rule %q, so a cover check cannot be answered completely",
-			ErrStore, MaxCandidates, rule)
+	out := &Cover{}
+	if len(rows) > s.maxCandidates() {
+		rows, out.Partial = rows[:s.maxCandidates()], true
 	}
 
 	var best *Suppression
@@ -244,9 +336,10 @@ func (s *Shelf) Cover(ctx context.Context, org string, in *CoverIn) (*Cover, err
 		}
 	}
 	if best == nil {
-		return &Cover{}, nil
+		return out, nil
 	}
-	return &Cover{Covered: true, Suppression: best}, nil
+	out.Covered, out.Suppression = true, best
+	return out, nil
 }
 
 // better breaks the tie between two covering suppressions: the narrower one, then

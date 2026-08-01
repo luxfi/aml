@@ -55,7 +55,7 @@ func plane(t *testing.T, rules ...types.Rule) *Handler {
 		}}
 	}
 	return &Handler{
-		Identity: func(*http.Request) (string, error) { return acme, nil },
+		Identity: func(*http.Request) (Caller, error) { return Caller{Tenant: acme, Subject: "u-analyst"}, nil },
 		Engine:   testEngine(rules),
 		Rate:     reference.Rates{},
 		Cases:    cases.NewStore(),

@@ -40,6 +40,7 @@ import (
 	"time"
 
 	"github.com/luxfi/aml/pkg/topology"
+	"github.com/luxfi/aml/pkg/types"
 )
 
 // Errors.
@@ -92,10 +93,15 @@ type Run struct {
 // what identifies the shape, and Adoptable says whether the live model is running
 // that shape today.
 type Fit struct {
-	ID       string            `json:"id"`
-	Org      string            `json:"org"`
-	At       time.Time         `json:"at"`
-	By       string            `json:"by"`
+	ID  string    `json:"id"`
+	Org string    `json:"org"`
+	At  time.Time `json:"at"`
+	By  string    `json:"by"`
+	// Elapsed is what this fit cost the machine. It is on the record for the same
+	// reason a run's is: the model plane is the expensive one, and a tenant's
+	// spend on it has to be answerable from what was kept rather than from a
+	// counter somewhere that a restart resets.
+	Elapsed  time.Duration     `json:"elapsed"`
 	Topology topology.Topology `json:"topology"`
 	Digest   string            `json:"digest"`
 	Trial    topology.Trial    `json:"trial"`
@@ -108,12 +114,19 @@ type Fit struct {
 }
 
 // The typed operations.
+//
+// By is the decider on each of the three that record a decision, and it is a
+// [types.Decider]: it carries `json:"-"`, so it is not a field of the wire
+// contract at all, and the transport writes the authenticated subject onto it
+// (pkg/api/typed.go). A search, a fit and an adoption are each a governed act,
+// and the record of one has to name the identity that took it rather than the
+// text a request body offered.
 type (
 	// SearchIn runs a search over this tenant's own history.
 	SearchIn struct {
 		Space   topology.Space   `json:"space"`
 		Options topology.Options `json:"options,omitempty"`
-		By      string           `json:"by"`
+		By      types.Decider    `json:"-"`
 	}
 
 	// RefIn names one run or one fit.
@@ -136,7 +149,7 @@ type (
 	FitIn struct {
 		Topology topology.Topology `json:"topology"`
 		Options  topology.Options  `json:"options,omitempty"`
-		By       string            `json:"by"`
+		By       types.Decider     `json:"-"`
 	}
 
 	// FitsIn lists this tenant's fits, most recent first.
@@ -152,9 +165,9 @@ type (
 
 	// AdoptIn installs a fit into the live model.
 	AdoptIn struct {
-		ID     string `json:"id"`
-		Reason string `json:"reason"`
-		By     string `json:"by"`
+		ID     string        `json:"id"`
+		Reason string        `json:"reason"`
+		By     types.Decider `json:"-"`
 	}
 )
 
