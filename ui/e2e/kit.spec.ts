@@ -156,14 +156,31 @@ test.describe('the kit reaches the screens', () => {
     // variable substituted in a scope that does not hold it, both land outside
     // them. It reads the resolved family off elements the kit owns and elements
     // it does not, because the two are dressed on opposite sides of the seam.
-    const families = await page
+    //
+    // The stacks are read from the document rather than written out here: they
+    // are @hanzo/gui's, and a copy of them in a test is one more place to drift
+    // from the kit. That the console is set in GEIST, and that the faces
+    // actually arrive and are what the renderer used, is e2e/font.spec.ts.
+    const { families, sans, mono } = await page
       .locator('body, nav.rail, h1, h2, button, input, select, td, .grid .id, code')
-      .evaluateAll((els) =>
-        [...new Set(els.map((el) => getComputedStyle(el).fontFamily))].sort(),
-      )
+      .evaluateAll((els) => {
+        const root = getComputedStyle(document.documentElement)
+        return {
+          families: [...new Set(els.map((el) => getComputedStyle(el).fontFamily))].sort(),
+          sans: root.getPropertyValue('--hz-font-sans').trim(),
+          mono: root.getPropertyValue('--hz-font-mono').trim(),
+        }
+      })
 
     expect(families.length, 'nothing was measured').toBeGreaterThan(0)
-    const stray = families.filter((f) => !/^ui-sans-serif,|^ui-monospace,/.test(f))
+    expect(sans, 'the console declares no sans stack').not.toBe('')
+    expect(mono, 'the console declares no mono stack').not.toBe('')
+
+    // Compared on the leading family, because the kit and the stylesheet quote
+    // and space a stack differently while meaning the same list.
+    const first = (f: string) => (f.split(',')[0] ?? '').trim().replace(/^["']|["']$/g, '')
+    const wanted = new Set([first(sans), first(mono)])
+    const stray = families.filter((f) => !wanted.has(first(f)))
     expect(stray, `type is set in ${stray.join(' / ')}`).toEqual([])
   })
 

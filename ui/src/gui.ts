@@ -26,23 +26,34 @@
 
 import { getDefaultGuiConfig } from '@hanzogui/config-default'
 import { createGui } from '@hanzogui/core'
+import { createGeistMonoFont } from '@hanzogui/font-geist-mono'
+import { createGeistSansFont } from '@hanzogui/font-geist-sans'
+
+import { origin, sheet } from './font'
 
 /**
- * The typeface, spelled the way the web spells it.
+ * The typeface, taken from the kit rather than spelled again here.
+ *
+ * Geist Sans is the UI face and Geist Mono the monospace one across every Hanzo
+ * property, so the STACK — Geist first, then what to try when it has not
+ * arrived — is @hanzo/gui's to state and this console's to read. A stack copied
+ * into an app is a second source of truth: it does not fail when the kit's
+ * changes, it just quietly stops matching the other hundred properties.
  *
  * The kit's default config names its families `System` and `Heading`. Those are
  * React Native family names: on that platform the OS resolves them, and on this
  * one nothing does. The kit emits the name verbatim as `--f-family`, every
  * component reads `font-family: var(--f-family)`, and a family no browser knows
- * falls back to the default serif — so the whole console rendered in Times New
- * Roman while the build, the typecheck, the CSP run and the render tests all
- * passed. One stack, given to both roles, is what `System` was asking for.
+ * falls back to the default serif — which is how the whole console came to
+ * render in Times New Roman while the build, the typecheck, the CSP run and the
+ * render tests all passed.
  *
- * It is the same list as `--hz-font-sans` in app.css, which dresses the plain
- * elements the kit does not own; the two are the console's one typeface stated
- * on each side of the seam.
+ * `mono` is a third role rather than a spare: src/ui.tsx asks the kit for
+ * `$mono` on the one control whose content is machine text, and a font token
+ * the config does not define resolves to nothing at all.
  */
-const sans = 'ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif'
+const sans = createGeistSansFont().family
+const mono = createGeistMonoFont().family
 
 const base = getDefaultGuiConfig('web')
 
@@ -51,6 +62,7 @@ export const config = createGui({
   fonts: {
     body: { ...base.fonts.body, family: sans },
     heading: { ...base.fonts.heading, family: sans },
+    mono: { ...base.fonts.body, family: mono },
   },
 })
 export default config
@@ -70,21 +82,48 @@ declare module '@hanzogui/core' {
 }
 
 /**
- * Put the kit's stylesheet on the document without writing markup.
+ * The typeface, said once, to both sides of the seam.
  *
- * Called once, before the first render, so the first paint is styled. It
- * reports whether the stylesheet went on: a browser with no constructable
- * stylesheets renders unstyled, which is safe and obvious, rather than falling
- * back to a <style> element the policy would refuse anyway.
+ * The kit dresses its own components from the config above. Everything the kit
+ * does not own — body, tables, ids, code — reads `--hz-font-sans` and
+ * `--hz-font-mono` from app.css. Both stacks come from the same two constants,
+ * so there is one answer to "what is this console set in" and no way for the
+ * two halves of the screen to disagree.
+ *
+ * At `:root`, which beats the floor app.css declares on `html` on specificity
+ * rather than on source order — so it does not matter where in the cascade an
+ * adopted stylesheet lands.
+ */
+const typeface = `:root{--hz-font-sans:${sans};--hz-font-mono:${mono}}`
+
+/**
+ * Put the console's stylesheets on the document without writing markup.
+ *
+ * Called once, before the first render, so the first paint is styled and the
+ * faces are already being fetched. It reports whether they went on: a browser
+ * with no constructable stylesheets renders unstyled, which is safe and
+ * obvious, rather than falling back to a <style> element the policy would
+ * refuse anyway.
+ *
+ * Two sheets, because they answer to different owners: the faces and the two
+ * stacks are this console's, and the rest is whatever the kit's config
+ * generates. @font-face in a constructed stylesheet installs a real face — the
+ * rules are adopted on the Document, not on a shadow root, which is the case
+ * that never worked — and e2e/font.spec.ts proves the face actually loads
+ * rather than that the rule was merely written.
  *
  * The kit publishes a theme as `:root .t_dark` — a descendant selector — so a
  * theme is always a subtree and never reaches :root. app.css bridges the theme
- * to its own names on the app's roots for that reason; see the note there.
+ * to its own names on the app's roots for that reason; see the note there. A
+ * typeface is not a theme, which is why it is at :root here and not in that
+ * bridge.
  */
 export function adoptStyles(doc: Document = document): boolean {
   if (typeof CSSStyleSheet === 'undefined' || !('adoptedStyleSheets' in doc)) return false
-  const sheet = new CSSStyleSheet()
-  sheet.replaceSync(config.getCSS())
-  doc.adoptedStyleSheets = [...doc.adoptedStyleSheets, sheet]
+  const type = new CSSStyleSheet()
+  type.replaceSync(sheet(origin(), [sans, mono]) + typeface)
+  const kit = new CSSStyleSheet()
+  kit.replaceSync(config.getCSS())
+  doc.adoptedStyleSheets = [...doc.adoptedStyleSheets, type, kit]
   return true
 }
