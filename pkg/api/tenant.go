@@ -31,60 +31,20 @@ type Identity func(*http.Request) (tenant string, err error)
 var ErrNoIdentity = errors.New("no identity configured, so no request can be attributed to a tenant")
 
 // sep divides a tenant key's two halves.
-const sep = "/"
+const sep = brand.Sep
 
-// qualify builds a tenant key from the brand whose issuer vouched for the caller
-// and the org that caller acts for.
-//
-// It is one string because it is one key. The same value is the store index for
-// alerts, cases and retained records, the org column on a history row, and the
-// HKDF salt every tokenisation key is derived from (pkg/token New: salt =
-// "aml/token/org/" + org). An org name is unique within an issuer and not across
-// issuers, so the bare org is not an identity: `acme` on lux.id and `acme` on
-// zoolabs.id are two unrelated financial institutions. Keyed on the bare org they
-// are one — one set of rows, and worse, one vault: the same salt derives the same
-// keys, so one brand's customer names tokenise to the other's pseudonyms and its
-// sealed records open under the other's tenant. That is a cross-brand plaintext
-// disclosure of retained personal data, against the purpose limitation retention
-// is held to (Directive (EU) 2015/849 Art. 41(2)) and against HIP-0302, which is
-// the requirement that the determinism stops at the tenant boundary.
-//
-// Qualifying at the key, rather than filtering on the brand afterwards, is what
-// makes that leak uncomputable instead of merely disallowed: there is no query
-// that returns the other brand's rows and no key that opens its vault. It is done
-// here, before any record exists, because doing it later re-keys every vault —
-// pseudonyms and sealed bodies both.
-func qualify(brandID, org string) (string, error) {
-	b, ok := brand.For(brandID)
-	if !ok {
-		return "", fmt.Errorf("no brand is registered as %q, so nothing vouches for this tenant", brandID)
-	}
-	org = strings.TrimSpace(org)
-	if org == "" {
-		return "", errors.New("no org, so the request acts for no tenant")
-	}
-	// Brand ids are a closed set and none contains the separator, so the first one
-	// always ends the brand and the key is unambiguous either way. The org half is
-	// held to it so the key stays readable back to the org it names: an operator
-	// reading a retention row or a vault refusal has to be able to say which
-	// institution it belongs to, and `zoo/lux/acme` does not say.
-	if strings.Contains(org, sep) {
-		return "", fmt.Errorf("org %q contains %q, so the tenant it names is not readable back", org, sep)
-	}
-	return b.ID + sep + org, nil
-}
-
-// qualified reports whether a key is one qualify would have produced. Derived from
-// qualify rather than stated again, so there is one definition of the shape and a
-// change to it cannot leave a validator behind.
-func qualified(key string) bool {
-	brandID, org, found := strings.Cut(key, sep)
-	if !found {
-		return false
-	}
-	again, err := qualify(brandID, org)
-	return err == nil && again == key
-}
+// qualify and qualified are the tenant key, and they live in pkg/brand because
+// the key is a brand fact: an org is only an identity once the brand whose issuer
+// vouched for it is named. They are aliases rather than a second implementation
+// so that the record planes below this package — lists, suppressions,
+// activations, field statistics, model runs — hold the same shape at their own
+// write boundary without any of them getting a private opinion about what a
+// tenant is. See brand.Qualify for why the key is one string and what a bare org
+// collides.
+var (
+	qualify   = brand.Qualify
+	qualified = brand.Qualified
+)
 
 // TrustedProxyHeader resolves the tenant's org from a header written by an
 // authenticating proxy, and its brand from the request's own Host.

@@ -66,6 +66,12 @@ type Handler struct {
 	// Anomaly scores whether a transaction is unusual for the entity, alongside
 	// the rules rather than instead of them. Nil runs on rules alone.
 	Anomaly *anomaly.Store
+	// Planes are the five record planes served alongside the engine: lists,
+	// suppressions, activations, the field catalog and the model plane. Each is
+	// optional and an absent one serves no route, because an empty answer from a
+	// plane nobody wired reads as an institution with no controls.
+	Planes Planes
+
 	// ClientID is this deployment's IAM application — the audience every token
 	// is pinned to. It is served by /v1/aml/config so the console reads its own
 	// identity from the engine that enforces it.
@@ -216,6 +222,7 @@ func (h *Handler) Register(se *core.ServeEvent) {
 	se.Router.GET("/v1/aml/catalog", h.catalog())
 	se.Router.GET("/v1/aml/config", h.brandConfig())
 	se.Router.GET("/v1/aml/health", h.health())
+	h.registerPlanes(se)
 }
 
 // refuse answers an unauthenticated request. The reason is logged for the
@@ -409,6 +416,17 @@ func (h *Handler) ingestTransaction() func(e *core.RequestEvent) error {
 			alertIDs[i] = a.ID
 		}
 		h.Alerts.Add(tx.ID, alerts)
+
+		// The monitoring plane records what fired and decides what the response
+		// is: a suppression the institution declared lowers it, a rung the
+		// institution declared raises it, and every activation is written either
+		// way. It runs after the record is retained and after the alerts are
+		// stored, so the activation cannot outlive the evidence it names.
+		action, err = h.monitor(e.Request.Context(), orgID, tx, alerts, action)
+		if err != nil {
+			return unavailable(e, "record activations", err)
+		}
+		h.observe(orgID, tx)
 
 		result := struct {
 			types.EvalResult
