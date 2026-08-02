@@ -146,12 +146,11 @@ func main() {
 				Zone:          zone,
 				Rate:          reference.RatesFromEnv(),
 				Jurisdictions: reference.JurisdictionsFromEnv(),
-				// Shadow until someone has read what the model would have done.
-				// Detection has to be testable before it is activated, so a new
-				// deployment scores, learns and publishes at GET /v1/aml/anomaly what
-				// it WOULD have alerted on, contributing nothing to any transaction's
-				// outcome until AML_ANOMALY=live. The rules are unaffected.
-				Shadow: os.Getenv("AML_ANOMALY") != "live",
+				// The behavioural model contributes to a verdict only once somebody
+				// has read what it would have done. The rules are unaffected either
+				// way. See api.Deployment.Live, which is stated from the live side so
+				// that the zero value is shadow.
+				Live: os.Getenv("AML_ANOMALY") == "live",
 			})
 			if err != nil {
 				return fmt.Errorf("refusing to start: %w", err)

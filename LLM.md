@@ -810,7 +810,7 @@ processed.
 | `AML_TOKEN_KEY` | KMS-held tokenisation root, hex, ≥32 bytes. No default |
 | `AML_DEFAULT_ORG` | Label carried by the rule catalog. The catalog is the deployment's, not a tenant's |
 | `AML_BUSINESS_ZONE` | Zone business-day and business-hour rules are answered in. Default UTC |
-| `AML_ANOMALY` | `live` leaves shadow mode. Anything else scores without contributing |
+| `AML_ANOMALY` | `live` leaves shadow mode. Anything else scores without contributing. The assembly states it from the LIVE side (`api.Deployment.Live`) so the zero value is shadow — a default that armed the statistical plane for anyone who did not think about it is the one direction a default must not fail in |
 
 The five planes take no configuration. A list, a suppression and a rung are all
 tenant DECLARATIONS carrying a reason and a decider, so none of them is a switch an
