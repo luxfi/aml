@@ -594,7 +594,7 @@ func TestAVocabularyIsBoundedPerTenant(t *testing.T) {
 	// BEFORE the flush, because the accumulator is the half that matters: it is
 	// in memory, in the process every institution's ingest runs in, and a bound
 	// applied only when the rows are written would let it grow between flushes.
-	held := s.pending[acme]
+	held, _ := s.pending.Get(acme)
 	if held == nil || held.names != 4 {
 		t.Fatalf("the accumulator holds %v custom names against a bound of 4", held)
 	}

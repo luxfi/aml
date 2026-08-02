@@ -120,5 +120,6 @@ func TestTheAdoptedReloadIsAskedOncePerTenant(t *testing.T) {
 // TestNoTenantMapIsEvictedFrom reads this package's own source. See the same
 // test in pkg/velocity, and pkg/roster.
 func TestNoTenantMapIsEvictedFrom(t *testing.T) {
-	source.NoMapByTenant(t, "anomaly.go", "Store")
+	source.NoTable(t, "anomaly.go", "Store",
+		"One map of every tenant's state under one cap is how one institution's traffic evicts another's; per-tenant state goes in roster.Roster, which cannot remove.")
 }

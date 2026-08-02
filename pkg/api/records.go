@@ -14,6 +14,7 @@ import (
 	"github.com/luxfi/aml/pkg/replay"
 	"github.com/luxfi/aml/pkg/retention"
 	"github.com/luxfi/aml/pkg/token"
+	"github.com/luxfi/aml/pkg/topology"
 	"github.com/luxfi/aml/pkg/types"
 )
 
@@ -27,8 +28,16 @@ var (
 	// errNoRecords is the refusal that keeps the engine from processing a
 	// transaction it cannot record.
 	errNoRecords = errors.New("record plane is not available")
-	errNoParty   = errors.New("record names no party")
-	errFull      = errors.New("history is full")
+	// errNoReceipts is the same refusal for the plane that recognises a retry.
+	// Without it an offer's identity cannot be resolved, so a retry of it would
+	// be counted by every aggregate as a second transaction.
+	errNoReceipts = errors.New("receipt plane is not available")
+	// errUnpaid is a whole-history read attempted without a hold on the machine.
+	// It is a programming error and never a caller's, which is why it is a plain
+	// refusal and not an HTTP status of its own.
+	errUnpaid  = errors.New("a history read must hold the machine's budget first")
+	errNoParty = errors.New("record names no party")
+	errFull    = errors.New("history is full")
 )
 
 // maxHistory bounds a replay. The ledger holds five years of records, and a
@@ -186,7 +195,19 @@ func refusalReason(alerts []types.Alert) string {
 // and not a commercial read (AMLD4 Art. 41(2)). A body that does not open is an
 // error and not a skipped event: a replay over a silently shortened history is
 // the same lie as a replay over an empty one.
-func (h *Handler) history(orgID string, v *token.Vault) (replay.Slice, error) {
+//
+// held is the caller's hold on the machine, and it is REQUIRED. This is the one
+// function in the engine that materialises a tenant's whole retained history —
+// up to maxHistory records, every sealed body opened and unmarshalled, an
+// indexed alert query per event — so it is the one place where "has this work
+// been paid for" is a question with an answer. A *topology.Grant can only come
+// from topology.Budget.Admit, so demanding one here is what makes an ungated
+// history read something a caller has to go out of their way to write rather
+// than something they can forget. See errUnpaid.
+func (h *Handler) history(held *topology.Grant, orgID string, v *token.Vault) (replay.Slice, error) {
+	if held == nil {
+		return nil, errUnpaid
+	}
 	judged, err := h.dispositions(orgID)
 	if err != nil {
 		return nil, err

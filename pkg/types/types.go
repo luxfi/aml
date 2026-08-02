@@ -18,6 +18,8 @@ package types
 
 import (
 	"encoding/json"
+	"errors"
+	"fmt"
 	"strings"
 	"time"
 
@@ -405,3 +407,45 @@ func ActionRank(action string) int {
 		return 0
 	}
 }
+
+// MaxIdent bounds every identifier a transaction carries.
+//
+// It is the one bound at the door, and it is what turns every count downstream
+// into a figure in bytes. A sliding-aggregate key is a fixed ring plus this
+// string; a field catalog name is this string; a retained record's slot is this
+// string. Bounding how MANY of a thing is kept says nothing about memory unless
+// something bounds how big one is, and this is that something — see
+// velocity.Config, whose per-tenant ceiling is stated in bytes on the strength of
+// it.
+//
+// 256 bytes is longer than any synthetic handle a core banking system issues and
+// short enough that the products are answerable. It is deliberately not
+// per-field: one number, checked in one place, is a bound somebody can hold in
+// their head.
+const MaxIdent = 256
+
+// Bounded reports whether every identifier this transaction carries is inside
+// [MaxIdent].
+//
+// Refusing is right where truncating is not: an identifier this engine shortened
+// is an aggregate kept under a key that names a different account, and a
+// retained record whose reference no longer resolves in the system it came from.
+func (t Transaction) Bounded() error {
+	for name, value := range map[string]string{
+		"id": t.ID, "user_id": t.UserID, "account_id": t.AccountID,
+		"symbol": t.Symbol, "asset_class": t.AssetClass, "side": t.Side,
+		"currency": t.Currency, "counterparty": t.Counterparty,
+		"direction": t.Direction, "customer_name": t.CustomerName,
+		"customer_jurisdiction": t.CustomerJurisdiction,
+		"ip_address":            t.IPAddress, "device_fingerprint": t.DeviceFingerprint,
+		"source": t.Source,
+	} {
+		if len(value) > MaxIdent {
+			return fmt.Errorf("%w: %s is %d bytes, at most %d", ErrIdent, name, len(value), MaxIdent)
+		}
+	}
+	return nil
+}
+
+// ErrIdent is an identifier longer than this engine accepts.
+var ErrIdent = errors.New("types: identifier is longer than this engine accepts")

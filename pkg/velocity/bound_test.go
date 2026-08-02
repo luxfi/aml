@@ -186,5 +186,6 @@ func TestATenantTurnedAwayIsCountedNotHidden(t *testing.T) {
 // package-level map keyed by tenant ever reappears here, the shape it made
 // possible reappears with it.
 func TestNoTenantMapIsEvictedFrom(t *testing.T) {
-	source.NoMapByTenant(t, "velocity.go", "Store")
+	source.NoTable(t, "velocity.go", "Store",
+		"One map of every tenant's state under one cap is how one institution's traffic evicts another's; per-tenant state goes in roster.Roster, which cannot remove.")
 }

@@ -21,9 +21,15 @@ import (
 // study that would have taken every core is the study that stops the institution
 // taking payments.
 //
-// Tokens ARE trial workers. A study takes at least one before it reads a single
-// event and holds them until it is done, which bounds three things with one
-// mechanism:
+// Tokens ARE trial workers, and a study takes them through [Budget.Admit] before
+// it reads a single event — in the CALLER that does the reading, not in the
+// callee that computes on what was read. That distinction is the whole of the
+// memory property: the read is a tenant's whole retained history, opened and
+// unmarshalled record by record, and a token taken after it is a token that
+// bounded nothing. Eight tenants once held eight full histories at once against
+// a budget of one worker.
+//
+// One admission bounds three things:
 //
 //   - CPU: the trial goroutines running at once, across every tenant, never
 //     exceed the budget, so the remaining cores are ingest's.
@@ -62,6 +68,49 @@ func (b *Budget) Size() int {
 		return 0
 	}
 	return cap(b.tokens)
+}
+
+// Grant is a study's hold on the machine: the workers it got, and the one way
+// to give them back.
+//
+// It exists so that the hold can be taken by the caller that reads the history
+// and handed to the callee that computes on it. A nil Grant is unbounded, which
+// is for the pure tests in this package.
+type Grant struct {
+	workers int
+	release func()
+}
+
+// Workers is how wide the study may run. A nil Grant answers one, so a caller
+// with no budget still runs.
+func (g *Grant) Workers() int {
+	if g == nil || g.workers < 1 {
+		return 1
+	}
+	return g.workers
+}
+
+// Release gives the workers back. It is safe to call more than once and safe on
+// a nil Grant, so a defer and a panic cannot between them leak or double-return
+// a token.
+func (g *Grant) Release() {
+	if g == nil || g.release == nil {
+		return
+	}
+	g.release()
+}
+
+// Admit takes up to want workers for a study, waiting for the first.
+//
+// It is the ONE way to hold this budget, and it is called before the history is
+// read. The wait ends when the caller's context does, which is either the client
+// going away or the operation's own deadline.
+func (b *Budget) Admit(ctx context.Context, want int) (*Grant, error) {
+	held, release, err := b.take(ctx, want)
+	if err != nil {
+		return nil, err
+	}
+	return &Grant{workers: held, release: release}, nil
 }
 
 // take acquires up to want workers, waiting for the first and taking the rest

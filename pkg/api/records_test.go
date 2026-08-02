@@ -2,6 +2,7 @@ package api
 
 import (
 	"bytes"
+	"context"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -14,15 +15,13 @@ import (
 	"github.com/hanzoai/base/core"
 
 	"github.com/luxfi/aml/internal/instance"
-	"github.com/luxfi/aml/pkg/cases"
 	"github.com/luxfi/aml/pkg/engine"
-	"github.com/luxfi/aml/pkg/history"
 	"github.com/luxfi/aml/pkg/reference"
 	"github.com/luxfi/aml/pkg/replay"
 	"github.com/luxfi/aml/pkg/retention"
 	"github.com/luxfi/aml/pkg/token"
+	"github.com/luxfi/aml/pkg/topology"
 	"github.com/luxfi/aml/pkg/types"
-	"github.com/luxfi/aml/pkg/velocity"
 )
 
 // The record plane joins three packages that do not know about each other. These
@@ -48,29 +47,23 @@ func send(method, target string, body any) (*core.RequestEvent, *httptest.Respon
 	return e, rec
 }
 
-// shelves opens an instance with every collection the ingest path writes to.
+// shelves opens an instance the deployment's way.
 //
-// It is the shelf cmd/amld wires and not a memory stand-in, deliberately. A green
-// suite over a shelf production does not use proves nothing about production: the
-// record fingerprint was a struct field no column stored, so every retry of one
-// transaction conflicted permanently on the durable shelf while every test passed
-// on the memory one. There is one way to build a handler in these tests and it is
-// the deployment's way.
+// There is one assembly (api.Wire) and these tests use it, deliberately. A green
+// suite over an arrangement production does not have proves nothing about
+// production: the record fingerprint was a struct field no column stored, so
+// every retry of one transaction conflicted permanently on the durable shelf
+// while every test passed on a hand-built handler over a memory one. See
+// wire_test.go.
 func shelves(t *testing.T) core.App {
 	t.Helper()
 	app := instance.New(t)
 	t.Cleanup(app.Cleanup)
-	for _, ensure := range []func(core.App) error{
-		retention.Ensure, cases.Ensure, EnsureAlerts, history.Ensure,
-	} {
-		if err := ensure(app); err != nil {
-			t.Fatalf("ensure: %v", err)
-		}
-	}
 	return app
 }
 
-// planeOn is a handler with a working record plane and one rule, over one app.
+// planeOn is the deployment, over one app, with a rule set. It is separate from
+// plane so a restart test can open a second instance over the first one's bytes.
 func planeOn(t *testing.T, app core.App, rules ...types.Rule) *Handler {
 	t.Helper()
 	if len(rules) == 0 {
@@ -79,20 +72,16 @@ func planeOn(t *testing.T, app core.App, rules ...types.Rule) *Handler {
 			Severity: types.SeverityHigh, Weight: 0.3, Action: types.ActionReport, Enabled: true,
 		}}
 	}
-	return &Handler{
-		Identity: func(*http.Request) (Caller, error) { return Caller{Tenant: acme, Subject: "u-analyst"}, nil },
-		Engine:   testEngine(rules),
-		Rate:     reference.Rates{},
-		Cases:    cases.NewBase(app),
-		Alerts:   NewAlertStoreBase(app),
-		Records:  retention.NewBase(app),
-		History:  history.NewBase(app),
-		Velocity: velocity.New(velocity.Config{}),
-		Keys:     token.NewKeyring(func(string) ([]byte, error) { return root, nil }),
+	d := deployment()
+	d.Rules = rules
+	h, err := Wire(app, d)
+	if err != nil {
+		t.Fatalf("wire: %v", err)
 	}
+	return h
 }
 
-// plane is a handler with a working record plane and one rule.
+// plane is the deployment over a fresh app.
 func plane(t *testing.T, rules ...types.Rule) *Handler {
 	t.Helper()
 	return planeOn(t, shelves(t), rules...)
@@ -600,7 +589,7 @@ func TestSandboxRefusesAnEmptyHistory(t *testing.T) {
 // replay.Evaluator — if those two stop fitting, this file stops compiling.
 func TestSandboxReplaysTheEngineOverRetainedHistory(t *testing.T) {
 	h := plane(t)
-	var _ replay.Evaluator = h.Engine.Evaluator()
+	var _ replay.Evaluator = Compiled{E: h.Engine.Evaluator()}
 
 	for _, notional := range []float64{500, 15000, 9500} {
 		if rec := ingest(t, h, map[string]any{
@@ -793,7 +782,7 @@ func TestHistoryDoesNotSilentlySkipARecordItCannotOpen(t *testing.T) {
 		t.Fatalf("Retain: %v", err)
 	}
 
-	if _, err := h.history(acme, vault); !errors.Is(err, token.ErrSealed) {
+	if _, err := h.history(paid(), acme, vault); !errors.Is(err, token.ErrSealed) {
 		t.Fatalf("err = %v, want ErrSealed", err)
 	}
 
@@ -823,7 +812,7 @@ func TestHistoryStaysInsideTheOrg(t *testing.T) {
 		t.Fatalf("vault: %v", err)
 	}
 
-	got, err := h.history(acme, mine)
+	got, err := h.history(paid(), acme, mine)
 	if err != nil {
 		t.Fatalf("history: %v", err)
 	}
@@ -831,7 +820,7 @@ func TestHistoryStaysInsideTheOrg(t *testing.T) {
 		t.Fatalf("own history = %d events, want 1", len(got))
 	}
 
-	other, err := h.history("beta", theirs)
+	other, err := h.history(paid(), "beta", theirs)
 	if err != nil {
 		t.Fatalf("history: %v", err)
 	}
@@ -878,4 +867,15 @@ func testEngine(rules []types.Rule) *engine.Engine {
 		panic(err)
 	}
 	return eng
+}
+
+// paid is a hold on a budget wide enough for a test's read. The whole-history
+// read demands one, because it is the one read that is worth paying for — see
+// Handler.history and topology.Budget.
+func paid() *topology.Grant {
+	held, err := topology.NewBudget(1).Admit(context.Background(), 1)
+	if err != nil {
+		panic(err)
+	}
+	return held
 }
