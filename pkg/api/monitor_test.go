@@ -11,7 +11,6 @@ import (
 
 	"github.com/hanzoai/base/core"
 
-	"github.com/luxfi/aml/internal/instance"
 	"github.com/luxfi/aml/pkg/dictionary"
 	"github.com/luxfi/aml/pkg/engine"
 	"github.com/luxfi/aml/pkg/lists"
@@ -32,8 +31,7 @@ import (
 
 func monitored(t *testing.T) *Handler {
 	t.Helper()
-	app := instance.New(t)
-	t.Cleanup(app.Cleanup)
+	app := shelves(t)
 	for _, ensure := range []func(core.App) error{lists.Ensure, suppress.Ensure, watch.Ensure, dictionary.Ensure} {
 		if err := ensure(app); err != nil {
 			t.Fatalf("ensure: %v", err)
@@ -43,7 +41,7 @@ func monitored(t *testing.T) *Handler {
 	monitor := watch.NewBase(app)
 	monitor.Cover = silence
 
-	h := plane(t)
+	h := planeOn(t, app)
 	h.Planes = Planes{
 		Lists:      lists.NewBase(app),
 		Suppress:   silence,
