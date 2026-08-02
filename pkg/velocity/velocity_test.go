@@ -133,15 +133,19 @@ func TestKeysAndOrgsAreIsolated(t *testing.T) {
 
 // Cardinality must be bounded. Key values come from caller data, so an unbounded
 // map is a memory-exhaustion surface reachable by anyone who can submit a
-// transaction.
+// transaction. The bound is stated in BYTES and the key count is derived from
+// it — see Config and bound_test.go for why a count on its own was not one.
 func TestKeyCardinalityIsBounded(t *testing.T) {
-	s := New(Config{MaxKeys: 640}) // 10 per shard
+	s := New(Config{PerOrg: 640 * keyCost(StandardWindows())})
 	for i := 0; i < 20_000; i++ {
 		s.Record(Key{OrgID: "acme", Kind: "account", Value: fmt.Sprintf("A-%d", i)},
 			t0.Add(time.Duration(i)*time.Second), 10, 0)
 	}
-	if got := s.Keys(); got > 2_000 {
+	if got := s.Keys(); got > 640 {
 		t.Fatalf("20,000 distinct keys grew the store to %d entries — cardinality is unbounded", got)
+	}
+	if s.Bytes() > s.Ceiling() {
+		t.Fatalf("the store holds %d bytes against its published ceiling of %d", s.Bytes(), s.Ceiling())
 	}
 }
 

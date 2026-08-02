@@ -37,7 +37,11 @@ import (
 	"math"
 	"sort"
 	"sync"
+	"sync/atomic"
 	"time"
+	"unsafe"
+
+	"github.com/luxfi/aml/pkg/roster"
 )
 
 // Window is one sliding aggregate: a duration and the resolution it is kept at.
@@ -71,9 +75,31 @@ func StandardWindows() []Window {
 // threshold, so [9,000, 10,000) — a deliberate default, not a tuned one, and rules
 // may override per threshold.
 //
-// MaxKeys bounds cardinality. Key values derive from caller-supplied data, so an
-// unbounded map is a memory-exhaustion surface reachable by anyone who can submit
-// transactions. On overflow the least-recently-updated key is evicted.
+// # The bound is in bytes, and it is per tenant
+//
+// PerOrg is the most one institution's aggregates may occupy, in BYTES, and Orgs
+// is how many institutions this process keeps aggregates for. Their product is
+// the ceiling on the whole store, and it is a figure an operator can hold against
+// a pod's memory limit — which is the entire point, because the bound this
+// replaced could not be.
+//
+// It was a count: a hundred thousand keys. A key is not a pointer to something
+// the caller sent; it is one ring per window, allocated whole on the first
+// transaction, and the four standard windows come to 444 buckets — a MEASURED
+// 22.7 KB. So the published bound implied 2,163 MiB of process memory against a
+// 1 GiB limit, which means the honest reading of "MaxKeys = 100,000" was "this
+// process dies at about 46,000 keys". A bound over a count of caller-sized
+// things is not a bound; see [keyCost], which derives the count from the bytes
+// so that the two can never disagree again.
+//
+// It was also shared. One map held every tenant's keys under one cap, so the
+// cap was spent out of a pool and a busy institution's traffic evicted a quiet
+// one's aggregates — silently, and an aggregate that reads zero is what an
+// account with no activity also reads. Now each tenant has its own keyspace with
+// its own byte bound: a tenant may only ever drop its OWN least recently used
+// key, the drop is counted and graded ([Store.Load]), and a tenant arriving when
+// the roster is full is refused and counted rather than admitted at another
+// institution's expense (see pkg/roster).
 //
 // MaxLateness is how far behind the ring's leading edge a transaction may arrive
 // and still be counted. Real feeds deliver out of order; a batch file can be hours
@@ -84,9 +110,29 @@ func StandardWindows() []Window {
 type Config struct {
 	Windows           []Window
 	NearThresholdBand float64
-	MaxKeys           int
-	MaxLateness       time.Duration
+	// PerOrg is one tenant's ceiling, in bytes.
+	PerOrg int64
+	// Orgs is how many tenants this process holds aggregates for.
+	Orgs        int
+	MaxLateness time.Duration
 }
+
+// The defaults, and the arithmetic behind them.
+//
+// DefaultPerOrg times [roster.Default] is the ceiling on the process. At the
+// standard windows that is 32 MiB per institution — about 1,400 live keys — and
+// 1 GiB across thirty-two of them, which is more than a single-replica pod has.
+// A deployment of this engine serves ONE financial institution, so the tenant
+// count in practice is one or a small handful and the real ceiling is the
+// per-tenant figure; a deployment that genuinely holds many raises one of the
+// two and states the product.
+//
+// An institution whose live key count exceeds its bound drops its own least
+// recently used keys, which is a real loss of a real aggregate. That is why it
+// is graded and counted rather than absorbed: the answer is to raise PerOrg
+// against a bigger pod, and an operator can only know to do that if the store
+// says so.
+const DefaultPerOrg = 32 << 20
 
 func (c Config) withDefaults() Config {
 	if len(c.Windows) == 0 {
@@ -95,8 +141,8 @@ func (c Config) withDefaults() Config {
 	if c.NearThresholdBand <= 0 || c.NearThresholdBand >= 1 {
 		c.NearThresholdBand = 0.10
 	}
-	if c.MaxKeys <= 0 {
-		c.MaxKeys = 100_000
+	if c.PerOrg <= 0 {
+		c.PerOrg = DefaultPerOrg
 	}
 	if c.MaxLateness <= 0 {
 		c.MaxLateness = time.Hour
@@ -235,49 +281,137 @@ type Key struct {
 
 func (k Key) id() string { return k.OrgID + "\x00" + k.Kind + "\x00" + k.Value }
 
+// entry is one key's rings, and its place in its tenant's recency order.
 type entry struct {
+	id      string
 	rings   []*ring
 	updated time.Time
+	// older and newer thread every key of ONE tenant into a recency list, so the
+	// key a tenant drops when it reaches its own bound is found in constant time
+	// rather than by scanning the tenant's whole keyspace on every arrival.
+	older, newer *entry
 }
 
-// Store holds live aggregates for many keys across many windows.
+// keyCost is the memory one key occupies, in bytes.
 //
-// Safe for concurrent use. Locking is sharded by key so unrelated entities do not
-// serialise against each other — with one lock, throughput would be bounded by the
-// single busiest key in the tenant.
+// Almost all of it is buckets: one ring per window, each allocated whole on the
+// key's first transaction, and everything else about a key is a fixed handful of
+// words. It is DERIVED from the windows rather than written down, because the
+// windows are the thing an operator tunes and a hand-written cost goes stale the
+// first time a resolution moves.
+//
+// The allowance covers what the arithmetic cannot see: the allocator rounds each
+// ring up to a size class, the map keeps its own bookkeeping, and the key string
+// is as long as the identifiers the institution uses. It is deliberately generous,
+// because a ceiling derived from a cost that UNDER-states the real one is a number
+// an operator would size a pod from and be wrong. TestTheCeilingIsInBytesAndItIsHonest
+// weighs a full store against it.
+func keyCost(ws []Window) int64 {
+	var buckets int64
+	for _, w := range ws {
+		buckets += int64(w.Buckets)
+	}
+	return buckets*int64(unsafe.Sizeof(bucket{})) + perKeyOverhead
+}
+
+// perKeyOverhead is the allowance above the buckets themselves. Measured at
+// about 1.4 KB for the standard windows; carried at 2 KB so the ceiling stays an
+// upper bound as identifiers and Go's size classes vary.
+const perKeyOverhead = 2048
+
+// Grade is how close a tenant is to its own bound, in words rather than in a
+// ratio a reader has to interpret.
+//
+// It exists because the alternative to saying this out loud is a control that
+// switches itself off quietly. A tenant at [GradeFull] is dropping aggregates it
+// would otherwise have used to find structuring, and "no findings" is what a
+// clean institution looks like too.
+type Grade string
+
+const (
+	// GradeClear is a tenant comfortably inside its bound.
+	GradeClear Grade = "clear"
+	// GradeCrowded is a tenant near it: nothing is lost yet and the next
+	// arrivals will start costing it keys.
+	GradeCrowded Grade = "crowded"
+	// GradeFull is a tenant at it, dropping its own least recently used keys.
+	GradeFull Grade = "full"
+)
+
+// crowded is the share of a tenant's bound above which it is reported crowded.
+const crowded = 0.9
+
+// Load is what one tenant is holding, and what it has lost.
+type Load struct {
+	Org  string `json:"org"`
+	Keys int    `json:"keys"`
+	// Bytes and Ceiling are this tenant's own, never the process's.
+	Bytes   int64 `json:"bytes"`
+	Ceiling int64 `json:"ceiling"`
+	// Room is how many keys the ceiling allows.
+	Room int `json:"room"`
+	// Dropped counts the keys this tenant has lost to its OWN bound. It is never
+	// another tenant's doing: no operation in this package can reach across.
+	Dropped int64 `json:"dropped"`
+	Grade   Grade `json:"grade"`
+}
+
+// Pressure is what the process is holding, for the operator.
+//
+// It carries no tenant's name and no tenant's numbers: a caller entitled to its
+// own Load is not entitled to know which other institutions this engine serves.
+type Pressure struct {
+	Orgs    int   `json:"orgs"`
+	Room    int   `json:"room"`
+	Refused int64 `json:"refused"`
+	Held    int64 `json:"held"`
+	Ceiling int64 `json:"ceiling"`
+	Late    int64 `json:"late"`
+}
+
+// keyspace is ONE tenant's keys, its own bound, and its own recency order.
+//
+// One lock per tenant, so no institution ever waits on another's traffic. Within
+// a tenant the aggregates are written on the same path as the durable row for
+// the same transaction, which is a single writer already, so a second level of
+// striping here would buy nothing and cost a map per shard per tenant.
+type keyspace struct {
+	room int
+
+	mu             sync.Mutex
+	keys           map[string]*entry
+	newest, oldest *entry
+	dropped        int64
+}
+
+// Store holds live aggregates per tenant, per key, across many windows.
+//
+// Safe for concurrent use.
 type Store struct {
-	cfg    Config
-	shards []*shard
-	late   int64
-	lateMu sync.Mutex
-}
+	cfg Config
+	// cost is the bytes one key occupies and room is how many of them one
+	// tenant's byte ceiling buys. The count is DERIVED from the bytes, in one
+	// place, so there is no second bound that could disagree with the first.
+	cost int64
+	room int
+	orgs *roster.Roster[*keyspace]
 
-type shard struct {
-	mu   sync.Mutex
-	keys map[string]*entry
+	late atomic.Int64
 }
-
-const shardCount = 64
 
 // New builds a Store. Zero-value Config is valid and yields the documented
 // defaults.
 func New(cfg Config) *Store {
 	cfg = cfg.withDefaults()
-	s := &Store{cfg: cfg, shards: make([]*shard, shardCount)}
-	for i := range s.shards {
-		s.shards[i] = &shard{keys: make(map[string]*entry)}
+	cost := keyCost(cfg.Windows)
+	room := int(cfg.PerOrg / cost)
+	if room < 1 {
+		// A tenant that may hold no key at all would report every account as
+		// having done nothing, which is the one answer this store must never
+		// invent. One key is the floor.
+		room = 1
 	}
-	return s
-}
-
-func (s *Store) shardFor(id string) *shard {
-	// FNV-1a, inline: no allocation on the hot path.
-	var h uint32 = 2166136261
-	for i := 0; i < len(id); i++ {
-		h ^= uint32(id[i])
-		h *= 16777619
-	}
-	return s.shards[h%shardCount]
+	return &Store{cfg: cfg, cost: cost, room: room, orgs: roster.New[*keyspace](cfg.Orgs)}
 }
 
 // Record adds a transaction to every window for key.
@@ -287,24 +421,31 @@ func (s *Store) shardFor(id string) *shard {
 // near-threshold counters stay zero. Amount and threshold must share a currency;
 // this package does not convert, because a silent FX assumption inside a compliance
 // aggregate is a defect waiting to be discovered by an auditor.
+//
+// A tenant this process has no room for records nothing. That is a gap in a
+// control and it is not hidden: it is counted by the roster and published by
+// [Store.Pressure].
 func (s *Store) Record(k Key, ts time.Time, amount, threshold float64) {
-	id := k.id()
-	sh := s.shardFor(id)
+	ks, ok := s.keyspaceFor(k.OrgID)
+	if !ok {
+		return
+	}
 
 	near := isNear(amount, threshold, s.cfg.NearThresholdBand)
 	day := int(ts.UTC().Unix() / 86400 % 64)
+	id := k.id()
 
-	sh.mu.Lock()
-	e := sh.keys[id]
+	ks.mu.Lock()
+	e := ks.keys[id]
 	if e == nil {
-		if len(sh.keys) >= s.cfg.MaxKeys/shardCount+1 {
-			s.evictOldestLocked(sh)
+		for len(ks.keys) >= ks.room {
+			ks.dropOldest()
 		}
-		e = &entry{rings: make([]*ring, len(s.cfg.Windows))}
+		e = &entry{id: id, rings: make([]*ring, len(s.cfg.Windows))}
 		for i, w := range s.cfg.Windows {
 			e.rings[i] = newRing(w)
 		}
-		sh.keys[id] = e
+		ks.keys[id] = e
 	}
 	displaced := false
 	for _, r := range e.rings {
@@ -315,28 +456,66 @@ func (s *Store) Record(k Key, ts time.Time, amount, threshold float64) {
 	if ts.After(e.updated) {
 		e.updated = ts
 	}
-	sh.mu.Unlock()
+	ks.touch(e)
+	ks.mu.Unlock()
 
 	if displaced {
-		s.lateMu.Lock()
-		s.late++
-		s.lateMu.Unlock()
+		s.late.Add(1)
 	}
 }
 
-// evictOldestLocked drops the least-recently-updated key. Caller holds sh.mu.
-func (s *Store) evictOldestLocked(sh *shard) {
-	var oldestID string
-	var oldest time.Time
-	first := true
-	for id, e := range sh.keys {
-		if first || e.updated.Before(oldest) {
-			oldestID, oldest, first = id, e.updated, false
-		}
+// keyspaceFor is this tenant's own keys, admitting the tenant if the process has
+// room for another. It never takes another tenant's place — see pkg/roster.
+func (s *Store) keyspaceFor(org string) (*keyspace, bool) {
+	return s.orgs.Hold(org, func() *keyspace {
+		return &keyspace{room: s.room, keys: make(map[string]*entry)}
+	})
+}
+
+// touch moves a key to the newest end of its tenant's recency order. Caller
+// holds ks.mu.
+func (ks *keyspace) touch(e *entry) {
+	if ks.newest == e {
+		return
 	}
-	if oldestID != "" {
-		delete(sh.keys, oldestID)
+	ks.unlink(e)
+	e.older, e.newer = ks.newest, nil
+	if ks.newest != nil {
+		ks.newest.newer = e
 	}
+	ks.newest = e
+	if ks.oldest == nil {
+		ks.oldest = e
+	}
+}
+
+func (ks *keyspace) unlink(e *entry) {
+	if e.older != nil {
+		e.older.newer = e.newer
+	} else if ks.oldest == e {
+		ks.oldest = e.newer
+	}
+	if e.newer != nil {
+		e.newer.older = e.older
+	} else if ks.newest == e {
+		ks.newest = e.older
+	}
+	e.older, e.newer = nil, nil
+}
+
+// dropOldest drops this tenant's least recently used key. Caller holds ks.mu.
+//
+// The only key it can reach belongs to the tenant whose keyspace this is. That
+// is the whole difference between a bound and a way for one institution to
+// silence another's monitoring.
+func (ks *keyspace) dropOldest() {
+	e := ks.oldest
+	if e == nil {
+		return
+	}
+	ks.unlink(e)
+	delete(ks.keys, e.id)
+	ks.dropped++
 }
 
 // Observe returns one Observation per configured window. An unknown key yields
@@ -344,19 +523,26 @@ func (s *Store) evictOldestLocked(sh *shard) {
 // legitimate and common answer, and forcing callers to distinguish it from failure
 // invites them to ignore both.
 func (s *Store) Observe(k Key) []Observation {
-	id := k.id()
-	sh := s.shardFor(id)
-
-	out := make([]Observation, 0, len(s.cfg.Windows))
-	sh.mu.Lock()
-	e := sh.keys[id]
-	if e == nil {
-		sh.mu.Unlock()
+	empty := func() []Observation {
+		out := make([]Observation, 0, len(s.cfg.Windows))
 		for _, w := range s.cfg.Windows {
 			out = append(out, Observation{Window: w.Name, Span: w.Span, Quantum: w.Span / time.Duration(w.Buckets)})
 		}
 		return out
 	}
+	ks, ok := s.orgs.Get(k.OrgID)
+	if !ok {
+		return empty()
+	}
+
+	id := k.id()
+	ks.mu.Lock()
+	defer ks.mu.Unlock()
+	e := ks.keys[id]
+	if e == nil {
+		return empty()
+	}
+	out := make([]Observation, 0, len(s.cfg.Windows))
 	for _, r := range e.rings {
 		c, sum, near, nearSum, days := r.read()
 		out = append(out, Observation{
@@ -370,19 +556,62 @@ func (s *Store) Observe(k Key) []Observation {
 			Quantum: r.win.Span / time.Duration(r.win.Buckets),
 		})
 	}
-	sh.mu.Unlock()
 	return out
 }
+
+// Load is what this tenant is holding against its own bound.
+func (s *Store) Load(org string) Load {
+	l := Load{Org: org, Ceiling: int64(s.room) * s.cost, Room: s.room, Grade: GradeClear}
+	ks, ok := s.orgs.Get(org)
+	if !ok {
+		return l
+	}
+	ks.mu.Lock()
+	l.Keys, l.Dropped = len(ks.keys), ks.dropped
+	ks.mu.Unlock()
+	l.Bytes = int64(l.Keys) * s.cost
+	switch {
+	case l.Keys >= ks.room:
+		l.Grade = GradeFull
+	case float64(l.Keys) >= crowded*float64(ks.room):
+		l.Grade = GradeCrowded
+	}
+	return l
+}
+
+// Pressure is what the whole process is holding.
+func (s *Store) Pressure() Pressure {
+	p := Pressure{
+		Orgs:    s.orgs.Held(),
+		Room:    s.orgs.Ceiling(),
+		Refused: s.orgs.Refused(),
+		Ceiling: s.Ceiling(),
+		Late:    s.Late(),
+	}
+	s.orgs.Each(func(_ string, ks *keyspace) bool {
+		ks.mu.Lock()
+		p.Held += int64(len(ks.keys)) * s.cost
+		ks.mu.Unlock()
+		return true
+	})
+	return p
+}
+
+// Ceiling is the most this store may hold, in bytes: every tenant it will admit,
+// each full. It is the number to hold against a pod's memory limit.
+func (s *Store) Ceiling() int64 { return int64(s.orgs.Ceiling()) * int64(s.room) * s.cost }
+
+// Bytes is what it is holding now.
+func (s *Store) Bytes() int64 { return s.Pressure().Held }
+
+// Room is how many keys ONE tenant may hold.
+func (s *Store) Room() int { return s.room }
 
 // Late is the number of transactions folded to the leading edge because they
 // arrived older than their window. A non-zero and growing value means the feed is
 // delivering outside MaxLateness and the aggregates are less precise than they
 // look — which is a fact an operator must be able to see, not one to bury.
-func (s *Store) Late() int64 {
-	s.lateMu.Lock()
-	defer s.lateMu.Unlock()
-	return s.late
-}
+func (s *Store) Late() int64 { return s.late.Load() }
 
 // Windows are the windows this Store keeps, so a caller that reads observations
 // by name can check at construction that the names it needs exist rather than
@@ -391,14 +620,16 @@ func (s *Store) Windows() []Window {
 	return append([]Window(nil), s.cfg.Windows...)
 }
 
-// Keys is the number of live keys, for capacity monitoring against MaxKeys.
+// Keys is the number of live keys across every tenant, for capacity monitoring
+// against [Store.Ceiling].
 func (s *Store) Keys() int {
 	n := 0
-	for _, sh := range s.shards {
-		sh.mu.Lock()
-		n += len(sh.keys)
-		sh.mu.Unlock()
-	}
+	s.orgs.Each(func(_ string, ks *keyspace) bool {
+		ks.mu.Lock()
+		n += len(ks.keys)
+		ks.mu.Unlock()
+		return true
+	})
 	return n
 }
 

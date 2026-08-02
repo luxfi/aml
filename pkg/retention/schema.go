@@ -27,6 +27,7 @@ const (
 	fieldExpiry   = "expiry"
 	fieldWritten  = "written"
 	fieldBody     = "body"
+	fieldMark     = "fingerprint"
 	fieldAssess   = "assessment"
 	fieldExtended = "extended"
 	fieldIdentity = "identity"
@@ -58,6 +59,11 @@ var records = store.Kind{
 		&core.DateField{Name: fieldExpiry},
 		&core.DateField{Name: fieldWritten, Required: true},
 		&core.TextField{Name: fieldBody},
+		// What the body says, named by the caller that sealed it. It is a column
+		// because it is a fact about the record: without it a sealed body read back
+		// carries no name, the digest compares a body against a name, and every
+		// retry of one transaction is a permanent conflict. See Record.Fingerprint.
+		&core.TextField{Name: fieldMark},
 		&core.JSONField{Name: fieldAssess},
 		&core.JSONField{Name: fieldExtended},
 		&core.TextField{Name: fieldIdentity, Required: true},
