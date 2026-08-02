@@ -39,10 +39,18 @@
 // THE SHAPE GATE — this is the training–serving skew control. A Map records the
 // digest of the scorer it was fitted under (anomaly.Store.Digest(), which covers
 // the feature inventory in order, the neutral values and the detector geometry).
-// P refuses to answer for a scorer whose shape differs. So a calibration cannot
+// A Map cannot be read at all: Under(shape) is the only way to obtain a Reader,
+// and it refuses for a scorer whose shape differs. So a calibration cannot
 // outlive the model it describes: change a feature, and every map fitted before
 // the change stops answering instead of silently mapping coordinates that no
 // longer mean what they meant.
+//
+// The gate is at the BIND and not at the read, because a gate every read has to
+// pass is a gate every read can be made to pass — the shape argument was
+// available from the map itself, so passing m.Shape cleared the control and
+// looked exactly like clearing it honestly. Reading is total once the bind has
+// happened, so there is one place to get it right and no way downstream to get
+// it wrong.
 package calibrate
 
 import (
@@ -163,32 +171,75 @@ func (m Map) Fitted() bool {
 	return m.Shape != "" && (len(m.Knots) > 0 || m.Method == Platt)
 }
 
-// P maps one score to a probability under this fit, refusing when the scorer's
-// shape is not the one it was fitted under.
+// Under binds this map to the scoring shape now in force, refusing when they
+// differ. It is the ONLY way to read a probability out of a Map.
 //
-// The shape argument is not optional and there is no variant without it. A
-// calibration applied to coordinates that have moved is the classic
-// training–serving skew failure, and it fails silently: every number still looks
-// like a probability. Making the shape a required argument turns that into a
-// refusal at the one place every read has to pass.
-func (m Map) P(score float64, shape string) (float64, error) {
+// A GATE A CALLER CAN SATISFY IS NOT A GATE. The earlier read was
+// P(score, shape), and every internal call site passed m.Shape — the value being
+// compared came from the value being checked, so the training–serving skew
+// control was trivially true everywhere except the one place a live shape
+// happened to be threaded in. Nothing about that was visible at the call site;
+// each one looked like it was passing the gate.
+//
+// Binding separates the two concerns. ONE place decides whether this map applies
+// to these coordinates, at the boundary where the current shape is a fact the
+// server observed rather than a value a caller supplied. Everything downstream
+// takes a Reader, for which the question is already answered and cannot be
+// re-asked wrongly — a Reader has no shape to pass and no Map to read one off.
+func (m Map) Under(shape string) (Reader, error) {
 	if !m.Fitted() {
-		return 0, ErrNotFitted
+		return Reader{}, ErrNotFitted
 	}
 	if shape == "" {
-		return 0, ErrNoShape
+		return Reader{}, ErrNoShape
 	}
 	if shape != m.Shape {
-		return 0, fmt.Errorf("%w: fitted under %s, asked under %s", ErrShape, short(m.Shape), short(shape))
+		return Reader{}, fmt.Errorf("%w: fitted under %s, asked under %s", ErrShape, short(m.Shape), short(shape))
 	}
-	switch m.Method {
-	case Platt:
-		return clamp01(1 / (1 + math.Exp(m.A*score+m.B))), nil
-	case Isotonic:
-		return clamp01(interpolate(m.Knots, score)), nil
-	default:
-		return 0, ErrMethod
+	if m.Method != Isotonic && m.Method != Platt {
+		return Reader{}, fmt.Errorf("%w: %q", ErrMethod, m.Method)
 	}
+	return Reader{m: m, ok: true}, nil
+}
+
+// Reader is a calibration that has already been checked against the coordinates
+// it is about to be read in: a map bound to one scoring shape.
+//
+// It has no exported fields and no constructor other than Map.Under, so a
+// function taking a Reader is a function whose caller has been through the gate,
+// and that is a property the compiler checks rather than a reviewer.
+//
+// The ZERO Reader is the honest "no probability here": it is what a caller holds
+// when this organisation has no calibration at all AND what it holds when the
+// shape has moved, which are the two facts every consumer downstream has to
+// treat the same way — silently, by not stating a probability.
+type Reader struct {
+	m  Map
+	ok bool
+}
+
+// Fitted reports whether this reader can answer.
+func (r Reader) Fitted() bool { return r.ok }
+
+// Digest names the fit behind this reader, so a record can pin which map turned
+// which score into which probability. Empty when it cannot answer.
+func (r Reader) Digest() string {
+	if !r.ok {
+		return ""
+	}
+	return r.m.Digest
+}
+
+// P maps one score to a probability. It is TOTAL: the only thing that could have
+// failed is the shape, and holding a Reader is proof it did not.
+func (r Reader) P(score float64) float64 {
+	if !r.ok {
+		return 0
+	}
+	if r.m.Method == Platt {
+		return clamp01(1 / (1 + math.Exp(r.m.A*score+r.m.B)))
+	}
+	return clamp01(interpolate(r.m.Knots, score))
 }
 
 // interpolate reads the piecewise-linear map at score, clamping outside the
@@ -268,9 +319,11 @@ func Fit(samples []Sample, method, shape string) (Map, error) {
 		}
 		clean = append(clean, s)
 	}
-	// Total order, so the fit does not depend on the caller's order. Score
-	// ascending; unproductive before productive at equal score, which is the
-	// order pool-adjacent-violators would reach anyway and makes it explicit.
+	// Score ascending, so the fit does not depend on the caller's order. The
+	// tie-break by class is cosmetic and stays only because a stable, stated order
+	// is easier to read in a dump: pava pools every sample at one score into one
+	// block before it starts, so the order WITHIN a tie cannot reach the answer.
+	// Relying on that order instead of pooling is exactly the bug pooling fixes.
 	sort.SliceStable(clean, func(i, j int) bool {
 		if clean[i].Score != clean[j].Score {
 			return clean[i].Score < clean[j].Score
@@ -293,7 +346,15 @@ func Fit(samples []Sample, method, shape string) (Map, error) {
 			return Map{}, err
 		}
 	}
-	m.Brier = brier(clean, m)
+	// The in-sample Brier reads the map through the shape it was just fitted
+	// under, which is the one place that identity is a fact rather than an
+	// assumption — the shape was handed in and stamped on the same value two lines
+	// above. Everywhere else the shape comes from the live scorer.
+	r, err := m.Under(shape)
+	if err != nil {
+		return Map{}, err
+	}
+	m.Brier = brier(clean, r)
 	m.Digest = digest(m)
 	return m, nil
 }
@@ -301,10 +362,25 @@ func Fit(samples []Sample, method, shape string) (Map, error) {
 // pava is pool-adjacent-violators: the exact least-squares fit of a
 // non-decreasing function to the labels, in one pass over the sorted samples.
 //
-// Each block holds a weighted mean; whenever a block's mean is not greater than
-// its predecessor's the two are merged, which is the only operation the
+// TIES ARE POOLED BEFORE THE ALGORITHM STARTS, and that is not a refinement —
+// it is what makes the answer isotonic regression at all. A monotone function
+// has ONE value at one score, so every sample sharing a score is one block by
+// definition. Fed individual samples instead, a run of unproductive-then-
+// productive at a single score is already non-decreasing, so the merge condition
+// never fires, every sample stays its own block, and the score ends up mapped to
+// whichever label the sort happened to put last: 1 wherever any positive sits at
+// the top of a tie, 0 wherever none does.
+//
+// That is the ordinary case here, not an edge. A decision score is
+// 1 - prod(1-weight) over a FIXED set of rule weights, rounded to four places, so
+// the score alphabet is a handful of atoms and the modal atom is exactly zero.
+// Un-pooled, the whole map collapses to a step function pinned at 0 and 1 — every
+// plateau reported as certainty, at the top of the range where declines happen.
+//
+// Each block then holds a weighted mean; whenever a block's mean is not greater
+// than its predecessor's the two are merged, which is the only operation the
 // algorithm has. The result is the unique monotone least-squares solution — not
-// an approximation and not an iterative one — which is why this is 40 lines and
+// an approximation and not an iterative one — which is why this is 60 lines and
 // needs no numerical library.
 //
 // The knots are the block CENTROIDS (the weighted mean score inside the block)
@@ -315,13 +391,7 @@ func Fit(samples []Sample, method, shape string) (Map, error) {
 func pava(sorted []Sample) []Knot {
 	type block struct{ sum, weight, score float64 }
 	blocks := make([]block, 0, len(sorted))
-	for _, s := range sorted {
-		w := s.weight()
-		y := 0.0
-		if s.Productive {
-			y = 1
-		}
-		b := block{sum: y * w, weight: w, score: s.Score * w}
+	push := func(b block) {
 		blocks = append(blocks, b)
 		for len(blocks) > 1 {
 			last := len(blocks) - 1
@@ -334,24 +404,42 @@ func pava(sorted []Sample) []Knot {
 			blocks = blocks[:last]
 		}
 	}
-	knots := make([]Knot, 0, len(blocks))
-	for _, b := range blocks {
-		knots = append(knots, Knot{
-			Score: round6(b.score / b.weight),
-			P:     round6(b.sum / b.weight),
-		})
-	}
-	// Two blocks can share a centroid when every sample in both carried the same
-	// score. Keep the last, which holds the merged mean, so the knots are
-	// strictly ascending and interpolate is total.
-	out := knots[:0]
-	for i, k := range knots {
-		if i+1 < len(knots) && knots[i+1].Score == k.Score {
-			continue
+	// One block per DISTINCT score. weight() is never zero, so every block the
+	// loop pushes has mass and the means below are total.
+	for i := 0; i < len(sorted); {
+		var b block
+		j := i
+		for ; j < len(sorted) && sorted[j].Score == sorted[i].Score; j++ {
+			w := sorted[j].weight()
+			if sorted[j].Productive {
+				b.sum += w
+			}
+			b.weight += w
+			b.score += sorted[j].Score * w
 		}
-		out = append(out, k)
+		push(b)
+		i = j
 	}
-	return out
+
+	// A block's centroid lies inside its own score range, and the ranges are
+	// disjoint and ordered, so the centroids ascend strictly — until round6 puts
+	// two of them on one score. Those two are POOLED rather than one of them
+	// discarded: either endpoint alone states a probability the pooled evidence
+	// does not support, and the pooled mean sits between the neighbours it
+	// replaced, so the map stays monotone and interpolate stays total.
+	knots := make([]Knot, 0, len(blocks))
+	for i := 0; i < len(blocks); {
+		at := round6(blocks[i].score / blocks[i].weight)
+		var sum, weight float64
+		j := i
+		for ; j < len(blocks) && round6(blocks[j].score/blocks[j].weight) == at; j++ {
+			sum += blocks[j].sum
+			weight += blocks[j].weight
+		}
+		knots = append(knots, Knot{Score: at, P: round6(sum / weight)})
+		i = j
+	}
+	return knots
 }
 
 // platt fits p = 1/(1+exp(A*score+B)) by Newton's method on the regularised
@@ -431,16 +519,13 @@ func platt(sorted []Sample, pos, neg int) (float64, float64, error) {
 // Lower is better; 0.25 is what a constant at the base rate of a balanced set
 // scores, so a number above that on a balanced set means the map is worse than
 // saying nothing.
-func brier(samples []Sample, m Map) float64 {
-	if len(samples) == 0 {
+func brier(samples []Sample, r Reader) float64 {
+	if len(samples) == 0 || !r.Fitted() {
 		return 0
 	}
 	var sum, w float64
 	for _, s := range samples {
-		p, err := m.P(s.Score, m.Shape)
-		if err != nil {
-			return 0
-		}
+		p := r.P(s.Score)
 		y := 0.0
 		if s.Productive {
 			y = 1
@@ -475,7 +560,15 @@ type Bin struct {
 // share, and reporting either as 0.0 would draw a point on the chart at perfect
 // confidence in innocence — which is the most misleading thing this whole
 // package could do.
-func Reliability(samples []Sample, m Map, bins int) []Bin {
+//
+// A reader that cannot answer gets NO CHART, not an empty one. A calibration
+// whose shape has moved refuses to state a probability; a reliability report is
+// that same map applied to every row, so shipping one beside the refusal would
+// draw the chart the prose just said does not exist.
+func Reliability(samples []Sample, r Reader, bins int) []Bin {
+	if !r.Fitted() {
+		return nil
+	}
 	if bins <= 0 {
 		bins = 10
 	}
@@ -487,10 +580,7 @@ func Reliability(samples []Sample, m Map, bins int) []Bin {
 		out[i] = Bin{From: float64(i) / float64(bins), To: float64(i+1) / float64(bins)}
 	}
 	for _, s := range samples {
-		p, err := m.P(s.Score, m.Shape)
-		if err != nil {
-			continue
-		}
+		p := r.P(s.Score)
 		i := int(p * float64(bins))
 		if i >= bins {
 			i = bins - 1

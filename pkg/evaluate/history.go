@@ -151,11 +151,8 @@ const Listed = 500
 // not sorted here: sorting would silently repair a caller that handed rows in
 // the wrong order, and a replay over shuffled history is a different question
 // that would then be indistinguishable from this one.
-func Replay(history []Recorded, cal calibrate.Map, pol policy.Policy, rank func(string) int) Report {
-	r := Report{Rows: len(history), Policy: pol.Digest}
-	if cal.Fitted() {
-		r.Calibration = cal.Digest
-	}
+func Replay(history []Recorded, cal calibrate.Reader, pol policy.Policy, rank func(string) int) Report {
+	r := Report{Rows: len(history), Policy: pol.Digest, Calibration: cal.Digest()}
 	if len(history) == 0 {
 		r.Refusal = "no history to replay, so the result would be indistinguishable from a candidate that decides nothing"
 		r.Digest = fingerprint("evaluate.replay.v1", r.Refusal)
@@ -189,7 +186,8 @@ func Replay(history []Recorded, cal calibrate.Map, pol policy.Policy, rank func(
 
 		var prob *float64
 		action := pol.Floor
-		if p, err := cal.P(h.Score, cal.Shape); err == nil {
+		if cal.Fitted() {
+			p := cal.P(h.Score)
 			v := round6(p)
 			prob = &v
 			action = pol.Action(p)
@@ -247,7 +245,7 @@ func Replay(history []Recorded, cal calibrate.Map, pol policy.Policy, rank func(
 //
 // Returns a threshold above one when no score reaches p, which flags nothing —
 // the correct reading of a rung the candidate can never reach.
-func scoreAt(cal calibrate.Map, p float64) float64 {
+func scoreAt(cal calibrate.Reader, p float64) float64 {
 	if !cal.Fitted() {
 		// Without a calibration the sweep has no probability to invert; a
 		// threshold above every score flags nothing, which is what a policy with
@@ -255,7 +253,7 @@ func scoreAt(cal calibrate.Map, p float64) float64 {
 		return 1.0000001
 	}
 	lo, hi := 0.0, 1.0
-	if v, err := cal.P(hi, cal.Shape); err != nil || v < p {
+	if cal.P(hi) < p {
 		return 1.0000001
 	}
 	// 40 halvings resolves the unit interval to about 1e-12, far finer than the
@@ -263,11 +261,7 @@ func scoreAt(cal calibrate.Map, p float64) float64 {
 	// precision and the loop is bounded.
 	for range 40 {
 		mid := (lo + hi) / 2
-		v, err := cal.P(mid, cal.Shape)
-		if err != nil {
-			return 1.0000001
-		}
-		if v >= p {
+		if cal.P(mid) >= p {
 			hi = mid
 		} else {
 			lo = mid
