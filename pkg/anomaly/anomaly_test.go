@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/luxfi/aml/pkg/roster"
 	"github.com/luxfi/aml/pkg/types"
 	"github.com/luxfi/aml/pkg/velocity"
 )
@@ -196,7 +197,7 @@ func TestAttributionIsACounterfactualOnTheModel(t *testing.T) {
 	}
 	x := p.X
 	x[at] = inv[at].Neutral
-	m := st.s.orgs[org]
+	m, _ := st.s.orgs.Get(org)
 	m.mu.Lock()
 	direct := m.score(x[:], st.s.cfg)
 	m.mu.Unlock()
@@ -301,7 +302,7 @@ func TestHostileAmountsGoBlindAndDoNotPoisonTheModel(t *testing.T) {
 		t.Fatalf("model produces %v after hostile input; before it was %v", got, want)
 	}
 	st.s.mu.RLock()
-	m := st.s.orgs[org]
+	m, _ := st.s.orgs.Get(org)
 	st.s.mu.RUnlock()
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -359,7 +360,7 @@ func TestUnusablePointsAreRefused(t *testing.T) {
 		t.Fatalf("refusal not counted: %d -> %d", before.Refused[ReasonUnusable], after.Refused[ReasonUnusable])
 	}
 	st.s.mu.RLock()
-	m := st.s.orgs[org]
+	m, _ := st.s.orgs.Get(org)
 	st.s.mu.RUnlock()
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -631,7 +632,8 @@ func TestTenantsAreIsolated(t *testing.T) {
 
 	// Geometry must differ too, so probing one tenant teaches nothing about
 	// where another's regions lie.
-	a, b := s.orgs["org-a"], s.orgs["org-b"]
+	a, _ := s.orgs.Get("org-a")
+	b, _ := s.orgs.Get("org-b")
 	if a.seed == b.seed {
 		t.Fatal("tenants share a tree geometry")
 	}
@@ -931,12 +933,12 @@ func TestBelowTheLineSampleIsRetainedAndReproducible(t *testing.T) {
 }
 
 // Bounded memory is what makes the cardinality claim meaningful: tenants arrive
-// from a header, and a model per tenant with no bound is an exhaustion surface.
-// Evicting returns a tenant to warming, which declines to score rather than
-// scoring from state it does not have.
+// from a credential, and a model per tenant with no bound is an exhaustion
+// surface. The bound ADMITS — a tenant past it is refused by name and counted,
+// never made room for at another institution's expense. See tenant_test.go.
 func TestTenantCardinalityIsBounded(t *testing.T) {
 	vel := velocity.New(velocity.Config{})
-	s, err := New(Config{MaxOrgs: 4, Seed: 3}, vel)
+	s, err := New(Config{Orgs: 4, Seed: 3}, vel)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -951,11 +953,11 @@ func TestTenantCardinalityIsBounded(t *testing.T) {
 		}
 		s.judge(tx, true)
 	}
-	s.mu.RLock()
-	held := len(s.orgs)
-	s.mu.RUnlock()
-	if held > 4 {
+	if held := s.orgs.Held(); held > 4 {
 		t.Fatalf("holding %d tenant models, bound is 4", held)
+	}
+	if p := s.Pressure(); p.Crowded == 0 {
+		t.Fatalf("36 tenants were turned away and none of it is reported: %+v", p)
 	}
 }
 
@@ -992,18 +994,17 @@ func TestConcurrentAssessKeepsTheMassesSound(t *testing.T) {
 	}
 	wg.Wait()
 
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	for id, m := range s.orgs {
+	s.orgs.Each(func(id string, m *model) bool {
 		m.mu.Lock()
+		defer m.mu.Unlock()
 		for i, t2 := range m.trees {
 			if !t2.sound(s.cfg.Depth) {
-				m.mu.Unlock()
-				t.Fatalf("%s tree %d lost an update", id, i)
+				t.Errorf("%s tree %d lost an update", id, i)
+				return false
 			}
 		}
-		m.mu.Unlock()
-	}
+		return true
+	})
 }
 
 // Scoring cost must not grow with how much the model has seen. It is a fixed
@@ -1100,7 +1101,7 @@ func TestInspectDoesNotMutate(t *testing.T) {
 func TestMemoryPerTenant(t *testing.T) {
 	const n = 200
 	vel := velocity.New(velocity.Config{})
-	s, err := New(Config{MaxOrgs: n + 10, Seed: 1}, vel)
+	s, err := New(Config{Orgs: n + 10, Seed: 1}, vel)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1108,16 +1109,15 @@ func TestMemoryPerTenant(t *testing.T) {
 	var a, b runtime.MemStats
 	runtime.ReadMemStats(&a)
 	for i := 0; i < n; i++ {
-		s.mu.Lock()
-		s.orgs[fmt.Sprintf("org-%d", i)] = s.plant(fmt.Sprintf("org-%d", i), uint64(i+1))
-		s.mu.Unlock()
+		s.orgs.Put(fmt.Sprintf("org-%d", i), s.plant(fmt.Sprintf("org-%d", i), uint64(i+1)))
 	}
 	runtime.GC()
 	runtime.ReadMemStats(&b)
 	per := float64(b.HeapAlloc-a.HeapAlloc) / n
 	nodes := 1<<(s.cfg.Depth+1) - 1
-	t.Logf("trees=%d depth=%d nodes/tree=%d -> %.0f B/tenant (%.0f KB), %d tenants at MaxOrgs=%d -> %.1f MB",
-		s.cfg.Trees, s.cfg.Depth, nodes, per, per/1024, 256, 256, per*256/(1024*1024))
+	t.Logf("trees=%d depth=%d nodes/tree=%d -> %.0f B/tenant (%.0f KB), %d tenants at Orgs=%d -> %.1f MB",
+		s.cfg.Trees, s.cfg.Depth, nodes, per, per/1024, roster.Default, roster.Default,
+		per*float64(roster.Default)/(1024*1024))
 	if per > 600_000 {
 		t.Fatalf("%.0f B/tenant exceeds the documented bound", per)
 	}
@@ -1128,7 +1128,7 @@ func TestMemoryPerTenant(t *testing.T) {
 func BenchmarkScore(b *testing.B) {
 	vel := velocity.New(velocity.Config{})
 	s, _ := New(Config{Seed: 1}, vel)
-	m := s.model("bench")
+	m, _ := s.model("bench")
 	var p Point
 	for i := range p.X {
 		p.X[i] = 0.5
@@ -1189,7 +1189,7 @@ func BenchmarkExplain(b *testing.B) {
 		}
 		s.judge(tx, true)
 	}
-	m := s.orgs[org]
+	m, _ := s.orgs.Get(org)
 	inv := Inventory()
 	p := project(9400,
 		vel.Observe(velocity.Key{OrgID: org, Kind: AxisAccount, Value: "a-1"}), nil, nil)

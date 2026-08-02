@@ -13,13 +13,16 @@ import (
 
 	"github.com/hanzoai/base/core"
 
+	"github.com/luxfi/aml/internal/instance"
 	"github.com/luxfi/aml/pkg/cases"
 	"github.com/luxfi/aml/pkg/engine"
+	"github.com/luxfi/aml/pkg/history"
 	"github.com/luxfi/aml/pkg/reference"
 	"github.com/luxfi/aml/pkg/replay"
 	"github.com/luxfi/aml/pkg/retention"
 	"github.com/luxfi/aml/pkg/token"
 	"github.com/luxfi/aml/pkg/types"
+	"github.com/luxfi/aml/pkg/velocity"
 )
 
 // The record plane joins three packages that do not know about each other. These
@@ -45,8 +48,30 @@ func send(method, target string, body any) (*core.RequestEvent, *httptest.Respon
 	return e, rec
 }
 
-// plane is a handler with a working record plane and one rule.
-func plane(t *testing.T, rules ...types.Rule) *Handler {
+// shelves opens an instance with every collection the ingest path writes to.
+//
+// It is the shelf cmd/amld wires and not a memory stand-in, deliberately. A green
+// suite over a shelf production does not use proves nothing about production: the
+// record fingerprint was a struct field no column stored, so every retry of one
+// transaction conflicted permanently on the durable shelf while every test passed
+// on the memory one. There is one way to build a handler in these tests and it is
+// the deployment's way.
+func shelves(t *testing.T) core.App {
+	t.Helper()
+	app := instance.New(t)
+	t.Cleanup(app.Cleanup)
+	for _, ensure := range []func(core.App) error{
+		retention.Ensure, cases.Ensure, EnsureAlerts, history.Ensure,
+	} {
+		if err := ensure(app); err != nil {
+			t.Fatalf("ensure: %v", err)
+		}
+	}
+	return app
+}
+
+// planeOn is a handler with a working record plane and one rule, over one app.
+func planeOn(t *testing.T, app core.App, rules ...types.Rule) *Handler {
 	t.Helper()
 	if len(rules) == 0 {
 		rules = []types.Rule{{
@@ -58,11 +83,19 @@ func plane(t *testing.T, rules ...types.Rule) *Handler {
 		Identity: func(*http.Request) (Caller, error) { return Caller{Tenant: acme, Subject: "u-analyst"}, nil },
 		Engine:   testEngine(rules),
 		Rate:     reference.Rates{},
-		Cases:    cases.NewStore(),
-		Alerts:   NewAlertStore(),
-		Records:  retention.New(),
+		Cases:    cases.NewBase(app),
+		Alerts:   NewAlertStoreBase(app),
+		Records:  retention.NewBase(app),
+		History:  history.NewBase(app),
+		Velocity: velocity.New(velocity.Config{}),
 		Keys:     token.NewKeyring(func(string) ([]byte, error) { return root, nil }),
 	}
+}
+
+// plane is a handler with a working record plane and one rule.
+func plane(t *testing.T, rules ...types.Rule) *Handler {
+	t.Helper()
+	return planeOn(t, shelves(t), rules...)
 }
 
 // keyless is a handler whose key material has not arrived.
@@ -434,7 +467,11 @@ func TestClosingARelationshipStartsTheClockOnWhatIsInsideIt(t *testing.T) {
 	}
 
 	inside = only(t, h, retention.ClassTransaction)
-	if want := ended.AddDate(retention.Period, 0, 0); !inside.Expiry().Equal(want) {
+	// To the millisecond the shelf keeps dates at. The ledger's own digest is
+	// computed in UnixMilli for the same reason: a clock read back is the clock
+	// that was stored, and comparing it against a nanosecond the caller happened
+	// to hold tests the test's precision rather than the record's.
+	if want := ended.AddDate(retention.Period, 0, 0).Truncate(time.Millisecond); !inside.Expiry().Equal(want) {
 		t.Errorf("expiry = %s, want five years from the end of the relationship (%s)", inside.Expiry(), want)
 	}
 
