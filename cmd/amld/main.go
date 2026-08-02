@@ -15,7 +15,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"log"
 	"os"
 	"strings"
 	"time"
@@ -25,17 +24,11 @@ import (
 	"github.com/hanzoai/base/tools/hook"
 	"github.com/spf13/cobra"
 
-	"github.com/luxfi/aml/pkg/anomaly"
 	"github.com/luxfi/aml/pkg/api"
-	"github.com/luxfi/aml/pkg/cases"
-	"github.com/luxfi/aml/pkg/engine"
-	"github.com/luxfi/aml/pkg/history"
 	"github.com/luxfi/aml/pkg/reference"
-	"github.com/luxfi/aml/pkg/retention"
 	"github.com/luxfi/aml/pkg/rules"
 	"github.com/luxfi/aml/pkg/screen"
 	"github.com/luxfi/aml/pkg/token"
-	"github.com/luxfi/aml/pkg/velocity"
 )
 
 var version = "(dev)"
@@ -97,7 +90,7 @@ func main() {
 	// endpoints read it; there is no second store for either to talk to instead —
 	// two stores is how sanctions search came to answer "no match" for every name
 	// while the refresh was loading designations somewhere else.
-	lists := screen.New(listStale, nil)
+	screening := screen.New(listStale, nil)
 
 	// Per-source readiness. The store answers whether screening can be relied on at
 	// all; this answers which publisher is behind it, with a count and a date,
@@ -111,20 +104,6 @@ func main() {
 	// job is to have kept the record.
 	keys := token.NewKeyring(token.Env("AML_TOKEN_KEY"))
 
-	// The behavioural plane. Sliding aggregates are the substrate every behavioural
-	// measure reads; the model reads them to score whether a transaction is unusual
-	// for the entity that made it, as a complement to the rules.
-	//
-	// It starts in shadow. Detection has to be testable before it is activated, so a
-	// new deployment scores, learns, and records what it would have alerted on at
-	// GET /v1/aml/anomaly, contributing nothing to any transaction's outcome until
-	// someone has read that and set AML_ANOMALY=live. The rules are unaffected.
-	windows := velocity.New(velocity.Config{})
-	model, err := anomaly.New(anomaly.Config{Shadow: os.Getenv("AML_ANOMALY") != "live"}, windows)
-	if err != nil {
-		log.Fatalf("[aml] behavioural plane: %v", err)
-	}
-
 	app.OnServe().Bind(&hook.Handler[*core.ServeEvent]{
 		Func: func(se *core.ServeEvent) error {
 			// Refuse to serve unauthenticated. This is checked here, at the start,
@@ -135,60 +114,17 @@ func main() {
 				return errors.New("refusing to start, AML_CLIENT_ID is not set: it is this deployment's IAM application clientId, and without it no token's audience can be checked")
 			}
 
-			// The transaction collection has to exist before any rule reads a
-			// window. Without it every aggregate rule reaches no verdict, which is
-			// how twelve of twenty rules came to fault on every transaction.
-			if err := history.Ensure(app); err != nil {
-				return fmt.Errorf("refusing to start, the transaction record cannot be created: %w", err)
-			}
-			events := history.NewBase(app)
-
-			// The retained record plane, on the same terms as the transaction
-			// record above: collections first, then a ledger over them.
+			// The whole engine, over this store, assembled in one place.
 			//
-			// It is Base-backed and not the memory shelf, which is the whole
-			// obligation. Records have to be kept for five years after the
-			// relationship ends (AMLR Art. 77(3)); a shelf that empties on restart
-			// keeps them until the next rollout, and a `kubectl rollout restart`
-			// is not an event the law makes an exception for. The memory shelf is
-			// for tests and says so.
-			if err := retention.Ensure(app); err != nil {
-				return fmt.Errorf("refusing to start, the retained record cannot be created: %w", err)
-			}
-			records := retention.NewBase(app)
-
-			// The case plane, on the same terms. A case is the record that an
-			// alert was considered and what was decided (AMLR Art. 77(1)(b)),
-			// and the timeline is the evidence of the work — both have to be
-			// there after a restart, so both are Base-backed.
-			if err := cases.Ensure(app); err != nil {
-				return fmt.Errorf("refusing to start, the case plane cannot be created: %w", err)
-			}
-			if err := api.EnsureAlerts(app); err != nil {
-				return fmt.Errorf("refusing to start, alerts cannot be recorded: %w", err)
-			}
-
-			rates := reference.RatesFromEnv()
-
-			eng := engine.New(engine.Providers{
-				History:   events,
-				Screen:    lists,
-				Reference: reference.JurisdictionsFromEnv(),
-				Rate:      rates,
-				Zone:      zone,
-			})
-			eng.SetScorer(model)
-
-			// Installing the library is what checks that every rule's evidence
-			// exists. A failure is a configuration error and the process refuses to
-			// start: a monitoring system that comes up with part of its catalog
-			// silently missing is worse than one that does not come up, because only
-			// the second is noticed.
-			if err := eng.SetRules(rules.Library(org)); err != nil {
-				return fmt.Errorf("refusing to start, the detection library cannot be installed: %w", err)
-			}
-
-			handler := &api.Handler{
+			// api.Wire is the ONE assembly: every collection, every shelf, every join
+			// between them, and everything that has to run on a cadence for the durable
+			// state to stay honest. It is what the tests build too, so a plane cannot be
+			// proven green against an arrangement this deployment does not have — which
+			// is how a record fingerprint came to be a field no column stored.
+			//
+			// What stays here is what an INSTALLATION answers differently, and it is
+			// read from the environment above.
+			handler, err := api.Wire(app, api.Deployment{
 				// The token is verified here, in this process, against the JWKS of the
 				// brand whose Host the request arrived on.
 				//
@@ -201,26 +137,27 @@ func main() {
 				// assumption: it is one hop away from another institution's records.
 				// TrustedProxyHeader remains for a deployment that can prove the
 				// assumption, and it qualifies its tenant the same way.
-				Identity:  api.IAMIdentity(api.JWKS(keysTTL, keysStale), client),
-				Engine:    eng,
-				ClientID:  client,
-				Cases:     cases.NewBase(app),
-				Alerts:    api.NewAlertStoreBase(app),
-				Screen:    lists,
-				Readiness: readiness,
-				History:   events,
-				Rate:      rates,
-				Records:   records,
-				Keys:      keys,
-				Velocity:  windows,
-				Anomaly:   model,
+				Identity:      api.IAMIdentity(api.JWKS(keysTTL, keysStale), client),
+				ClientID:      client,
+				Rules:         rules.Library(org),
+				Keys:          keys,
+				Screen:        screening,
+				Readiness:     readiness,
+				Zone:          zone,
+				Rate:          reference.RatesFromEnv(),
+				Jurisdictions: reference.JurisdictionsFromEnv(),
+				// The behavioural model contributes to a verdict only once somebody
+				// has read what it would have done. The rules are unaffected either
+				// way. See api.Deployment.Live, which is stated from the live side so
+				// that the zero value is shadow.
+				Live: os.Getenv("AML_ANOMALY") == "live",
+			})
+			if err != nil {
+				return fmt.Errorf("refusing to start: %w", err)
 			}
 			handler.Register(se)
 
-			refresh(app, lists, readiness)
-
-			// Destroy records whose retention period has run out, daily.
-			retention.Cron(app, records)
+			refresh(app, screening, readiness)
 
 			return se.Next()
 		},
@@ -240,7 +177,7 @@ func main() {
 
 // refresh registers the daily sanctions load and runs one immediately, so the
 // process does not serve a whole day with nothing loaded.
-func refresh(app core.App, lists *screen.Store, readiness *screen.Readiness) {
+func refresh(app core.App, screening *screen.Store, readiness *screen.Readiness) {
 	load := func() {
 		results := screen.Fetch(context.Background())
 		for i := range results {
@@ -249,7 +186,7 @@ func refresh(app core.App, lists *screen.Store, readiness *screen.Readiness) {
 				app.Logger().Error("sanctions list load failed", "source", r.Source, "error", r.Err)
 				continue
 			}
-			if err := lists.Load(r.Source, r.Entries); err != nil {
+			if err := screening.Load(r.Source, r.Entries); err != nil {
 				// Recorded on the result too, so readiness reports a rejected list as
 				// unfit rather than as a successful load of nothing.
 				r.Err = err
@@ -259,7 +196,7 @@ func refresh(app core.App, lists *screen.Store, readiness *screen.Readiness) {
 			app.Logger().Info("sanctions list loaded", "source", r.Source, "designations", len(r.Entries))
 		}
 		readiness.Record(results, time.Now().UTC())
-		if err := lists.Ready(); err != nil {
+		if err := screening.Ready(); err != nil {
 			app.Logger().Error("screening is not ready after a refresh", "error", err)
 		}
 	}

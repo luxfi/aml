@@ -181,13 +181,13 @@ func TestEveryAlgorithmIAMPublishesVerifies(t *testing.T) {
 		if err != nil {
 			t.Fatalf("%s: sign: %v", tc.kid, err)
 		}
-		tenant, err := id(bearing("api.hanzo.ai", raw))
+		who, err := id(bearing("api.hanzo.ai", raw))
 		if err != nil {
 			t.Errorf("%s (%s): a token signed by a published key was refused: %v", tc.kid, tc.method.Alg(), err)
 			continue
 		}
-		if tenant != "hanzo/acme" {
-			t.Errorf("%s: tenant = %q, want hanzo/acme", tc.kid, tenant)
+		if who.Tenant != "hanzo/acme" {
+			t.Errorf("%s: tenant = %q, want hanzo/acme", tc.kid, who.Tenant)
 		}
 
 		// And the signature is what did it: the same claims under a different key of

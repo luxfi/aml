@@ -63,7 +63,28 @@ func NewAlertStoreBase(app core.App) *AlertStore {
 }
 
 // add writes alerts to the durable shelf.
+//
+// What a rule concluded about a transaction is a property of the transaction, so
+// a tenant that already has alerts on one has already judged it and the evidence
+// on record stands. Re-evaluating would mint fresh alert ids and file a second
+// copy of one judgement — which a case then cites twice and a replay counts
+// twice. It matters because the answer to an offer is kept AFTER these writes: a
+// process that dies in between leaves the alerts filed and the caller
+// unanswered, and the caller offers again.
+//
+// Nothing is deleted and nothing is overwritten. The first judgement is the one
+// the institution made.
 func (s *AlertStore) add(txID string, alerts []types.Alert) error {
+	if len(alerts) == 0 {
+		return nil
+	}
+	held, err := alertKind.Find(s.app, alerts[0].OrgID, fieldTx+" = {:tx}", "", 1, dbx.Params{"tx": txID})
+	if err != nil {
+		return fmt.Errorf("alerts: read %s: %w", txID, err)
+	}
+	if len(held) > 0 {
+		return nil
+	}
 	for _, a := range alerts {
 		body, err := json.Marshal(a)
 		if err != nil {
@@ -82,6 +103,13 @@ func (s *AlertStore) add(txID string, alerts []types.Alert) error {
 		}
 	}
 	return nil
+}
+
+// judged reports whether this tenant has already recorded alerts on a
+// transaction, which is the question "has this transaction been judged before".
+func (s *AlertStore) judged(org, txID string) bool {
+	held, err := alertKind.Find(s.app, org, fieldTx+" = {:tx}", "", 1, dbx.Params{"tx": txID})
+	return err == nil && len(held) > 0
 }
 
 // byTx reads a tenant's alerts for a transaction from the durable shelf.

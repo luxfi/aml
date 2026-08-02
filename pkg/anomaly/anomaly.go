@@ -48,8 +48,10 @@ import (
 	"math/rand/v2"
 	"sort"
 	"sync"
+	"sync/atomic"
 	"time"
 
+	"github.com/luxfi/aml/pkg/roster"
 	"github.com/luxfi/aml/pkg/types"
 	"github.com/luxfi/aml/pkg/velocity"
 )
@@ -80,6 +82,12 @@ const (
 	// against an aggregate keyed on nothing would pool every anonymous
 	// transaction in the tenant into one imaginary customer.
 	ReasonUnidentified = "unidentified"
+	// ReasonCrowded means this process holds models for as many institutions as
+	// it may and this one arrived after the last place was taken, so there is no
+	// model to score against. It is refused by name rather than scored as
+	// ordinary, because a transaction nothing examined must never be counted as
+	// a transaction something found nothing in.
+	ReasonCrowded = "crowded"
 )
 
 // histBuckets is the resolution of the score distribution the alert threshold is
@@ -152,13 +160,19 @@ type Config struct {
 	Severity string   `json:"severity"`
 	Action   string   `json:"action"`
 	Shadow   bool     `json:"shadow"`
-	// MaxOrgs bounds how many tenants' models are held at once. Each costs
-	// Trees * (2^(Depth+1)-1) nodes — a measured 336 KB at the defaults — and
-	// models are created on a tenant's first transaction, so idle tenants cost
-	// nothing. On overflow the least recently used is dropped, which returns
-	// that tenant to warming: the model then declines to score rather than
-	// scoring from state it does not have.
-	MaxOrgs int `json:"max_orgs"`
+	// Orgs is how many institutions this process holds a model for. Each costs
+	// Trees * (2^(Depth+1)-1) nodes — a measured 336 KB at the defaults — and a
+	// model is planted on a tenant's first transaction, so an idle institution
+	// costs nothing.
+	//
+	// The bound ADMITS; it does not evict. A tenant that is holding a model
+	// keeps it, and a tenant arriving when the roster is full is refused by name
+	// ([ReasonCrowded]) and counted. The alternative — dropping the least
+	// recently used tenant to make room — meant one institution's ordinary
+	// traffic returned another's model to warming, and a model that is warming
+	// reports nothing, which is what a clean institution also reports. See
+	// pkg/roster.
+	Orgs int `json:"orgs"`
 	// Seed fixes the tree geometry. Left at zero it is drawn from the system
 	// CSPRNG at construction, which is the right default: geometry that cannot
 	// be predicted cannot be probed for a region to hide in. Setting it makes
@@ -203,8 +217,8 @@ func (c Config) withDefaults() Config {
 	if c.Action == "" {
 		c.Action = types.ActionReview
 	}
-	if c.MaxOrgs <= 0 {
-		c.MaxOrgs = 256
+	if c.Orgs <= 0 {
+		c.Orgs = roster.Default
 	}
 	return c
 }
@@ -231,10 +245,44 @@ var (
 //
 // Safe for concurrent use.
 type Store struct {
-	cfg  Config
-	vel  *velocity.Store
-	mu   sync.RWMutex
-	orgs map[string]*model
+	cfg Config
+	vel *velocity.Store
+	// orgs is one model per institution. It is a roster and not a map because a
+	// roster admits and cannot remove: there is no expression in this package
+	// that takes one tenant's model to make room for another's.
+	orgs *roster.Roster[*model]
+	// crowded counts the transactions refused for want of a place on the roster.
+	crowded atomic.Int64
+
+	mu sync.RWMutex
+	// adopted is where a tenant's previously adopted state is read back from when
+	// this store has no model for it. See SetAdopted.
+	adopted Adopted
+}
+
+// Adopted answers what a tenant last adopted into its model, if anything.
+//
+// It is the seam that makes an adoption survive the things memory does not. A
+// model lives in this process; the deployment is one replica with a Recreate
+// strategy, so every rollout empties it, and the store holds a bounded number of
+// tenants' models at once, so an idle tenant's can be dropped for a busy one's.
+// Neither of those is a decision anybody took, and both of them silently return a
+// tenant to warming — which reports no alerts, which is what a quiet institution
+// also reports. A control must not be able to go quiet without somebody deciding
+// it should.
+//
+// The implementation is the model plane's durable record of the adoption
+// (models.Shelf.Adopted). It is an interface here rather than an import because
+// the dependency runs one way: the model plane knows about the model, and the
+// model knows nothing about a store.
+type Adopted func(org string) (Snapshot, bool)
+
+// SetAdopted wires the reload. It is called once at start-up, before the store
+// serves anything: this is deployment wiring and not a runtime switch.
+func (s *Store) SetAdopted(fn Adopted) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.adopted = fn
 }
 
 type model struct {
@@ -252,6 +300,15 @@ type model struct {
 	sample  []Sampled
 	at      int
 	updated time.Time
+	// planted is when this tenant's model started, and restored says it started
+	// from an adoption rather than blind. Both are published (see State) because
+	// the events that reset a model — a rollout, an eviction to make room for
+	// another tenant — are nobody's decision, and a control that quietly went
+	// back to warming reports no alerts, which is what a quiet institution also
+	// reports. A model that started this morning under an institution that has
+	// been live for a year is the fact that answers "why did this go quiet".
+	planted  time.Time
+	restored bool
 }
 
 // New builds a Store reading aggregates from vel.
@@ -282,7 +339,7 @@ func New(cfg Config, vel *velocity.Store) (*Store, error) {
 		}
 		cfg.Seed = binary.LittleEndian.Uint64(b[:])
 	}
-	return &Store{cfg: cfg, vel: vel, orgs: map[string]*model{}}, nil
+	return &Store{cfg: cfg, vel: vel, orgs: roster.New[*model](cfg.Orgs)}, nil
 }
 
 // Config returns the configuration in force, with the seed withheld.
@@ -307,7 +364,7 @@ func (s *Store) Config() Config {
 // every baseline in the feature set has the transaction removed from it
 // arithmetically so that nothing is measured against itself.
 func (s *Store) Assess(tx types.Transaction, entity types.Entity) (types.RuleHit, bool) {
-	a := s.judge(tx, true)
+	a := s.Learn(tx, entity)
 	if !a.Alert {
 		return types.RuleHit{}, false
 	}
@@ -328,6 +385,20 @@ func (s *Store) Assess(tx types.Transaction, entity types.Entity) (types.RuleHit
 		Match:  true,
 		Causes: a.Causes,
 	}, true
+}
+
+// Learn scores one transaction, lets the model learn from it, and returns the
+// whole assessment.
+//
+// It is what Assess does, with the answer not yet reduced to the engine's Scorer
+// shape. The two cannot disagree about what the model did, because Assess is
+// defined in terms of this and there is no second scoring path — which is the
+// property that lets a study of the model (pkg/topology) replay a tenant's own
+// history through the code that scores production, and read the score of every
+// event as the model learned it, rather than through a copy of the algorithm
+// that would be free to be wrong.
+func (s *Store) Learn(tx types.Transaction, entity types.Entity) Assessment {
+	return s.judge(tx, true)
 }
 
 // Inspect scores one transaction without learning from it, moving any counter, or
@@ -388,10 +459,11 @@ type Sampled struct {
 // judge reads the aggregates for one transaction, projects it, and weighs it.
 func (s *Store) judge(tx types.Transaction, learn bool) Assessment {
 	if account(tx) == "" {
-		m := s.model(tx.OrgID)
-		m.mu.Lock()
-		m.refused[ReasonUnidentified]++
-		m.mu.Unlock()
+		if m, ok := s.model(tx.OrgID); ok {
+			m.mu.Lock()
+			m.refused[ReasonUnidentified]++
+			m.mu.Unlock()
+		}
 		return Assessment{Shadow: s.cfg.Shadow, Reason: ReasonUnidentified}
 	}
 	p := project(tx.USD,
@@ -413,7 +485,11 @@ func (s *Store) judge(tx types.Transaction, learn bool) Assessment {
 func (s *Store) weigh(orgID string, p Point, txID string, at time.Time, learn bool) Assessment {
 	inv := inventory
 	a := Assessment{Shadow: s.cfg.Shadow, Values: values(p, inv)}
-	m := s.model(orgID)
+	m, ok := s.model(orgID)
+	if !ok {
+		a.Reason = ReasonCrowded
+		return a
+	}
 
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -722,25 +798,48 @@ func (m *model) keep(s Sampled) {
 // it owes.
 const sampleDepth = 256
 
-func (s *Store) model(orgID string) *model {
-	s.mu.RLock()
-	m := s.orgs[orgID]
-	s.mu.RUnlock()
-	if m != nil {
-		return m
+// model is this tenant's model, or the reason there is none.
+//
+// It reports false only when the roster is full and this tenant is not on it.
+// That is a real gap in a real control, so it is counted here and published by
+// [Store.State] and [Store.Pressure] rather than looking like a quiet stream.
+func (s *Store) model(orgID string) (*model, bool) {
+	if m, ok := s.orgs.Get(orgID); ok {
+		return m, true
 	}
 
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if m = s.orgs[orgID]; m != nil {
-		return m
+	// Room before work. A tenant this process cannot hold must not be able to
+	// make it read a durable adoption — a store query plus a whole learned-state
+	// unmarshal — once per transaction for as long as it keeps sending.
+	if s.orgs.Full() {
+		s.crowded.Add(1)
+		return nil, false
 	}
-	if len(s.orgs) >= s.cfg.MaxOrgs {
-		s.evict()
+
+	// No model in memory. Before planting a blind one, ask whether this tenant
+	// adopted state that a rollout took away — see Adopted. The read happens
+	// without the lock, because it reaches a store, and it happens at most once
+	// per admission: the tenant has a model afterwards and keeps it, since
+	// nothing here evicts. Two first transactions arriving together may both
+	// ask, and both answers are the same row.
+	s.mu.RLock()
+	adopted := s.adopted
+	s.mu.RUnlock()
+	if adopted != nil {
+		if snap, ok := adopted(orgID); ok && snap.OrgID == orgID {
+			if err := s.Restore(snap); err == nil {
+				if m, ok := s.orgs.Get(orgID); ok {
+					return m, true
+				}
+			}
+		}
 	}
-	m = s.plant(orgID, mix(s.cfg.Seed, orgID))
-	s.orgs[orgID] = m
-	return m
+
+	m, ok := s.orgs.Hold(orgID, func() *model { return s.plant(orgID, mix(s.cfg.Seed, orgID)) })
+	if !ok {
+		s.crowded.Add(1)
+	}
+	return m, ok
 }
 
 func (s *Store) plant(orgID string, seed uint64) *model {
@@ -752,29 +851,12 @@ func (s *Store) plant(orgID string, seed uint64) *model {
 		sample:  make([]Sampled, 0, sampleDepth),
 		cut:     1, // admit nothing until a distribution exists
 		updated: time.Now().UTC(),
+		planted: time.Now().UTC(),
 	}
 	for i := range m.trees {
 		m.trees[i] = plant(rng, Dims, s.cfg.Depth)
 	}
 	return m
-}
-
-// evict drops the least recently used tenant's model. Caller holds s.mu.
-func (s *Store) evict() {
-	var oldest string
-	var at time.Time
-	first := true
-	for id, m := range s.orgs {
-		m.mu.Lock()
-		u := m.updated
-		m.mu.Unlock()
-		if first || u.Before(at) {
-			oldest, at, first = id, u, false
-		}
-	}
-	if oldest != "" {
-		delete(s.orgs, oldest)
-	}
 }
 
 // mix derives a tenant's seed from the store's seed and the tenant's identity, so
@@ -828,6 +910,45 @@ type State struct {
 	// Sample is the below-the-line window: transactions scored, not alerted, and
 	// retained for review so the miss rate can be measured.
 	Sample []Sampled `json:"sample"`
+	// Planted is when the model this tenant is being scored by started, and
+	// Restored says it started from an adopted state rather than blind.
+	//
+	// They are published because the two things that reset a model are not
+	// decisions anybody took: this deployment is one replica with a Recreate
+	// strategy, so a rollout empties every model, and the store holds a bounded
+	// number of tenants' models at once, so an idle institution's can be dropped
+	// to make room for a busy one's. Either way the tenant returns to warming,
+	// which reports no alerts — indistinguishable from a quiet institution unless
+	// the model says when it started. An adopted state comes back on its own
+	// (models.Shelf.Adopted) and Restored is how a reviewer sees that it did.
+	Planted  time.Time `json:"planted,omitzero"`
+	Restored bool      `json:"restored,omitempty"`
+	// Crowded means this process holds models for as many institutions as it
+	// may and this tenant is not one of them, so nothing here has examined its
+	// transactions at all. It is the state that must never be read as quiet: the
+	// rules still ran, the model did not, and Refused carries the count under
+	// [ReasonCrowded] for the tenants that do have a model.
+	Crowded bool `json:"crowded,omitempty"`
+}
+
+// Pressure is what this process is holding, for the operator.
+//
+// It names no tenant. How many institutions an engine serves and how many it has
+// turned away are facts about the deployment, not about anybody's business.
+type Pressure struct {
+	Orgs int `json:"orgs"`
+	Room int `json:"room"`
+	// Crowded counts the transactions that reached no model because this process
+	// holds models for as many institutions as it may. It is ONE number for the
+	// whole condition — an admission turned away and a transaction that found no
+	// model are the same event counted at two depths, and two counters for one
+	// fact is how a report comes to disagree with itself.
+	Crowded int64 `json:"crowded"`
+}
+
+// Pressure reports the roster.
+func (s *Store) Pressure() Pressure {
+	return Pressure{Orgs: s.orgs.Held(), Room: s.orgs.Ceiling(), Crowded: s.crowded.Load()}
 }
 
 // State reports the model for one tenant.
@@ -839,16 +960,16 @@ func (s *Store) State(orgID string) State {
 		Distribution: make([]float64, 32),
 	}
 
-	s.mu.RLock()
-	m := s.orgs[orgID]
-	s.mu.RUnlock()
-	if m == nil {
+	m, held := s.orgs.Get(orgID)
+	if !held {
+		st.Crowded = s.orgs.Full()
 		return st
 	}
 
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	st.Learned, st.Cut, st.Scored, st.Alerted = m.learned, m.cut, m.scored, m.alerted
+	st.Planted, st.Restored = m.planted, m.restored
 	st.Warm = m.learned >= int64(s.cfg.Appetite.Warm)
 	st.Saturated = st.Warm && m.cut >= 1
 	if m.scored > 0 {
@@ -909,9 +1030,7 @@ type Snapshot struct {
 // Snapshot returns one tenant's learned state, or false when that tenant has
 // none.
 func (s *Store) Snapshot(orgID string) (Snapshot, bool) {
-	s.mu.RLock()
-	m := s.orgs[orgID]
-	s.mu.RUnlock()
+	m, _ := s.orgs.Get(orgID)
 	if m == nil {
 		return Snapshot{}, false
 	}
@@ -985,13 +1104,11 @@ func (s *Store) Restore(snap Snapshot) error {
 		}
 	}
 	m.learned, m.seen, m.cut = snap.Learned, snap.Seen, snap.Cut
+	m.restored = true
 	copy(m.hist[:], snap.Hist)
 
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if _, held := s.orgs[snap.OrgID]; !held && len(s.orgs) >= s.cfg.MaxOrgs {
-		s.evict()
+	if !s.orgs.Put(snap.OrgID, m) {
+		return fmt.Errorf("%w: this process holds models for as many institutions as it may", ErrSnapshot)
 	}
-	s.orgs[snap.OrgID] = m
 	return nil
 }

@@ -273,6 +273,18 @@ type Record struct {
 	// Body is the record itself, opaque to the ledger and sealed by the caller.
 	// It is what reconstructs the transaction, so it is never partial.
 	Body []byte `json:"body,omitempty"`
+	// Fingerprint is the stable name of what Body holds, supplied by the caller
+	// that sealed it. When it is set the digest hashes it INSTEAD of Body.
+	//
+	// Without it, a caller whose seal draws a fresh nonce cannot retry: the same
+	// record sealed twice is two different byte strings, so the second submission
+	// of one transaction reads as a different fact under the same name and is
+	// refused as a conflict — permanently, since every further retry seals again.
+	// The ledger stays ignorant of encryption; it takes the caller's word for
+	// what two bodies mean the same thing, which is the only party that can know
+	// (see token.Vault.Fingerprint, which is keyed, so this is not a way to
+	// confirm a guess at the body).
+	Fingerprint string `json:"fingerprint,omitempty"`
 
 	// Assessment is set on ClassAssessment records.
 	Assessment *Assessment `json:"assessment,omitempty"`
@@ -335,6 +347,12 @@ func (r Record) digest() string {
 		Body       []byte
 		Assessment *Assessment
 	}
+	body := r.Body
+	if r.Fingerprint != "" {
+		// A sealed body is a different byte string every time it is sealed, so the
+		// caller names what it holds and that name is what identifies the fact.
+		body = []byte(r.Fingerprint)
+	}
 	f := fact{
 		Class:      r.Class,
 		Trigger:    r.Trigger,
@@ -344,7 +362,7 @@ func (r Record) digest() string {
 		Reason:     r.Reason,
 		Inside:     r.Relationship,
 		Occurred:   r.Occurred.UTC().UnixMilli(),
-		Body:       r.Body,
+		Body:       body,
 		Assessment: r.Assessment,
 	}
 	if f.Assessment != nil {
