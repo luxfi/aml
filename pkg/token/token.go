@@ -121,6 +121,8 @@ type Vault struct {
 	org  string
 	seal cipher.AEAD
 	keys map[Domain][]byte
+	// mark keys the fingerprint of a sealed body. See Fingerprint.
+	mark []byte
 }
 
 // New derives an org's vault from root key material. It refuses an empty org,
@@ -163,7 +165,12 @@ func New(org string, root []byte) (*Vault, error) {
 		return nil, fmt.Errorf("token: gcm: %w", err)
 	}
 
-	return &Vault{org: org, seal: aead, keys: keys}, nil
+	mark, err := hkdf.Key(sha256.New, root, salt, "fingerprint", keyLen)
+	if err != nil {
+		return nil, fmt.Errorf("token: derive fingerprint: %w", err)
+	}
+
+	return &Vault{org: org, seal: aead, keys: keys, mark: mark}, nil
 }
 
 func allZero(b []byte) bool {
@@ -199,6 +206,28 @@ func (v *Vault) Seal(slot string, plain []byte) ([]byte, error) {
 		return nil, fmt.Errorf("token: nonce: %w", err)
 	}
 	return v.seal.Seal(nonce, nonce, plain, v.aad(slot)), nil
+}
+
+// Fingerprint is the stable name of what a Seal holds.
+//
+// A seal draws a fresh nonce every time, which is the right thing for
+// confidentiality and the wrong thing for identity: the same record sealed twice
+// is two different byte strings, so anything downstream that asks "is this the
+// same record I already have" by comparing sealed bytes answers no, always. That
+// is how a retried transaction became a conflict rather than a repeat.
+//
+// So the vault also names the plaintext, deterministically: an HMAC under a key
+// derived for nothing else, bound to the org and to the slot the record occupies.
+// Two seals of the same record in the same slot share a fingerprint; two
+// different records never do; and the value discloses nothing without the key, so
+// it can sit beside the sealed body in a row without becoming a way to confirm a
+// guess at what the body holds.
+func (v *Vault) Fingerprint(slot string, plain []byte) string {
+	mac := hmac.New(sha256.New, v.mark)
+	mac.Write(v.aad(slot))
+	mac.Write([]byte{0})
+	mac.Write(plain)
+	return hex.EncodeToString(mac.Sum(nil))
 }
 
 // Open decrypts a record sealed for this org and slot.

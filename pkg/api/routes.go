@@ -5,8 +5,10 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"log"
 	"net/http"
 	"sync"
@@ -19,11 +21,13 @@ import (
 	"github.com/luxfi/aml/pkg/cases"
 	"github.com/luxfi/aml/pkg/engine"
 	"github.com/luxfi/aml/pkg/history"
+	"github.com/luxfi/aml/pkg/receipt"
 	"github.com/luxfi/aml/pkg/replay"
 	"github.com/luxfi/aml/pkg/retention"
 	"github.com/luxfi/aml/pkg/sanctions"
 	"github.com/luxfi/aml/pkg/screen"
 	"github.com/luxfi/aml/pkg/token"
+	"github.com/luxfi/aml/pkg/topology"
 	"github.com/luxfi/aml/pkg/types"
 	"github.com/luxfi/aml/pkg/velocity"
 )
@@ -52,6 +56,11 @@ type Handler struct {
 	// Records is the retained record plane. Ingest refuses without it: a
 	// transaction that cannot be recorded must not be processed.
 	Records *retention.Ledger
+	// Receipts is what this tenant was already told about a transaction. Ingest
+	// refuses without it on the same terms as Records: an offer whose identity
+	// cannot be resolved cannot be processed, because a retry of it would be
+	// counted by every aggregate as a second transaction.
+	Receipts *receipt.Shelf
 	// Keys tokenises direct identifiers before they are retained, and opens
 	// sealed records for the reads that are entitled to them.
 	Keys *token.Keyring
@@ -66,6 +75,12 @@ type Handler struct {
 	// Anomaly scores whether a transaction is unusual for the entity, alongside
 	// the rules rather than instead of them. Nil runs on rules alone.
 	Anomaly *anomaly.Store
+	// Planes are the five record planes served alongside the engine: lists,
+	// suppressions, activations, the field catalog and the model plane. Each is
+	// optional and an absent one serves no route, because an empty answer from a
+	// plane nobody wired reads as an institution with no controls.
+	Planes Planes
+
 	// ClientID is this deployment's IAM application — the audience every token
 	// is pinned to. It is served by /v1/aml/config so the console reads its own
 	// identity from the engine that enforces it.
@@ -81,6 +96,23 @@ type Handler struct {
 	// jurisdiction is known — see the entity resolver above, which does not
 	// have one yet.
 	Limit float64
+
+	// Cores is the share of the machine every study and every replay together
+	// may take. It is the SAME budget the models plane holds, wired once in
+	// cmd/amld, because the CPU is one machine however many planes ask for it.
+	Cores *topology.Budget
+
+	// The expensive work, admitted one at a time per tenant. They are fields and
+	// not package state so that two handlers in one process are two deployments,
+	// and they are separate gates so that a rule replay, a model study and an
+	// offer of a transaction do not exclude each other. See gate.go.
+	replays gate
+	studies gate
+	// folds admits the row-bounded reads that are not pages — see costly.
+	folds gate
+	// offers is keyed by tenant AND transaction, so two offers of ONE transaction
+	// exclude each other and nothing else does.
+	offers gate
 }
 
 // reportLimit is the fallback reporting limit, in the unit the aggregates are
@@ -214,8 +246,15 @@ func (h *Handler) Register(se *core.ServeEvent) {
 	se.Router.POST("/v1/aml/sanctions/search", h.searchSanctions())
 	se.Router.GET("/v1/aml/sanctions/sources", h.screeningSources())
 	se.Router.GET("/v1/aml/catalog", h.catalog())
+	// One door for "is anything of mine quietly degraded". Every bound in this
+	// process can bind, and when one does an aggregate stops being kept or a model
+	// is not planted — neither of which raises an error, because refusing a
+	// payment because a cache is full would be the worse failure. Reaching a bound
+	// is allowed; reaching it quietly is not. See load.go.
+	se.Router.GET("/v1/aml/load", get(h, h.load))
 	se.Router.GET("/v1/aml/config", h.brandConfig())
 	se.Router.GET("/v1/aml/health", h.health())
+	h.registerPlanes(se)
 }
 
 // refuse answers an unauthenticated request. The reason is logged for the
@@ -269,11 +308,36 @@ func (h *Handler) health() func(e *core.RequestEvent) error {
 	}
 }
 
+// offered reads and bounds an ingest body.
+//
+// The bytes are read whole rather than streamed into the decoder because the
+// offer has to be NAMED before it is acted on — see pkg/receipt — and a stream
+// cannot be read twice.
+func offered(e *core.RequestEvent) ([]byte, error) {
+	body, err := io.ReadAll(io.LimitReader(e.Request.Body, maxBody+1))
+	if err != nil {
+		return nil, err
+	}
+	if len(body) > maxBody {
+		return nil, errTooBig
+	}
+	return body, nil
+}
+
+var errTooBig = errors.New("api: the request body is larger than this engine accepts")
+
 func (h *Handler) ingestTransaction() func(e *core.RequestEvent) error {
 	return func(e *core.RequestEvent) error {
 		orgID, err := h.tenant(e)
 		if err != nil {
 			return refuse(e, err)
+		}
+
+		body, err := offered(e)
+		if errors.Is(err, errTooBig) {
+			return fail(e, http.StatusRequestEntityTooLarge, "the request body is larger than this engine accepts")
+		} else if err != nil {
+			return fail(e, http.StatusBadRequest, "invalid request body")
 		}
 
 		// The relationship a transaction sits inside decides where its retention
@@ -287,7 +351,7 @@ func (h *Handler) ingestTransaction() func(e *core.RequestEvent) error {
 			// from an identifier, and customer screening has no input without one.
 			Entity types.Entity `json:"entity"`
 		}
-		if err := json.NewDecoder(e.Request.Body).Decode(&in); err != nil {
+		if err := json.Unmarshal(body, &in); err != nil {
 			return fail(e, http.StatusBadRequest, "invalid request body")
 		}
 		tx := in.Transaction
@@ -295,11 +359,64 @@ func (h *Handler) ingestTransaction() func(e *core.RequestEvent) error {
 			tx.ID = uuid.NewString()
 		}
 		tx.OrgID = orgID
-		now := time.Now().UTC()
-		tx.CreatedAt = now
-		tx.UpdatedAt = now
+		// Every identifier bounded, at the door, once. What is downstream of here
+		// keeps a fixed structure PER identifier — a ring of aggregate buckets, a
+		// catalog name, a record slot — so a bound on how many of them are held is
+		// a bound on memory only because this is a bound on how big one is. See
+		// types.MaxIdent.
+		if err := tx.Bounded(); err != nil {
+			return fail(e, http.StatusBadRequest, err.Error())
+		}
+		// The identity of this offer, resolved ONCE, here, before anything is read
+		// or written.
+		//
+		// The ledger has always recognised a retry. Nothing else did: the
+		// aggregates counted it, the history took a second row, the alerts were
+		// stored again and a second case was opened — and because the aggregates
+		// were written BEFORE the engine evaluated, the second offer of an
+		// unchanged transaction saw a window it had put itself in twice and could
+		// answer "block" where the first answered "allow". That retained a refusal
+		// under AMLR Art. 77(3) for a refusal the institution never made, and
+		// refused a customer's payment, because a client retried.
+		//
+		// So the identity gates every write and not just the ledger's, and the
+		// answer a caller was given is kept and returned unchanged. See
+		// pkg/receipt.
+		offer := receipt.Offer{Ref: tx.ID, Mark: receipt.Mark(body)}
+		if h.Receipts == nil {
+			return unavailable(e, "ingest", errNoReceipts)
+		}
+		// One offer of one transaction at a time. Two arriving together would
+		// both find no prior receipt and both do the work; the entry exists only
+		// while the offer is in flight and is keyed by the transaction, so no
+		// tenant waits on another and no transaction waits on a different one.
+		inflight := orgID + "\x00" + tx.ID
+		if !h.offers.enter(inflight) {
+			return fail(e, http.StatusTooManyRequests, "this transaction is already being answered")
+		}
+		defer h.offers.leave(inflight)
+
+		prior, answered, err := h.Receipts.Prior(e.Request.Context(), orgID, offer)
+		switch {
+		case errors.Is(err, receipt.ErrDiffers):
+			// A different transaction under an id this tenant has already used. It
+			// is the caller's to resolve and it will never clear on its own, so it
+			// is a conflict and not an outage: answered 503 it reads as "retry",
+			// and a client that retries a permanent refusal retries forever.
+			return fail(e, http.StatusConflict, "a different transaction is already retained under this id")
+		case err != nil:
+			return unavailable(e, "read receipt", err)
+		case answered:
+			return e.JSON(http.StatusOK, json.RawMessage(prior))
+		}
+
+		// One clock, and it is the transaction's own. A reception clock stamped
+		// here would go into the retained body, and the retained body is what
+		// identifies the fact — so the same transaction offered twice would be two
+		// different facts under one id and the retry would conflict forever. The
+		// ledger records when it took a record; see types.Transaction.Timestamp.
 		if tx.Timestamp.IsZero() {
-			tx.Timestamp = now
+			tx.Timestamp = time.Now().UTC()
 		}
 
 		// Normalise the value once, here, and overwrite whatever the caller sent.
@@ -400,15 +517,47 @@ func (h *Handler) ingestTransaction() func(e *core.RequestEvent) error {
 			return fail(e, http.StatusBadRequest, "transaction names no party to retain it under")
 		case errors.Is(err, retention.ErrRelationship):
 			return fail(e, http.StatusBadRequest, "unknown relationship")
+		case errors.Is(err, retention.ErrConflict):
+			// A different transaction under an id this tenant has already used. It
+			// is the caller's to resolve and it will never clear on its own, so it
+			// is a conflict and not an outage: answered 503 it reads as "retry",
+			// and a client that retries a permanent refusal retries forever.
+			return fail(e, http.StatusConflict, "a different transaction is already retained under this id")
 		case err != nil:
 			return unavailable(e, "retain transaction", err)
 		}
 
+		// Has this transaction been judged before?
+		//
+		// It has, if a process died between these writes and the answer: the work
+		// landed, no receipt was kept, and the caller — never answered — offered
+		// again. The receipt recognises every OTHER retry, so this is the narrow
+		// case it cannot, and every plane past this point answers it for itself
+		// rather than relying on being sequenced behind something that does.
+		//
+		// A second judgement of one transaction is not more evidence. The alerts on
+		// record are the judgement the institution made, so they are what this
+		// answer names and what the case that already exists cites.
+		judged := h.Alerts.judged(orgID, tx.ID)
+		h.Alerts.Add(tx.ID, alerts)
+		if judged {
+			alerts = h.Alerts.ByTx(orgID, tx.ID)
+		}
 		alertIDs := make([]string, len(alerts))
 		for i, a := range alerts {
 			alertIDs[i] = a.ID
 		}
-		h.Alerts.Add(tx.ID, alerts)
+
+		// The monitoring plane records what fired and decides what the response
+		// is: a suppression the institution declared lowers it, a rung the
+		// institution declared raises it, and every activation is written either
+		// way. It runs after the record is retained and after the alerts are
+		// stored, so the activation cannot outlive the evidence it names.
+		action, err = h.monitor(e.Request.Context(), orgID, tx, alerts, action)
+		if err != nil {
+			return unavailable(e, "record activations", err)
+		}
+		h.observe(orgID, tx)
 
 		result := struct {
 			types.EvalResult
@@ -418,13 +567,30 @@ func (h *Handler) ingestTransaction() func(e *core.RequestEvent) error {
 			Record:     record,
 		}
 
-		// On critical: auto-create case.
-		if action == types.ActionBlock || action == types.ActionReport {
+		// On critical: auto-create case, unless this transaction has already been
+		// judged. A case is an investigation of what a transaction did, so a
+		// second one for the same transaction is two analysts looking at one
+		// payment — and the first case already cites the evidence of record, which
+		// is what this offer's alerts were folded into. See AlertStore.add.
+		if !judged && (action == types.ActionBlock || action == types.ActionReport) {
 			c := h.Cases.Create(orgID, types.SeverityCritical, alertIDs, []string{tx.UserID})
 			result.CaseID = c.ID
 		}
 
-		return e.JSON(http.StatusOK, result)
+		// Keep the answer before giving it, and give exactly what was kept.
+		//
+		// Both halves matter. Kept first, because a caller that received an answer
+		// this engine has no record of would be counted twice on its next offer.
+		// Given from the kept bytes, because a retry is answered from them and a
+		// client must not be able to tell a retry from a first offer.
+		answer, err := json.Marshal(result)
+		if err != nil {
+			return unavailable(e, "encode the answer", err)
+		}
+		if err := h.Receipts.Keep(e.Request.Context(), orgID, offer, answer, time.Now().UTC()); err != nil {
+			return unavailable(e, "keep receipt", err)
+		}
+		return e.JSON(http.StatusOK, json.RawMessage(answer))
 	}
 }
 
@@ -531,11 +697,16 @@ func (h *Handler) addCaseEvent() func(e *core.RequestEvent) error {
 
 // resolution is a decision to close a case, and it carries what Art. 69(2)
 // requires of one.
+//
+// By is the analyst who took it, and it is a [types.Decider]: not on the wire,
+// written from the verified credential. Closing a case is the decision this whole
+// plane exists to record, and one attributed to whatever name a request body
+// carried is a retained assessment signed by nobody.
 type resolution struct {
-	Resolution string   `json:"resolution"`
-	Considered []string `json:"considered"`
-	Rationale  string   `json:"rationale"`
-	By         string   `json:"by"`
+	Resolution string        `json:"resolution"`
+	Considered []string      `json:"considered"`
+	Rationale  string        `json:"rationale"`
+	By         types.Decider `json:"-"`
 }
 
 // resolveCase closes a case against a retained assessment.
@@ -546,6 +717,10 @@ type resolution struct {
 // (AMLR Art. 77(1)(b); JMLSG 6.32), not a deleted row.
 func (h *Handler) resolveCase() func(e *core.RequestEvent) error {
 	return func(e *core.RequestEvent) error {
+		who, err := h.caller(e)
+		if err != nil {
+			return refuse(e, err)
+		}
 		c, orgID, err := h.caseOf(e)
 		switch {
 		case errors.Is(err, errNoCase):
@@ -558,6 +733,9 @@ func (h *Handler) resolveCase() func(e *core.RequestEvent) error {
 		if err := json.NewDecoder(e.Request.Body).Decode(&in); err != nil {
 			return fail(e, http.StatusBadRequest, "invalid request body")
 		}
+		// The decider, from the credential and after the body, exactly as the typed
+		// adapters do it for the record planes.
+		decide(&in, who.Subject)
 		if in.Resolution == "" {
 			return fail(e, http.StatusBadRequest, "resolution is required")
 		}
@@ -577,7 +755,7 @@ func (h *Handler) resolveCase() func(e *core.RequestEvent) error {
 			return unavailable(e, "retain assessment", err)
 		}
 
-		if err := h.Cases.Resolve(orgID, c.ID, in.Resolution, in.By, assessment); err != nil {
+		if err := h.Cases.Resolve(orgID, c.ID, in.Resolution, in.By.Trim(), assessment); err != nil {
 			return fail(e, http.StatusBadRequest, err.Error())
 		}
 		return e.JSON(http.StatusOK, map[string]string{
@@ -694,10 +872,10 @@ func (h *Handler) testRule() func(e *core.RequestEvent) error {
 		// One replay at a time per tenant. Rejecting is the honest answer: the
 		// caller asked for work that is already running, and queueing it would
 		// hold a connection open while the engine falls behind on ingest.
-		if !startReplay(orgID) {
+		if !h.replays.enter(orgID) {
 			return fail(e, http.StatusTooManyRequests, "a replay is already running for this tenant")
 		}
-		defer endReplay(orgID)
+		defer h.replays.leave(orgID)
 
 		var req struct {
 			DSL       string         `json:"dsl"`
@@ -730,13 +908,33 @@ func (h *Handler) testRule() func(e *core.RequestEvent) error {
 			}
 		}
 
+		// The same deadline a model study runs under, derived from the request's
+		// own context, so a client that goes away cancels the work.
+		ctx, stop := context.WithTimeout(e.Request.Context(), maxStudy)
+		defer stop()
+
 		var history replay.History = replay.Slice(req.Sample)
 		if len(req.Sample) == 0 {
+			// And the same share of the MACHINE, taken before the history is read.
+			//
+			// A replay over a tenant's whole retained history is the same work a
+			// model study is: a hundred thousand records opened, unmarshalled and
+			// evaluated, on the single-replica process that also has to answer
+			// ingest. The gate above bounds how many replays ONE tenant may have
+			// in flight; only the budget bounds how much of the machine every
+			// tenant's replays and studies together may take, and it is one budget
+			// for the process because the CPU is one machine. See topology.Budget.
+			held, err := h.Cores.Admit(ctx, 1)
+			if err != nil {
+				return fail(e, http.StatusTooManyRequests, "the engine is busy; try again")
+			}
+			defer held.Release()
+
 			vault, err := h.vault(orgID)
 			if err != nil {
 				return unavailable(e, "replay", err)
 			}
-			stored, err := h.history(orgID, vault)
+			stored, err := h.history(held, orgID, vault)
 			if err != nil {
 				return unavailable(e, "read history", err)
 			}
@@ -744,13 +942,15 @@ func (h *Handler) testRule() func(e *core.RequestEvent) error {
 		}
 
 		candidate := types.Rule{ID: "candidate", Name: "candidate", DSL: req.DSL}
-		report, err := replay.Run(e.Request.Context(), h.Engine.Evaluator(), history, candidate, incumbent)
+		report, err := replay.Run(ctx, Compiled{E: h.Engine.Evaluator()}, history, candidate, incumbent)
 		switch {
+		case errors.Is(err, context.DeadlineExceeded), errors.Is(ctx.Err(), context.DeadlineExceeded):
+			return fail(e, http.StatusBadRequest, "the replay did not finish inside its budget; replay a sample instead")
 		case errors.Is(err, replay.ErrEmpty):
 			return fail(e, http.StatusConflict, "no history to replay against")
 		case errors.Is(err, replay.ErrNoRule):
 			return fail(e, http.StatusBadRequest, "dsl is required")
-		case errors.Is(err, replay.ErrEval):
+		case errors.Is(err, replay.ErrRule), errors.Is(err, replay.ErrEval):
 			return fail(e, http.StatusBadRequest, err.Error())
 		case err != nil:
 			return unavailable(e, "replay", err)
@@ -800,20 +1000,21 @@ func (h *Handler) openRelationship() func(e *core.RequestEvent) error {
 			return fail(e, http.StatusBadRequest, "relationship names no party")
 		}
 
-		body, err := seal(vault, retention.ClassRelationship, in.Ref, in)
+		body, mark, err := seal(vault, retention.ClassRelationship, in.Ref, in)
 		if err != nil {
 			return unavailable(e, "seal relationship", err)
 		}
 
 		id, err := h.Records.Retain(retention.Record{
-			Org:      orgID,
-			Class:    retention.ClassRelationship,
-			Trigger:  retention.TriggerRelationshipEnd,
-			Ref:      in.Ref,
-			Nature:   in.Nature,
-			Parties:  party,
-			Occurred: in.Opened,
-			Body:     body,
+			Org:         orgID,
+			Class:       retention.ClassRelationship,
+			Trigger:     retention.TriggerRelationshipEnd,
+			Ref:         in.Ref,
+			Nature:      in.Nature,
+			Parties:     party,
+			Occurred:    in.Opened,
+			Body:        body,
+			Fingerprint: mark,
 		})
 		switch {
 		case errors.Is(err, retention.ErrNature):

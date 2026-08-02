@@ -301,6 +301,7 @@ func write(row *core.Record, r Record) {
 	row.Set(fieldExpiry, r.Expiry().UTC())
 	row.Set(fieldWritten, r.Written.UTC())
 	row.Set(fieldBody, base64.StdEncoding.EncodeToString(r.Body))
+	row.Set(fieldMark, r.Fingerprint)
 	row.Set(fieldAssess, r.Assessment)
 	row.Set(fieldExtended, r.Extended)
 	row.Set(fieldIdentity, r.identity)
@@ -320,6 +321,7 @@ func read(row *core.Record) (Record, error) {
 		Nature:       row.GetString(fieldNature),
 		Reason:       row.GetString(fieldReason),
 		Relationship: row.GetString(fieldInside),
+		Fingerprint:  row.GetString(fieldMark),
 		Occurred:     row.GetDateTime(fieldOccurred).Time(),
 		Ended:        row.GetDateTime(fieldEnded).Time(),
 		Start:        row.GetDateTime(fieldStart).Time(),

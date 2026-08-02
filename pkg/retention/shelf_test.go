@@ -181,6 +181,40 @@ func TestRecordsSurviveARestart(t *testing.T) {
 	}
 }
 
+// ledgersOwn names the fields a caller does not supply. The ledger sets each one,
+// so the fixture below leaves it zero on the way in and the round trip compares it
+// against what came back. Every OTHER field has to be set to a distinguishable
+// value, or the comparison is zero against zero and proves nothing — which is
+// exactly how a field with no column reads as kept.
+var ledgersOwn = map[string]bool{
+	"ID":       true, // minted here
+	"Start":    true, // the retention clock, started by the trigger or by Close
+	"Ended":    true, // set by Close, on a relationship
+	"Written":  true, // the reception clock
+	"Extended": true, // set by Extend, after the write
+}
+
+// everyFieldSet refuses a fixture that leaves a field of Record at its zero value.
+//
+// It is the guard on the guard. A round trip that compares a field nobody set
+// compares zero against zero, so it passes whether or not the shelf keeps the
+// field — and a field the durable shelf does not keep is a fact that exists in
+// memory and nowhere else. Reflection rather than a list, so a field ADDED to
+// Record fails here until somebody decides which side of the line it is on.
+func everyFieldSet(t *testing.T, r Record) {
+	t.Helper()
+	v := reflect.ValueOf(r)
+	for i := range v.NumField() {
+		f := v.Type().Field(i)
+		if !f.IsExported() || ledgersOwn[f.Name] {
+			continue
+		}
+		if v.Field(i).IsZero() {
+			t.Fatalf("Record.%s is zero in the round-trip fixture, so this test cannot tell a shelf that keeps it from one that does not. Set it to a distinguishable value, or name it in ledgersOwn and say why the ledger owns it.", f.Name)
+		}
+	}
+}
+
 // TestEveryFieldSurvivesTheRoundTrip: a column the writer forgets to set does not
 // fail, it reads back empty — and an empty field in a retained record is a
 // transaction that can no longer be reconstructed. So a record with every field
@@ -208,6 +242,7 @@ func TestEveryFieldSurvivesTheRoundTrip(t *testing.T) {
 		Parties:      []string{"subject:p1", "name:ivan petrov"},
 		Occurred:     ago(3),
 		Body:         []byte{0x00, 0x01, 0xff, 0xfe, '{', '}'},
+		Fingerprint:  "fp-tx-full",
 		Assessment: &Assessment{
 			Alerts:     []string{"alert-1", "alert-2"},
 			Case:       "case-1",
@@ -218,6 +253,7 @@ func TestEveryFieldSurvivesTheRoundTrip(t *testing.T) {
 			At:         decided,
 		},
 	}
+	everyFieldSet(t, full)
 	id, err := l.Retain(full)
 	if err != nil {
 		t.Fatalf("Retain: %v", err)
@@ -296,6 +332,48 @@ func TestRetryDoesNotRetainTwice(t *testing.T) {
 	}
 	if repeated != refused {
 		t.Errorf("refusal retry returned %s, want %s", repeated, refused)
+	}
+}
+
+// TestRetryOfASealedRecordIsStillOneRecord: the retry a production caller actually
+// makes.
+//
+// A sealed body is a different byte string every time it is sealed, so the second
+// offer of ONE transaction cannot be recognised by its bytes. The caller names what
+// it holds — [Record.Fingerprint] — and that name is what the digest compares. If
+// the shelf does not keep the name, the prior record reads back with none, the
+// digest compares a sealed body against a fingerprint, and the two can never agree:
+// every retry of one transaction is a permanent conflict.
+func TestRetryOfASealedRecordIsStillOneRecord(t *testing.T) {
+	l := fresh(t)
+
+	offer := func(sealed []byte, mark string) (string, error) {
+		return l.Retain(Record{
+			Org: org, Class: ClassTransaction, Trigger: TriggerOccasional,
+			Ref: "tx-sealed", Parties: []string{"subject:p1"}, Occurred: ago(1),
+			Body: sealed, Fingerprint: mark,
+		})
+	}
+
+	first, err := offer([]byte("sealed under nonce one"), "fp-tx-sealed")
+	if err != nil {
+		t.Fatalf("first offer: %v", err)
+	}
+	again, err := offer([]byte("sealed under nonce two"), "fp-tx-sealed")
+	if err != nil {
+		t.Fatalf("retry of one transaction: %v", err)
+	}
+	if again != first {
+		t.Errorf("retry returned %s, want the record it already wrote %s", again, first)
+	}
+	if held := mustLen(t, l); held != 1 {
+		t.Fatalf("ledger holds %d records after one transaction and a retry", held)
+	}
+
+	// And the refusal the fingerprint must not weaken: a DIFFERENT fact under the
+	// same reference is still two facts under one name.
+	if _, err := offer([]byte("sealed under nonce three"), "fp-something-else"); !errors.Is(err, ErrConflict) {
+		t.Fatalf("a different transaction under one id = %v, want ErrConflict", err)
 	}
 }
 
