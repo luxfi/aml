@@ -176,9 +176,12 @@ type Point struct {
 // policy over probabilities converts once, at the boundary, rather than making
 // every metric here depend on a map that may not exist.
 //
-// cal may be an unfitted zero Map: Brier is then absent and everything else is
-// unaffected, since every other metric here is a rank statistic.
-func Measure(obs []Observation, threshold float64, cost policy.Cost, cal calibrate.Map) Metrics {
+// cal may be the zero Reader — no calibration, or one whose shape has moved.
+// Brier is then absent and everything else is unaffected, since every other
+// metric here is a rank statistic. It is a READER and not a Map because the
+// question "does this map apply to these coordinates" is answered once, at the
+// boundary that knows the live shape, and never re-asked here.
+func Measure(obs []Observation, threshold float64, cost policy.Cost, cal calibrate.Reader) Metrics {
 	m := Metrics{Rows: len(obs)}
 	judged := make([]Observation, 0, len(obs))
 	for _, o := range obs {
@@ -236,10 +239,8 @@ func Measure(obs []Observation, threshold float64, cost policy.Cost, cal calibra
 			m.Refusal = "the stated prices cannot be multiplied by this many observations without overflowing, so no cost is reported"
 		}
 	}
-	if cal.Fitted() {
-		if b, ok := brier(judged, cal); ok {
-			m.Brier = ptr(round6(b))
-		}
+	if b, ok := brier(judged, cal); ok {
+		m.Brier = ptr(round6(b))
 	}
 	return m
 }
@@ -529,13 +530,13 @@ func averagePrecision(judged []Observation) float64 {
 // brier is the mean squared error of the calibration on these observations. It
 // is the out-of-sample number when the caller passes data the map was not fitted
 // on, which is the only version of it worth reporting.
-func brier(judged []Observation, cal calibrate.Map) (float64, bool) {
+func brier(judged []Observation, cal calibrate.Reader) (float64, bool) {
+	if !cal.Fitted() {
+		return 0, false
+	}
 	var sum, w float64
 	for _, o := range judged {
-		p, err := cal.P(o.Score, cal.Shape)
-		if err != nil {
-			return 0, false
-		}
+		p := cal.P(o.Score)
 		y := 0.0
 		if o.productive() {
 			y = 1

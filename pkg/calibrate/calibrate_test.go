@@ -31,13 +31,13 @@ func TestIsotonicRecoversTheTrueProbability(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	r, err := m.Under(shape)
+	if err != nil {
+		t.Fatal(err)
+	}
 	var worst float64
 	for _, s := range []float64{0.05, 0.15, 0.3, 0.5, 0.7, 0.85, 0.95} {
-		got, err := m.P(s, shape)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if d := math.Abs(got - truth(s)); d > worst {
+		if d := math.Abs(r.P(s) - truth(s)); d > worst {
 			worst = d
 		}
 	}
@@ -61,13 +61,14 @@ func TestFitIsMonotone(t *testing.T) {
 		if err != nil {
 			t.Fatalf("%s: %v", method, err)
 		}
+		r, err := m.Under(shape)
+		if err != nil {
+			t.Fatalf("%s: %v", method, err)
+		}
 		prev := -1.0
 		for i := range 1001 {
 			s := float64(i) / 1000
-			p, err := m.P(s, shape)
-			if err != nil {
-				t.Fatalf("%s: %v", method, err)
-			}
+			p := r.P(s)
 			if p < prev-1e-12 {
 				t.Fatalf("%s: not monotone — p(%g)=%g after %g", method, s, p, prev)
 			}
@@ -112,14 +113,17 @@ func TestMapRefusesAnotherModelShape(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := m.P(0.5, shape); err != nil {
+	if _, err := m.Under(shape); err != nil {
 		t.Fatalf("refused its own shape: %v", err)
 	}
-	if _, err := m.P(0.5, "sha256:a-tenth-feature-was-added"); !errors.Is(err, ErrShape) {
-		t.Fatalf("answered under a different shape (err=%v); a moved feature space would go unnoticed", err)
+	if _, err := m.Under("sha256:a-tenth-feature-was-added"); !errors.Is(err, ErrShape) {
+		t.Fatalf("bound under a different shape (err=%v); a moved feature space would go unnoticed", err)
 	}
-	if _, err := m.P(0.5, ""); !errors.Is(err, ErrNoShape) {
-		t.Fatalf("answered with no shape stated (err=%v)", err)
+	if _, err := m.Under(""); !errors.Is(err, ErrNoShape) {
+		t.Fatalf("bound with no shape stated (err=%v)", err)
+	}
+	if _, err := (Map{}).Under(shape); !errors.Is(err, ErrNotFitted) {
+		t.Fatalf("bound an unfitted map (err=%v)", err)
 	}
 	if _, err := Fit(stream(1000, 3, func(s float64) float64 { return s }), Isotonic, ""); !errors.Is(err, ErrNoShape) {
 		t.Fatal("fitted a map that cannot refuse to be misapplied")
@@ -167,14 +171,11 @@ func TestPlattStaysInsideTheOpenInterval(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	hi, err := m.P(1, shape)
+	r, err := m.Under(shape)
 	if err != nil {
 		t.Fatal(err)
 	}
-	lo, err := m.P(0, shape)
-	if err != nil {
-		t.Fatal(err)
-	}
+	hi, lo := r.P(1), r.P(0)
 	if hi >= 1 || lo <= 0 {
 		t.Fatalf("the fit reached certainty: p(0)=%g p(1)=%g", lo, hi)
 	}
@@ -191,7 +192,11 @@ func TestReliabilityReportsAbsenceNotZero(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	bins := Reliability(stream(3000, 6, func(s float64) float64 { return 0.5 * s }), m, 10)
+	r, err := m.Under(shape)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bins := Reliability(stream(3000, 6, func(s float64) float64 { return 0.5 * s }), r, 10)
 	if len(bins) != 10 {
 		t.Fatalf("%d bins, want 10", len(bins))
 	}
@@ -230,16 +235,17 @@ func TestCalibrationImprovesBrier(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	r, err := m.Under(shape)
+	if err != nil {
+		t.Fatal(err)
+	}
 	var fitted, raw float64
 	for _, s := range test {
 		y := 0.0
 		if s.Productive {
 			y = 1
 		}
-		p, err := m.P(s.Score, shape)
-		if err != nil {
-			t.Fatal(err)
-		}
+		p := r.P(s.Score)
 		fitted += (p - y) * (p - y)
 		raw += (s.Score - y) * (s.Score - y)
 	}
@@ -247,5 +253,132 @@ func TestCalibrationImprovesBrier(t *testing.T) {
 	raw /= float64(len(test))
 	if fitted >= raw {
 		t.Fatalf("calibrated Brier %.4f is no better than the raw score's %.4f", fitted, raw)
+	}
+}
+
+// THE TIE TEST, and the one that matters most in production. The scores this
+// package is asked to calibrate are not a continuum: a decision score is
+// 1 - prod(1-weight) over a FIXED set of rule weights, rounded to four places,
+// so thousands of decisions land on a handful of atoms and the modal atom is
+// exactly zero.
+//
+// Isotonic regression assigns ONE value per score, so every sample sharing a
+// score is one block before the algorithm starts. Fed sample by sample instead,
+// the run of unproductive-then-productive at a tied score is already
+// non-decreasing, nothing merges, and each plateau ends up reported as whichever
+// label sorted last — 1 at every plateau that holds a positive. The map then
+// says CERTAINTY at the top of the range, which is where declines happen.
+func TestIsotonicPoolsTiedScores(t *testing.T) {
+	atoms := []struct {
+		score        float64
+		clean, fraud int
+	}{
+		{0.00, 900, 2},  // 0.002217
+		{0.35, 190, 10}, // 0.05
+		{0.50, 85, 15},  // 0.15
+		{0.70, 45, 55},  // 0.55
+		{0.90, 10, 40},  // 0.80
+	}
+	var s []Sample
+	for _, a := range atoms {
+		for range a.clean {
+			s = append(s, Sample{Score: a.score})
+		}
+		for range a.fraud {
+			s = append(s, Sample{Score: a.score, Productive: true})
+		}
+	}
+	m, err := Fit(s, Isotonic, shape)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r, err := m.Under(shape)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The observed rates are already non-decreasing, so pooling alone is the
+	// whole fit and the map must reproduce them exactly. Nothing here is a
+	// tolerance on statistical noise: this is arithmetic.
+	for _, a := range atoms {
+		want := round6(float64(a.fraud) / float64(a.clean+a.fraud))
+		if got := r.P(a.score); math.Abs(got-want) > 1e-6 {
+			t.Errorf("score %.2f -> %.6f, want %.6f (%d productive of %d)",
+				a.score, got, want, a.fraud, a.clean+a.fraud)
+		}
+	}
+	// One knot per distinct score, no more: a plateau is one place on the map.
+	if len(m.Knots) != len(atoms) {
+		t.Errorf("%d knots over %d distinct scores; ties were not pooled into blocks",
+			len(m.Knots), len(atoms))
+	}
+}
+
+// A tie whose samples arrive in the other order is the same evidence and must
+// produce the same map. Pooling makes that true by construction; ordering the
+// sort by class makes it look true without being true.
+func TestTiedFitDoesNotDependOnLabelOrder(t *testing.T) {
+	build := func(positiveFirst bool) []Sample {
+		var s []Sample
+		for _, sc := range []float64{0.1, 0.4, 0.8} {
+			pos, neg := 20, 30
+			if sc == 0.8 {
+				pos, neg = 40, 10
+			}
+			if positiveFirst {
+				for range pos {
+					s = append(s, Sample{Score: sc, Productive: true})
+				}
+				for range neg {
+					s = append(s, Sample{Score: sc})
+				}
+				continue
+			}
+			for range neg {
+				s = append(s, Sample{Score: sc})
+			}
+			for range pos {
+				s = append(s, Sample{Score: sc, Productive: true})
+			}
+		}
+		return s
+	}
+	a, err := Fit(build(false), Isotonic, shape)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := Fit(build(true), Isotonic, shape)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if a.Digest != b.Digest {
+		t.Fatalf("the same tied evidence in two orders produced two maps: %.12s vs %.12s", a.Digest, b.Digest)
+	}
+	ra, _ := a.Under(shape)
+	if got := ra.P(0.1); math.Abs(got-0.4) > 1e-6 {
+		t.Errorf("p(0.1) = %.6f, want 0.4 (20 productive of 50)", got)
+	}
+}
+
+// A reader that cannot answer draws no chart. The reliability report IS the map
+// applied to every row, so shipping one beside a refusal states in a picture
+// exactly what the prose has just refused to state.
+func TestReliabilityRefusesWhenTheMapDoes(t *testing.T) {
+	m, err := Fit(stream(2000, 13, func(s float64) float64 { return s }), Isotonic, shape)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rows := stream(2000, 14, func(s float64) float64 { return s })
+	if _, err := m.Under("sha256:a-rule-was-written"); !errors.Is(err, ErrShape) {
+		t.Fatalf("bound under a moved shape: %v", err)
+	}
+	if bins := Reliability(rows, Reader{}, 10); len(bins) != 0 {
+		t.Errorf("a map that refuses to answer shipped %d reliability bins", len(bins))
+	}
+	good, err := m.Under(shape)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bins := Reliability(rows, good, 10); len(bins) != 10 {
+		t.Fatalf("the bound reader drew %d bins, want 10", len(bins))
 	}
 }
