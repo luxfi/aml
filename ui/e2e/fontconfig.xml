@@ -1,0 +1,34 @@
+<?xml version="1.0"?>
+<!DOCTYPE fontconfig SYSTEM "urn:fontconfig:fonts.dtd">
+<!--
+  The machine, with no Geist on it.
+
+  This suite proves the console fetches Geist and renders in it. That proof is
+  worthless on a developer machine that has Geist INSTALLED — and this one does,
+  and so does anyone else's who has ever installed it. With a local Geist the
+  renderer resolves the family without a single byte crossing the wire,
+  `CSS.getPlatformFontsForNode` reports "Geist", and every assertion in
+  e2e/font.spec.ts passes against a build with no webfont at all. That is the
+  precise shape of the bug this whole change exists to close: a font that looks
+  right locally and is a serif in production.
+
+  So Chromium is pointed at this fontconfig instead of the machine's, and it
+  names only the distribution's font directory. /usr/local/share/fonts, where a
+  hand-installed Geist lands, is not in it, so the browser has no way to obtain
+  the face except the one production uses.
+
+  This file is not taken on trust. `the face on screen came over the wire` in
+  e2e/font.spec.ts blocks the CDN and asserts the console is then NOT in Geist:
+  if a local copy were still visible, that test fails, and it is the reason this
+  one can be believed.
+
+  It stays a font environment rather than a stripped one: the distribution's own
+  rules are included, so the fallbacks the stacks name (`system-ui`,
+  `ui-monospace`, `monospace`) resolve to what they resolve to anywhere else.
+  What is isolated is Geist and nothing else.
+-->
+<fontconfig>
+  <dir>/usr/share/fonts</dir>
+  <cachedir prefix="xdg">fontconfig</cachedir>
+  <include ignore_missing="yes">/etc/fonts/conf.d</include>
+</fontconfig>

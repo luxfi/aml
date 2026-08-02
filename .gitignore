@@ -8,7 +8,6 @@
 *.db-shm
 .env
 ui/dist/
-ui/dist-offline/
 ui/node_modules/
 ui/tsconfig.tsbuildinfo
 ui/test-results/

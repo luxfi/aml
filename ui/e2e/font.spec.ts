@@ -1,5 +1,5 @@
-// The typeface: that it arrives, that it is the one on the screen, and what it
-// costs the policy.
+// The typeface: that it arrives, that it is the one on the screen, that it is
+// the kit's rather than this console's, and what it costs the policy.
 //
 // A font is the easiest thing in a front end to be wrong about quietly. A
 // family the browser cannot resolve is not an error — it silently takes the
@@ -17,23 +17,43 @@
 //     Times New Roman, whatever the stylesheet says.
 //   - the request log, which says where the bytes came from and how often.
 //
-// The faces are served by e2e/cdn.ts, from the `geist` package at the version
-// the bundle pins, so the run is offline and the cross-origin request is still
+// One warning for whoever runs this by hand: Geist may also be INSTALLED on the
+// machine, and then the renderer resolves `Geist` locally and every assertion
+// below passes with no webfont at all. playwright.config.ts therefore runs
+// Chromium under a fontconfig that cannot see it (e2e/fontconfig.xml), and
+// `the face on screen came over the wire` is the control that proves it worked.
+//
+// The faces are served by e2e/cdn.ts, from the `geist` package at the release
+// the KIT names, so the run is offline and the cross-origin request is still
 // genuinely made and still has to pass `font-src`.
 
+import {
+  GEIST_CDN_ORIGIN,
+  GEIST_VERSION,
+  geistMono,
+  geistPreloadHrefs,
+  geistSans,
+} from '@hanzogui/font-geist'
 import { expect, test, type Page } from '@playwright/test'
-import { readFileSync } from 'node:fs'
+import { readdirSync, readFileSync } from 'node:fs'
+import { join } from 'node:path'
 
-import { cdn, dir, faces, lead } from '../src/font'
+import { published, serveFonts } from './cdn'
 import { signIn } from './session'
 
 const csp = readFileSync(new URL('../csp.txt', import.meta.url), 'utf8').trim()
+
+/** The family a stack leads with, unquoted. */
+const lead = (stack: string): string => (stack.split(',')[0] ?? '').trim().replace(/^["']|["']$/g, '')
 
 /** The two stacks as the document holds them, and the family each one leads with. */
 async function stacks(page: Page) {
   const [sans, mono] = await page.evaluate(() => {
     const root = getComputedStyle(document.documentElement)
-    return [root.getPropertyValue('--hz-font-sans').trim(), root.getPropertyValue('--hz-font-mono').trim()]
+    return [
+      root.getPropertyValue('--hz-font-sans').trim(),
+      root.getPropertyValue('--hz-font-mono').trim(),
+    ]
   })
   return { sans, mono, sansFace: lead(sans), monoFace: lead(mono) }
 }
@@ -83,9 +103,9 @@ test.describe('the typeface', () => {
     // Once each. Both files are preloaded; a preload whose CORS mode disagrees
     // with the fetch that follows is not a saved request but a duplicated one,
     // and the only way to tell is to count.
-    for (const f of faces) {
-      const hits = seen.filter((r) => r.url === `${cdn}${dir}/${f.file}`)
-      expect(hits.length, `${f.file} was fetched ${hits.length} times`).toBe(1)
+    for (const href of geistPreloadHrefs()) {
+      const hits = seen.filter((r) => r.url === href)
+      expect(hits.length, `${href} was fetched ${hits.length} times`).toBe(1)
       expect(hits[0].type).toBe('font')
     }
   })
@@ -96,15 +116,22 @@ test.describe('the typeface', () => {
     await expect(page.locator('nav.rail')).toBeVisible()
     await page.evaluate(() => document.fonts.ready)
 
-    // What the stylesheet asks for. Geist Sans is the UI face and Geist Mono
-    // the monospace one across the fleet, so the two stacks are pinned by name
-    // and not merely to each other — and the tail is pinned too, because the
-    // whole point of the fallback is what happens when Geist does not arrive
-    // and the one answer that is never acceptable is the browser's default.
+    // What the stylesheet asks for, and that it is what the KIT asks for. The
+    // two stacks in the document must be @hanzo/gui's own strings, because the
+    // whole point of the change that put them there is that this console no
+    // longer has a typeface of its own to drift with.
     const { sans, mono, sansFace, monoFace } = await stacks(page)
-    expect(sansFace, 'the UI face is not Geist').toMatch(/^Geist( Sans)?$/)
+    expect(sans, 'the sans stack is not the kit’s').toBe(geistSans)
+    expect(mono, 'the mono stack is not the kit’s').toBe(geistMono)
+    expect(sansFace, 'the UI face is not Geist').toBe('Geist')
     expect(monoFace, 'the monospace face is not Geist Mono').toBe('Geist Mono')
-    expect(sans, 'the sans stack can fall back to a serif').toMatch(/(^|,\s*)(ui-sans-serif|system-ui)\b/)
+
+    // The tail is pinned too, because the whole point of the fallback is what
+    // happens when Geist does not arrive, and the one answer that is never
+    // acceptable is the browser's default.
+    expect(sans, 'the sans stack can fall back to a serif').toMatch(
+      /(^|,\s*)(ui-sans-serif|system-ui)\b/,
+    )
     expect(sans.trimEnd()).toMatch(/sans-serif$/)
     expect(mono.trimEnd(), 'the mono stack can fall back to a serif').toMatch(/monospace$/)
 
@@ -117,12 +144,11 @@ test.describe('the typeface', () => {
     // correct CSS can fake, because the answer comes from the rasteriser.
     //
     // What it reports is the family name INSIDE the woff2, which is not the
-    // name the @font-face registered it under: a CSS family name is an alias,
-    // and Vercel ships the UI face with `Geist` in it whatever a stack chooses
-    // to call it. So these two pin the FILE, the assertions above pin the
-    // ALIAS, and together they say the stack asked for a face and was given
-    // this one. They are also what separates "Geist arrived" from "something
-    // arrived": a fallback here reads DejaVu Sans, or Times New Roman.
+    // name the @font-face registered it under: a CSS family name is an alias.
+    // So these two pin the FILE, the assertions above pin the ALIAS, and
+    // together they say the stack asked for a face and was given this one. They
+    // are also what separates "Geist arrived" from "something arrived": a
+    // fallback here reads DejaVu Sans, or Times New Roman.
     //
     // The heading takes its family from nothing but the document, so what it is
     // set in is what body resolved to; it is measured instead of body because
@@ -136,11 +162,6 @@ test.describe('the typeface', () => {
     // `.mono` ties with those on specificity and loses on order, so machine
     // text asked for through the kit came out in the UI face — a rate in
     // proportional digits, in a column, which is exactly where it shows.
-    //
-    // Asked of a real kit element rather than of a fixture, because which
-    // screens happen to render a Mono depends on which data came back, and the
-    // cascade does not. Marking one is a CSSOM call from a script that already
-    // passed script-src, so the policy is not involved.
     const seam = await page.evaluate(() => {
       // `.font_body` is precisely the class the kit's own font-family rule is
       // written against, so this is the element the collision is about and not
@@ -153,7 +174,52 @@ test.describe('the typeface', () => {
     })
     expect(seam, 'no kit-rendered element was found to test the seam with').not.toBeNull()
     expect(lead(seam!.was), 'a kit element is not in the sans stack to begin with').toBe(sansFace)
-    expect(lead(seam!.now), 'a kit element marked as machine text is not in the mono stack').toBe(monoFace)
+    expect(lead(seam!.now), 'a kit element marked as machine text is not in the mono stack').toBe(
+      monoFace,
+    )
+  })
+
+  test('the face on screen came over the wire', async ({ page }) => {
+    // The negative control, and the reason every assertion above can be
+    // believed.
+    //
+    // Geist is INSTALLED on plenty of machines, this one included. Where it is,
+    // the renderer resolves the family with no webfont at all and the whole of
+    // this file passes against a console that fetches nothing — which is
+    // exactly the failure it was written to catch, wearing the costume of a
+    // pass. e2e/fontconfig.xml exists to take the local copy away; this proves
+    // it did, by removing the only other source and watching the face change.
+    //
+    // Nothing about the console is altered: the same bundle, the same rules,
+    // the same policy. Only the CDN is unreachable, which is a thing that
+    // happens.
+    //
+    // After signIn, which installs the mock CDN: a later route wins, so this
+    // has to be registered second or it is the mock that answers and this test
+    // proves nothing. It did, once.
+    await signIn(page)
+    await page.route(`${GEIST_CDN_ORIGIN}/**`, (route) => route.abort())
+    await page.goto('/cases')
+    await expect(page.locator('nav.rail')).toBeVisible()
+    await page.evaluate(() => document.fonts.ready.catch(() => undefined))
+
+    // The stack is unchanged — it still ASKS for Geist, which is the whole
+    // reason getComputedStyle cannot answer this question — and the renderer
+    // has fallen through it to something else.
+    const { sans } = await stacks(page)
+    expect(sans, 'the stack changed; this is not the same console').toBe(geistSans)
+
+    const face = await rendered(page, '.bar h1')
+    expect(
+      face,
+      'Geist rendered with the CDN blocked: it is installed on this machine and ' +
+        'e2e/fontconfig.xml is not taking it away, so every other assertion here is vacuous',
+    ).not.toBe('Geist')
+
+    // And the fall is onto a sans face. A stack that ends in `sans-serif`
+    // exists so that the answer is never the browser's default, which is the
+    // serif the console shipped with.
+    expect(face, 'the fallback is a serif').not.toMatch(/serif$/i)
   })
 
   test('quantities are set on a fixed advance', async ({ page }) => {
@@ -175,7 +241,10 @@ test.describe('the typeface', () => {
 
     const off = await quantities.evaluateAll((els) =>
       els
-        .map((el) => ({ text: (el.textContent ?? '').trim().slice(0, 16), v: getComputedStyle(el).fontVariantNumeric }))
+        .map((el) => ({
+          text: (el.textContent ?? '').trim().slice(0, 16),
+          v: getComputedStyle(el).fontVariantNumeric,
+        }))
         .filter((x) => !x.v.includes('tabular-nums')),
     )
     expect(off, 'a quantity is set in proportional figures').toEqual([])
@@ -199,13 +268,19 @@ test.describe('the typeface', () => {
     // change adds to the second, so that is what is pinned: every subresource
     // fetched from another origin is a font, and every one of them is ours.
     const loads = away.filter((r) => r.type !== 'xhr' && r.type !== 'fetch')
-    expect([...new Set(loads.map((r) => new URL(r.url).origin))]).toEqual([cdn])
+    expect([...new Set(loads.map((r) => new URL(r.url).origin))]).toEqual([GEIST_CDN_ORIGIN])
     expect([...new Set(loads.map((r) => r.type))]).toEqual(['font'])
 
     // And the CDN is asked for the two files and for nothing else — no
     // stylesheet, no script, no beacon riding along on the host we just let in.
-    const paths = [...new Set(away.filter((r) => new URL(r.url).origin === cdn).map((r) => new URL(r.url).pathname))]
-    expect(paths.sort()).toEqual(faces.map((f) => `${dir}/${f.file}`).sort())
+    const paths = [
+      ...new Set(
+        away
+          .filter((r) => new URL(r.url).origin === GEIST_CDN_ORIGIN)
+          .map((r) => new URL(r.url).pathname),
+      ),
+    ]
+    expect(paths.sort()).toEqual([...published].sort())
   })
 
   test('no face, and no preload, is refused by the policy', async ({ page }) => {
@@ -218,7 +293,8 @@ test.describe('the typeface', () => {
       )
     })
     page.on('console', (m) => {
-      if (/Content Security Policy|Refused to (apply|load|execute)/i.test(m.text())) refusals.push(m.text())
+      if (/Content Security Policy|Refused to (apply|load|execute)/i.test(m.text()))
+        refusals.push(m.text())
     })
     page.on('requestfailed', (r) => refusals.push(`failed ${r.url()} ${r.failure()?.errorText}`))
 
@@ -231,24 +307,54 @@ test.describe('the typeface', () => {
     expect(refusals).toEqual([])
   })
 
+  test('the console names no typeface of its own', () => {
+    // The deletion IS the change. Every fact about the typeface — the families,
+    // the release, the origin, the files, the @font-face rules — belongs to
+    // @hanzo/gui, so that this console and the other hundred properties cannot
+    // be set in different things. A stack copied back in here would not fail:
+    // it would quietly stop matching, which is precisely why it is checked
+    // rather than intended.
+    //
+    // Two shapes are forbidden, and they are the only two ways a typeface can
+    // be re-stated: an @font-face RULE (delivery — which release, which files,
+    // which origin) and a QUOTED family (the stack). Prose may name Geist and
+    // an import specifier must, so neither is what is matched; a CSS family
+    // token is always quoted, and a rule is always followed by its brace.
+    const src = new URL('../src/', import.meta.url).pathname
+    const walk = (at: string): string[] =>
+      readdirSync(at, { withFileTypes: true }).flatMap((e) =>
+        e.isDirectory() ? walk(join(at, e.name)) : [join(at, e.name)],
+      )
+
+    const files = walk(src)
+    expect(files.length, 'no sources were read').toBeGreaterThan(5)
+    const offend = (rule: RegExp) =>
+      files.filter((f) => rule.test(readFileSync(f, 'utf8'))).map((f) => f.slice(src.length))
+
+    expect(offend(/@font-face\s*\{/), 'a source installs a face of its own').toEqual([])
+    expect(offend(/["']Geist/i), 'a source writes a Geist family').toEqual([])
+  })
+
   test('the two URLs are the ones the fleet publishes', () => {
     // Written out in full, on purpose, and this is the one place in the suite
-    // that does not derive them from src/font.ts.
+    // that does not derive them from the kit.
     //
-    // These are not this console's to choose. They are the fleet's: the same
-    // two files, at the same two URLs, cached once for every Hanzo property,
-    // published to our CDN by the kit track. A console that quietly renames a
-    // file still passes every other test here — its own mock serves whatever it
-    // asks for — and then 404s in production against the real CDN. So the
-    // contract is stated where changing it means editing the agreement.
+    // These are not this console's to choose, nor even the kit's to change
+    // quietly. They are the fleet's: the same two files, at the same two URLs,
+    // cached once for every Hanzo property, published to our CDN by the kit
+    // track. A kit release that renamed a file still passes every other test
+    // here — the mock serves whatever is asked for — and then 404s in
+    // production against the real CDN. So the contract is stated where changing
+    // it means editing the agreement.
     //
     // Immutable by version: nothing at these paths is ever rewritten, which is
     // what earns them `max-age=31536000, immutable`. A new Geist is a new
     // directory beside this one, never a new file inside it.
-    expect(faces.map((f) => `${cdn}${dir}/${f.file}`)).toEqual([
+    expect(geistPreloadHrefs()).toEqual([
       'https://cdn.hanzo.ai/fonts/geist/1.7.2/GeistVariable.woff2',
       'https://cdn.hanzo.ai/fonts/geist/1.7.2/GeistMonoVariable.woff2',
     ])
+    expect(GEIST_VERSION).toBe('1.7.2')
   })
 
   test('the CDN costs the policy exactly one host, in exactly one directive', () => {
@@ -269,7 +375,9 @@ test.describe('the typeface', () => {
 
     expect(directives.get('font-src')).toBe("'self' https://cdn.hanzo.ai")
     expect(directives.get('default-src')).toBe("'none'")
-    expect(directives.get('style-src')).toBe("'self' 'sha256-47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU='")
+    expect(directives.get('style-src')).toBe(
+      "'self' 'sha256-47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU='",
+    )
     expect(directives.get('script-src')).toBe("'self'")
     expect(csp).not.toContain('unsafe-inline')
     expect(csp).not.toContain('unsafe-eval')
