@@ -14,8 +14,6 @@ import (
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/hanzoai/base/core"
 
-	"github.com/luxfi/aml/pkg/cases"
-	"github.com/luxfi/aml/pkg/reference"
 	"github.com/luxfi/aml/pkg/retention"
 	"github.com/luxfi/aml/pkg/token"
 	"github.com/luxfi/aml/pkg/types"
@@ -34,20 +32,17 @@ import (
 
 // shared is one record plane, reachable on every brand's Host, authenticating
 // through real tokens.
+// shared is one deployment's stores, on the shelves cmd/amld wires.
+//
+// It is the durable shelf and not a memory stand-in because what these tests are
+// ABOUT is the store boundary: whether one brand's institution can reach
+// another's rows. A boundary proven over a map is a property of the map — the
+// index, the filter and the column are exactly where it can be lost.
 func shared(t *testing.T) *Handler {
 	t.Helper()
-	return &Handler{
-		Identity: identity(),
-		Engine: testEngine([]types.Rule{{
-			ID: "ctr", Name: "CTR Threshold", DSL: "Tx.Notional > 10000.0",
-			Severity: types.SeverityHigh, Weight: 0.3, Action: types.ActionReport, Enabled: true,
-		}}),
-		Rate:    reference.Rates{},
-		Cases:   cases.NewStore(),
-		Alerts:  NewAlertStore(),
-		Records: retention.New(),
-		Keys:    token.NewKeyring(func(string) ([]byte, error) { return root, nil }),
-	}
+	h := planeOn(t, shelves(t))
+	h.Identity = identity()
+	return h
 }
 
 // call drives a handler as a caller on one brand's Host holding that brand's token.

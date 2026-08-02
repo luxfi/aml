@@ -37,6 +37,12 @@ var events = store.Kind{
 	},
 	Indexes: []store.Index{
 		{Name: "org_at", Fields: []string{store.Org, fieldAt}},
+		// The identity read. An event IS one transaction, so a re-offer of one is
+		// not a second event — see Base.Append. Not unique, deliberately: a
+		// deployment upgrading from a version that appended unconditionally
+		// already holds duplicates, and a unique index would refuse to start over
+		// its own history rather than stop making more.
+		{Name: "org_tx", Fields: []string{store.Org, fieldTxID}},
 		{Name: "org_user_at", Fields: []string{store.Org, fieldUser, fieldAt}},
 		{Name: "org_account_at", Fields: []string{store.Org, fieldAccount, fieldAt}},
 		{Name: "org_counterparty_at", Fields: []string{store.Org, fieldCounterparty, fieldAt}},

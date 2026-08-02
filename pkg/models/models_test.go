@@ -32,7 +32,7 @@ var (
 // history is a tenant's own traffic, with the outliers a human judged productive.
 type history struct{ n int }
 
-func (h history) History(ctx context.Context, org string) (replay.History, error) {
+func (h history) History(ctx context.Context, org string, held *topology.Grant) (replay.History, error) {
 	out := make(replay.Slice, 0, h.n)
 	for i := 0; i < h.n; i++ {
 		usd := 100 + float64(i%17)*3

@@ -2,10 +2,10 @@ package engine
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
-	"sync"
 
 	"github.com/expr-lang/expr"
 	"github.com/expr-lang/expr/ast"
@@ -23,16 +23,69 @@ import (
 // term that returns a plausible constant when its provider is absent — produces
 // a rule that is present in the catalog, visible in the interface, reported to
 // the regulator, and incapable of ever firing.
+//
+// It holds NO compiled rules. A rule's compiled form is a value — see [Ruleset]
+// — belonging to whoever asked for it, and dropped with them. That is not an
+// optimisation left undone: a candidate rule's text arrives on the wire at
+// /v1/aml/rules/test, so a table of compiled rules kept here would be keyed by a
+// string a caller wrote, sized by how many distinct ones a caller sends, with no
+// cap and no removal, in the memory every institution's ingest runs in.
 type Evaluator struct {
 	p Providers
-
-	mu    sync.RWMutex
-	cache map[string]*vm.Program
 }
 
 // NewEvaluator builds an evaluator over the given evidence providers.
-func NewEvaluator(p Providers) *Evaluator {
-	return &Evaluator{p: p, cache: make(map[string]*vm.Program)}
+func NewEvaluator(p Providers) *Evaluator { return &Evaluator{p: p} }
+
+// Ruleset is a rule set compiled once, held by whoever asked for it.
+//
+// It is what makes "compile once, run over a hundred thousand events" and "keep
+// nothing a caller named" the same design rather than opposing ones: the
+// programs have an owner and a lifetime. The engine's owner is the installed
+// library; a replay's owner is the one request.
+type Ruleset struct {
+	p     Providers
+	rules []types.Rule
+	progs []*vm.Program
+}
+
+// Ready admits every rule in a set and returns them compiled, or reports every
+// one that cannot be evaluated.
+//
+// The whole set is rejected if any rule fails. A partially compiled set is a
+// control surface nobody can describe: the operator believes the catalog is in
+// force, and the difference is discoverable only by reading startup logs.
+func (e *Evaluator) Ready(rules []types.Rule) (*Ruleset, error) {
+	out := &Ruleset{p: e.p, rules: make([]types.Rule, 0, len(rules)), progs: make([]*vm.Program, 0, len(rules))}
+	var errs []error
+	for _, r := range rules {
+		if r.Weight < 0 {
+			errs = append(errs, fmt.Errorf("rule %q: weight %v is negative, which would subtract from the risk score", r.ID, r.Weight))
+			continue
+		}
+		prog, err := e.Admit(r)
+		if err != nil {
+			errs = append(errs, err)
+			continue
+		}
+		out.rules = append(out.rules, r)
+		out.progs = append(out.progs, prog)
+	}
+	if len(errs) > 0 {
+		return nil, fmt.Errorf("rule set rejected, %d of %d rules cannot be evaluated: %w",
+			len(errs), len(rules), errors.Join(errs...))
+	}
+	return out, nil
+}
+
+// Rules is the set as it was admitted, copied.
+func (rs *Ruleset) Rules() []types.Rule {
+	if rs == nil {
+		return nil
+	}
+	out := make([]types.Rule, len(rs.rules))
+	copy(out, rs.rules)
+	return out
 }
 
 // Vocabulary lists the terms this evaluator can answer, sorted. Terms whose
@@ -63,16 +116,8 @@ func (t *terms) Visit(node *ast.Node) {
 }
 
 // Admit compiles a rule and reports why it cannot be installed, if it cannot.
-// The compiled program is cached, so admitting a rule also prepares it to run.
+// The program it returns belongs to the caller; nothing is kept here.
 func (e *Evaluator) Admit(r types.Rule) (*vm.Program, error) {
-	key := r.ID + ":" + r.DSL
-	e.mu.RLock()
-	prog, ok := e.cache[key]
-	e.mu.RUnlock()
-	if ok {
-		return prog, nil
-	}
-
 	tree, err := parser.Parse(r.DSL)
 	if err != nil {
 		return nil, fmt.Errorf("rule %q: %w", r.ID, err)
@@ -96,30 +141,15 @@ func (e *Evaluator) Admit(r types.Rule) (*vm.Program, error) {
 		return nil, fmt.Errorf("rule %q: %w for %s", r.ID, ErrNoProvider, strings.Join(missing, ", "))
 	}
 
-	prog, err = expr.Compile(r.DSL, expr.Env(&scope{}), expr.AsBool())
+	prog, err := expr.Compile(r.DSL, expr.Env(&scope{}), expr.AsBool())
 	if err != nil {
 		return nil, fmt.Errorf("rule %q: %w", r.ID, err)
 	}
-
-	e.mu.Lock()
-	e.cache[key] = prog
-	e.mu.Unlock()
 	return prog, nil
 }
 
-// Eval runs one rule against a transaction. It is the path used to try a
-// candidate rule before saving it; evaluating a whole set goes through EvalAll,
-// which shares one scope so a window is fetched once.
-func (e *Evaluator) Eval(ctx context.Context, r types.Rule, tx types.Transaction, ent types.Entity) (bool, error) {
-	return e.eval(newScope(ctx, e.p, tx, ent), r)
-}
-
-// eval runs one rule against an existing scope.
-func (e *Evaluator) eval(s *scope, r types.Rule) (bool, error) {
-	prog, err := e.Admit(r)
-	if err != nil {
-		return false, err
-	}
+// run executes one compiled rule against an existing scope.
+func run(prog *vm.Program, s *scope, r types.Rule) (bool, error) {
 	out, err := expr.Run(prog, s)
 	if err != nil {
 		return false, fmt.Errorf("rule %q: %w", r.ID, err)
@@ -128,21 +158,25 @@ func (e *Evaluator) eval(s *scope, r types.Rule) (bool, error) {
 	return out.(bool), nil
 }
 
-// EvalAll evaluates every enabled, in-scope rule and returns the hits.
+// EvalAll evaluates every enabled, in-scope rule of this set and returns the
+// hits.
 //
 // A rule that fails at evaluation time becomes a hit carrying the failure. The
 // rule set was admitted, so a failure here is a data or storage fault — an
 // unknown currency, an absent subject, an unreachable store — and the
 // transaction it happened on is precisely the one nobody has assessed. Passing
 // it through as clean would turn an outage into an approval.
-func (e *Evaluator) EvalAll(ctx context.Context, rules []types.Rule, tx types.Transaction, ent types.Entity) []types.RuleHit {
+func (rs *Ruleset) EvalAll(ctx context.Context, tx types.Transaction, ent types.Entity) []types.RuleHit {
+	if rs == nil {
+		return nil
+	}
 	// One scope for the whole rule set, so the window a dozen rules ask about is
 	// fetched once. A scope per rule turns a rule set into a query per rule per
 	// transaction, which is the cost that makes institutions disable rules.
-	s := newScope(ctx, e.p, tx, ent)
+	s := newScope(ctx, rs.p, tx, ent)
 
 	var hits []types.RuleHit
-	for _, r := range rules {
+	for i, r := range rs.rules {
 		if !r.Enabled {
 			continue
 		}
@@ -152,7 +186,7 @@ func (e *Evaluator) EvalAll(ctx context.Context, rules []types.Rule, tx types.Tr
 		if !scoped(r.AssetClassFilter, tx.AssetClass) {
 			continue
 		}
-		match, err := e.eval(s, r)
+		match, err := run(rs.progs[i], s, r)
 		if err != nil {
 			hits = append(hits, types.RuleHit{Rule: r, Match: true, EvalErr: err.Error()})
 			continue

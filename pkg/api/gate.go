@@ -34,6 +34,8 @@ import (
 	"fmt"
 	"sync"
 	"time"
+
+	"github.com/luxfi/aml/pkg/topology"
 )
 
 // ErrBusy is what an operation returns when this tenant already has one of its
@@ -98,6 +100,30 @@ func one[In, Out any](g *gate, fn op[In, Out]) op[In, Out] {
 			return nil, ErrBusy
 		}
 		defer g.leave(org)
+		return fn(ctx, org, in)
+	}
+}
+
+// costly makes an operation take a share of the machine before it runs.
+//
+// It is for a read whose cost is bounded by ROWS rather than by a page: a fold
+// over a window has no correct partial answer, so it examines up to fifty
+// thousand activations however many the caller wanted, and any authenticated
+// caller can ask for one in a loop. Row-bounded is not rate-bounded, and the
+// resource a loop of them spends is the same CPU a model study spends — so it is
+// the same budget, which is what makes "how much of this machine can a tenant
+// take" one question with one answer.
+//
+// A paged read is deliberately NOT wrapped. A page is bounded work with a cursor,
+// and putting the machine's budget in front of every list would make an ordinary
+// console screen wait behind a study.
+func costly[In, Out any](cores *topology.Budget, fn op[In, Out]) op[In, Out] {
+	return func(ctx context.Context, org string, in *In) (*Out, error) {
+		held, err := cores.Admit(ctx, 1)
+		if err != nil {
+			return nil, fmt.Errorf("%w: %w", ErrBusy, err)
+		}
+		defer held.Release()
 		return fn(ctx, org, in)
 	}
 }

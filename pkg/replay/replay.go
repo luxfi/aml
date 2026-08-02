@@ -51,6 +51,11 @@ var (
 	ErrNoRule      = errors.New("replay: candidate has no expression")
 	ErrEmpty       = errors.New("replay: history is empty, so a replay proves nothing")
 	ErrEval        = errors.New("replay: rule did not evaluate over history")
+	// ErrRule is a rule this engine cannot run: it does not parse, it names
+	// evidence the deployment has no provider for, or it does not yield a
+	// boolean. It is the caller's to fix, and it is answered before a single
+	// event is read.
+	ErrRule = errors.New("replay: rule cannot be run by this engine")
 )
 
 // listed is how many transaction ids an outcome or a delta carries. The counts
@@ -59,11 +64,23 @@ var (
 // count was cut here.
 const listed = 1000
 
-// Evaluator evaluates a rule set against one event. *engine.Evaluator satisfies
-// it, which is the whole point: the candidate is scored by the code that scores
-// production.
+// Evaluator compiles a rule set. *engine.Evaluator satisfies it, which is the
+// whole point: the candidate is scored by the code that scores production.
+//
+// Compiling is a step of its own, and it is the caller's, because a candidate is
+// a rule an INSTITUTION TYPED and this replay may run it over a hundred thousand
+// events. Compiling per event would be the cost; compiling into something the
+// engine keeps would be worse — a table of every rule anyone ever tried, keyed
+// by their text, with no cap and no removal. So the compiled set is a value with
+// an owner, the owner is this run, and it is dropped when the run ends.
 type Evaluator interface {
-	EvalAll(ctx context.Context, rules []types.Rule, tx types.Transaction, ent types.Entity) []types.RuleHit
+	Ready(rules []types.Rule) (Ruleset, error)
+}
+
+// Ruleset is a compiled rule set: what an [Evaluator] hands back, and the only
+// thing this package runs.
+type Ruleset interface {
+	EvalAll(ctx context.Context, tx types.Transaction, ent types.Entity) []types.RuleHit
 }
 
 // Disposition is what a human concluded about an event that alerted. It is what
@@ -187,23 +204,34 @@ func Run(ctx context.Context, e Evaluator, h History, candidate types.Rule, incu
 
 	cand := activated(candidate)
 	report := Report{Candidate: Outcome{Rule: name(cand)}}
+	// Compiled ONCE, here, and held for the length of this run only — and BEFORE
+	// the history is read, so a rule this engine cannot run costs the caller a
+	// refusal rather than a tenant's whole history.
+	trial, err := e.Ready([]types.Rule{cand})
+	if err != nil {
+		return Report{}, fmt.Errorf("%w: %w", ErrRule, err)
+	}
 
 	var prev *types.Rule
+	var was Ruleset
 	if incumbent != nil {
 		if strings.TrimSpace(incumbent.DSL) == "" {
 			return Report{}, fmt.Errorf("%w: incumbent %s", ErrNoRule, name(*incumbent))
 		}
 		p := activated(*incumbent)
 		prev = &p
+		if was, err = e.Ready([]types.Rule{p}); err != nil {
+			return Report{}, fmt.Errorf("%w: %w", ErrRule, err)
+		}
 		report.Incumbent = &Outcome{Rule: name(p)}
 		report.Delta = &Delta{}
 	}
 
-	err := h.Each(func(ev Event) error {
+	err = h.Each(func(ev Event) error {
 		report.Events++
 		observe(&report, ev)
 
-		hit, err := fires(ctx, e, cand, ev)
+		hit, err := fires(ctx, trial, cand, ev)
 		if err != nil {
 			return err
 		}
@@ -214,21 +242,21 @@ func Run(ctx context.Context, e Evaluator, h History, candidate types.Rule, incu
 			return nil
 		}
 
-		was, err := fires(ctx, e, *prev, ev)
+		before, err := fires(ctx, was, *prev, ev)
 		if err != nil {
 			return err
 		}
-		if was {
+		if before {
 			record(report.Incumbent, ev)
 		}
 		switch {
-		case hit && was:
+		case hit && before:
 			report.Delta.Kept = add(report.Delta.Kept, ev.Tx.ID)
 			report.Delta.Sizes.Kept++
 		case hit:
 			report.Delta.Added = add(report.Delta.Added, ev.Tx.ID)
 			report.Delta.Sizes.Added++
-		case was:
+		case before:
 			report.Delta.Dropped = add(report.Delta.Dropped, ev.Tx.ID)
 			report.Delta.Sizes.Dropped++
 		}
@@ -250,8 +278,8 @@ func Run(ctx context.Context, e Evaluator, h History, candidate types.Rule, incu
 
 // fires reports whether a rule would alert on an event, through the engine's own
 // evaluation. An evaluation error is the caller's answer, not a zero.
-func fires(ctx context.Context, e Evaluator, r types.Rule, ev Event) (bool, error) {
-	hits := e.EvalAll(ctx, []types.Rule{r}, ev.Tx, ev.Entity)
+func fires(ctx context.Context, rs Ruleset, r types.Rule, ev Event) (bool, error) {
+	hits := rs.EvalAll(ctx, ev.Tx, ev.Entity)
 	for _, h := range hits {
 		if h.EvalErr != "" {
 			return false, fmt.Errorf("%w: %s on transaction %s: %s", ErrEval, name(r), ev.Tx.ID, h.EvalErr)
