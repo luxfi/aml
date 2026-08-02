@@ -32,11 +32,12 @@ const reportLimit = 10_000.0
 // different set of trees than the one the tenant would get. It is required for
 // the same reason a history window refuses an empty tenant.
 //
-// cores is the machine's share (see Budget). The search takes its workers from it
-// BEFORE it reads a single event, so a study that is waiting for the machine is
-// also not holding a tenant's history in memory. A nil budget is unbounded and is
-// for tests.
-func Search(ctx context.Context, org string, h replay.History, space Space, opt Options, cores *Budget) (Report, error) {
+// held is this study's hold on the machine (see Budget and Grant). It is taken
+// by the CALLER, before the tenant's history is read, so a study waiting for the
+// machine is also not holding a history in memory — see models.Shelf, which is
+// where the reading happens. A nil Grant is unbounded and is for the pure tests
+// in this package.
+func Search(ctx context.Context, org string, h replay.History, space Space, opt Options, held *Grant) (Report, error) {
 	if org == "" {
 		return Report{}, ErrOrg
 	}
@@ -47,12 +48,7 @@ func Search(ctx context.Context, org string, h replay.History, space Space, opt 
 	if err != nil {
 		return Report{}, err
 	}
-
-	workers, release, err := cores.take(ctx, want(opt.Workers, len(grid)))
-	if err != nil {
-		return Report{}, err
-	}
-	defer release()
+	workers := min(held.Workers(), len(grid))
 
 	events, cut, from, to, judged, err := collect(h, opt.Events)
 	if err != nil {
@@ -122,6 +118,21 @@ func Search(ctx context.Context, org string, h replay.History, space Space, opt 
 // The clamp is the point. Workers arrives on the wire, and without a ceiling a
 // caller names the width of its own study — a grid of MaxTrials with one worker
 // per candidate is 256 goroutines of pure arithmetic from one request.
+// Width is how many workers a study over this space should ask the budget for.
+//
+// It is exported and pure so that the hold can be taken before the history is
+// read: the caller needs the number, and the number is a property of the space
+// and the request rather than of anything that has to be loaded. It also
+// validates the space, so a request naming a space that cannot be enumerated is
+// refused before a tenant's history is opened.
+func Width(space Space, opt Options) (int, error) {
+	grid, err := space.Grid()
+	if err != nil {
+		return 0, err
+	}
+	return want(opt.Workers, len(grid)), nil
+}
+
 func want(asked, candidates int) int {
 	if asked <= 0 {
 		asked = DefaultWorkers
@@ -145,9 +156,9 @@ func want(asked, candidates int) int {
 // why a search's winner is a recommendation to a deployment rather than something
 // this package can install.
 //
-// One candidate, so one worker's worth of the machine (see Budget), taken before
-// the history is read.
-func Fit(ctx context.Context, org string, h replay.History, t Topology, opt Options, cores *Budget) (anomaly.Snapshot, Trial, error) {
+// One candidate, so one worker's worth of the machine (see Budget), and the hold
+// is the caller's because the caller is what reads the history.
+func Fit(ctx context.Context, org string, h replay.History, t Topology, opt Options, held *Grant) (anomaly.Snapshot, Trial, error) {
 	if org == "" {
 		return anomaly.Snapshot{}, Trial{}, ErrOrg
 	}
@@ -157,11 +168,6 @@ func Fit(ctx context.Context, org string, h replay.History, t Topology, opt Opti
 	if err := t.Valid(); err != nil {
 		return anomaly.Snapshot{}, Trial{}, err
 	}
-	_, release, err := cores.take(ctx, 1)
-	if err != nil {
-		return anomaly.Snapshot{}, Trial{}, err
-	}
-	defer release()
 
 	events, _, _, _, _, err := collect(h, opt.Events)
 	if err != nil {

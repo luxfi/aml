@@ -84,10 +84,13 @@ func TestTheDefaultBudgetLeavesTheMachineForIngest(t *testing.T) {
 //
 // It is also the queue: the second study waits, it is not refused, and no
 // tenant's work is dropped because another tenant is busy.
+// The admission is what a caller waits on, and the caller is what reads. See
+// models.TestNoStudyReadsAHistoryItHasNotPaidFor for the same property at the
+// layer where the reading actually happens.
 func TestAStudyTakesTheMachineBeforeItReadsTheHistory(t *testing.T) {
 	b := NewBudget(1)
-	held, release, err := b.take(context.Background(), 1)
-	if err != nil || held != 1 {
+	first, err := b.Admit(context.Background(), 1)
+	if err != nil || first.Workers() != 1 {
 		t.Fatal(err)
 	}
 
@@ -98,7 +101,14 @@ func TestAStudyTakesTheMachineBeforeItReadsTheHistory(t *testing.T) {
 	ctx, stop := context.WithCancel(context.Background())
 	defer stop()
 	go func() {
-		_, err := Search(ctx, "hanzo/acme", events, small(), Options{Seed: 7}, b)
+		// Exactly what models.Shelf does: hold the machine, then read.
+		held, err := b.Admit(ctx, 1)
+		if err != nil {
+			done <- err
+			return
+		}
+		defer held.Release()
+		_, err = Search(ctx, "hanzo/acme", events, small(), Options{Seed: 7}, held)
 		done <- err
 	}()
 
@@ -108,7 +118,7 @@ func TestAStudyTakesTheMachineBeforeItReadsTheHistory(t *testing.T) {
 	case <-time.After(30 * time.Millisecond):
 	}
 
-	release()
+	first.Release()
 	select {
 	case <-read:
 	case <-time.After(5 * time.Second):
@@ -117,6 +127,30 @@ func TestAStudyTakesTheMachineBeforeItReadsTheHistory(t *testing.T) {
 	if err := <-done; err != nil {
 		t.Fatalf("the queued study failed: %v", err)
 	}
+}
+
+// TestReleaseIsIdempotent: a defer and a panic must not between them leak or
+// double-return a token, and a caller with no budget must still run.
+func TestReleaseIsIdempotent(t *testing.T) {
+	b := NewBudget(1)
+	held, err := b.Admit(context.Background(), 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	held.Release()
+	held.Release()
+
+	again, err := b.Admit(context.Background(), 1)
+	if err != nil {
+		t.Fatal("the token was not returned")
+	}
+	again.Release()
+
+	var none *Grant
+	if none.Workers() != 1 {
+		t.Errorf("a caller with no budget got %d workers, want 1", none.Workers())
+	}
+	none.Release()
 }
 
 // TestWorkersAreClamped. Workers arrives on the wire, and the grid holds up to
@@ -153,7 +187,13 @@ func TestOneTenantsStudyIsNeverAnothersRefusal(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			_, errs[i] = Search(context.Background(), org, stream(120, true), small(), Options{Seed: 3}, b)
+			held, err := b.Admit(context.Background(), 1)
+			if err != nil {
+				errs[i] = err
+				return
+			}
+			defer held.Release()
+			_, errs[i] = Search(context.Background(), org, stream(120, true), small(), Options{Seed: 3}, held)
 		}()
 	}
 	wg.Wait()

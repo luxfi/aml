@@ -114,6 +114,15 @@ pkg/
                               history is read; the wait is the queue and it cancels
   models/                  -- The record of every search and every fitted state, and
                               the one path that adopts one into the live model
+  receipt/                 -- What an institution was told about a transaction,
+                              kept so that offering it again returns the same
+                              answer instead of computing a second one
+  roster/                  -- The set of tenants a process holds live state for,
+                              and the ceiling on how many. Admits, never removes
+  api/wire.go              -- THE assembly: every collection, every shelf, every
+                              join, and what runs on a cadence. One function,
+                              called by cmd/amld and by the tests alike
+  api/load.go              -- One door for "is anything of mine quietly degraded"
   api/typed.go             -- One operation shape, two adapters: the tenant is an
                               argument, the input is one struct, the output another
   api/gate.go              -- Admission for the expensive work: one per tenant, and
@@ -217,6 +226,7 @@ scores, learns and reports what it *would* have alerted on, changing nothing.
 | POST | /v1/aml/sanctions/search | Search sanctions lists by name |
 | GET | /v1/aml/sanctions/sources | Per-list readiness: count, date, fitness |
 | GET | /v1/aml/catalog | Coverage: installed rules, their citations, and the stated gaps |
+| GET | /v1/aml/load | What this engine holds for the caller's tenant, and what it has had to let go |
 | GET | /v1/aml/health | Health check, 503 when records cannot be kept |
 | GET | /v1/aml/config | Brand identity of the request's Host: brand, display name, issuer, domain |
 | GET/POST | /v1/aml/lists | The tenant's declared lists / declare one |
@@ -358,6 +368,163 @@ after a row was written does not reach that row. Undeclared, a count of ten mill
 turns every activation of that rule into a ten-million-row scan of the tenant's own
 store, on the path that has to answer before a payment can be taken.
 
+### One assembly, and both the deployment and the tests use it
+
+`pkg/api/wire.go` is the only place this engine is built: every collection
+(`Ensure`), every shelf (`NewBase`), every join between them, and everything that
+has to run on a cadence for the durable state to stay honest. `cmd/amld` calls
+`api.Wire(app, api.Deployment{…})` and supplies only what an INSTALLATION answers
+differently — who a caller is, which IAM application this is, what it detects,
+its key material, its designations, its business day, its rates. The tests build
+the same function.
+
+That is a correctness property and not tidiness. The previous review's defining
+failure was two wirings: `cmd/amld` assembled a Handler by hand and the tests
+assembled a different one, so the record fingerprint could be a struct field the
+tests exercised and no column stored — every retry a permanent 409 in production
+while every test passed. The bug was not in the ledger; it was that there were
+two arrangements and only one of them was under test.
+
+Three tests keep it that way, each doing one thing:
+
+| Test | What it refuses |
+|---|---|
+| `TestTheDeploymentDoesNotAssembleItsOwnHandler` | an `api.Handler` composite literal anywhere in `cmd/amld`, read from the AST (`internal/source.NoLiteral`) |
+| `TestWireLeavesNothingUnwired` | any exported `Handler` field left nil, empty or zero after `Wire`, found by reflection rather than by a list that would be a third copy |
+| `TestWireCreatesEveryCollectionItWritesTo` | a missing collection, by ingesting one transaction through every plane |
+
+### A retry is not a second transaction
+
+`pkg/receipt` is the identity of an OFFER, resolved once, at the top of ingest,
+before anything is read or written — and the answer that was given for it.
+
+Every number this engine exists to compute is a count of transactions over a
+window, so a retry that is counted is an aggregate wrong by the number of times
+the network failed. Worse: the second offer of an UNCHANGED transaction saw a
+window it had already put itself in, the verdict flipped from allow to block, and
+`retain` filed a REFUSAL under AMLR Art. 77(3) — a regulatory record of a refusal
+the institution never made, and a customer's payment declined, because a client
+retried.
+
+The ledger was idempotent. Nothing else was, and an engine whose ledger holds one
+record while its aggregates hold three is worse than one that double counts
+everywhere, because the numbers disagree and nothing says which is right.
+
+- The offer is `(Ref, Mark)`. `Mark` digests the request body decoded and
+  re-encoded, so a client that re-serialises is recognised; it covers nothing this
+  engine derived, because a digest over a value this process invented differs on
+  every offer — which is precisely the defect that made every retry a permanent
+  conflict once before.
+- A prior receipt is returned **byte for byte**. A client cannot tell a retry from
+  a first offer, which is what idempotent means.
+- Two different transactions under one reference is not a retry. It is refused
+  (`409`), never answered from the wrong one, and never on a 5xx: `503` reads as
+  "retry", and a client retrying a permanent refusal retries forever.
+- The shelf is durable because the deployment is Recreate at one replica: the
+  process that answered the first offer is gone by the time a client retries
+  across a rollout.
+- Receipts are kept for `Window(widest aggregate) = widest + 24h`, DERIVED rather
+  than chosen, so tuning a window cannot leave the receipt outlived by the
+  aggregate it protects. Disposal is a daily cron and destroys nothing an
+  obligation covers.
+
+**And every plane past it recognises the transaction for itself.** The receipt is
+written after the work and before the response, so a process that dies in between
+leaves the work done, no receipt, and a caller who — never answered — offers
+again. The receipt cannot catch that one, so nothing relies on being sequenced
+behind it: the ledger has its fingerprint, an activation's id is
+`hash(tenant, tx, rule, subject)`, `history.Base.Append` does not append a second
+row for a transaction it already holds, `AlertStore.add` keeps the first
+judgement, and a transaction that has already been judged does not open a second
+case. Velocity is not in that list because it is in memory — the crash that loses
+the receipt loses the aggregate too. `TestAnInterruptedOfferIsStillCountedOnce`
+produces exactly that state and checks all of them.
+
+### A bound over a count of caller-sized things is not a bound
+
+Three bounds in this engine are stated in BYTES, and each derives its count from
+its cost in one place so the two cannot disagree:
+
+| Bound | Where | Worst case weighed by |
+|---|---|---|
+| `types.MaxIdent` (256) | every identifier a transaction carries, refused at the door | `TestAnOversizedIdentifierIsRefusedAtTheDoor` |
+| `velocity.Store.Ceiling()` | tenants × keys × `keyCost(windows)` | `TestTheCeilingIsInBytesAndItIsHonest` |
+| `dictionary.Ceiling()` | `(MaxCustom + declared) × nameCost()`, where `nameCost` needs `MaxName` (128) | `TestOneNamesCeilingIsInBytes` |
+
+`MaxIdent` is what turns every count downstream into a figure in bytes: a
+sliding-aggregate key is a fixed ring plus that string, a catalog name is that
+string, a retained record's slot is that string. Refusing is right where
+truncating is not — an identifier this engine shortened is an aggregate kept
+under a key naming a different account.
+
+### Per-tenant state, per-tenant bounds, and no eviction anywhere
+
+`pkg/roster` is the set of tenants a process holds live state for. It **admits and
+never removes**: there is no `Drop`, no evict, no `delete` in the package, and
+`internal/source.NoRemoval` reads the file to keep it that way. A tenant that is
+held keeps what it holds; a tenant arriving when the roster is full is REFUSED,
+and the refusal is counted and published.
+
+The banned shape is one map of every tenant's state under one cap with LRU
+eviction. It is a defect every time: the cap is spent from a pool every tenant
+draws on, so a busy institution's traffic takes a quiet one's CONTROL — its
+aggregates return to zero and its model returns to warming, both of which read
+exactly like an institution with nothing to report. No error, no log. It is also
+cheap to cause on purpose, from any tenant, with ordinary traffic.
+
+`velocity.Store`, `anomaly.Store` and `dictionary.Shelf` all hold their
+per-tenant state in a roster, and each has a `source.NoTable` test refusing a
+string-keyed map on the type. `roster.Default` is ONE answer to how many
+institutions this process holds state for, so every per-tenant bound multiplies
+by the same figure and the products add up against a pod's memory limit.
+
+The same rule applies to a table keyed by anything else a caller writes.
+`engine.Evaluator` holds NO compiled rules for that reason: a candidate rule's
+text arrives on the wire at `/v1/aml/rules/test`, so a compiled-rule cache would
+be keyed by a string a caller wrote, sized by how many distinct ones a caller
+sends, with no cap and no removal, in the memory every institution's ingest runs
+in. A rule's compiled form is a VALUE — `engine.Ruleset` — belonging to whoever
+asked for it: the engine's owner is the installed library, a replay's owner is the
+one request, and both are dropped with their owner.
+
+### Reaching a bound is allowed; reaching it quietly is not
+
+Every live bound here can bind, and when one does an aggregate stops being kept,
+a model is not planted, or an observation is turned away. None of those raises an
+error, because refusing a payment because a cache is full would be the worse
+failure. What is NOT allowed is for it to happen silently: an aggregate that reads
+zero is what a clean account also reads, and a model that is warming reports
+nothing, which is what a clean institution also reports. A control that switches
+itself off without saying so is worse than no control, because it is a control
+somebody is relying on.
+
+So there is ONE door — `GET /v1/aml/load` — per tenant, answering in words rather
+than in ratios a reader has to interpret: the tenant's aggregates against its own
+ceiling in bytes with a grade (`clear`/`crowded`/`full`), whether it has a
+behavioural model at all, the field catalog's own pressure, and the process's
+counts of institutions held, refused and turned away. Nothing there names another
+institution.
+
+### The machine is one budget, and the expensive read demands its receipt
+
+`topology.Budget` is half the cores for every study, replay and fold together;
+the other half is ingest's. Tokens ARE trial workers and the hold is taken by the
+CALLER THAT READS, not the callee that computes — that distinction is the whole
+of the memory property, because the read is a tenant's whole retained history
+opened record by record, and a token taken after it bounded nothing. Eight tenants
+once held eight full histories at once against a budget of one worker.
+
+`Handler.history` is the one function that materialises a whole retained history,
+so it REQUIRES a `*topology.Grant`, and a `Grant` comes from `Budget.Admit` and
+from nowhere else. An ungated whole-history read is therefore something a caller
+has to go out of their way to write rather than something they can forget.
+`api.costly` puts the same budget in front of a fold that is not a page —
+`GET /v1/aml/activations/rates` examines up to `MaxExamined` rows however few the
+caller asked for, and row-bounded is not rate-bounded. A paged read is
+deliberately NOT wrapped: a page is bounded work with a cursor, and putting the
+machine's budget in front of every list would make an ordinary console screen wait
+behind a study.
+
 ### Ingest degrades; it does not refuse for volume
 
 Two things run on the ingest path once per activation, and neither may be a way for
@@ -373,19 +540,20 @@ dismisses — where refusing produces silence, which nobody sees.
 
 An activation naming a transaction IS one rule firing on one subject in one
 transaction, so its id is derived from `(tenant, transaction, rule, subject)` and
-the row is looked up before anything is computed. Ingest writes the record, then
-the alerts, then the activations; anything after the first write that fails answers
-503, and a client that retries offers the same firings again. With a fresh id each
-time the retry writes a second row, the second row is counted in the streak, and a
-declared repetition policy fires on a repeat that never happened — a payment
-blocked because the client retried. The retained record is idempotent for the same
-reason and by the same means: `token.Vault.Fingerprint` names the plaintext
-deterministically (a seal draws a fresh nonce, so sealed bytes never match), and
-the transaction carries ONE clock — its own. A reception clock stamped at ingest
-made every retry a different fact under one id, which is a conflict that no retry
-could ever clear. A genuine conflict — an id reused for a different transaction —
-answers 409 and not 503, because 503 reads as "retry" and a client retrying a
-permanent refusal retries forever.
+the row is looked up before anything is computed. With a fresh id each time, a
+retry writes a second row, the second row is counted in the streak, and a declared
+repetition policy fires on a repeat that never happened — a payment blocked
+because the client retried.
+
+The retained record is idempotent by the same means: `token.Vault.Fingerprint`
+names the plaintext deterministically (a seal draws a fresh nonce, so sealed bytes
+never match), it is a COLUMN and not only a struct field, and the transaction
+carries ONE clock — its own. A reception clock stamped at ingest made every retry
+a different fact under one id, a conflict no retry could ever clear. A fingerprint
+that was a struct field no column stored had the same effect on the durable shelf
+and none on the memory one, which is why every identity test now runs on the shelf
+`cmd/amld` wires. See "A retry is not a second transaction" for the identity that
+gates all of it.
 
 ### The dictionary stores no value, ever
 
@@ -457,7 +625,7 @@ one thing:
 |---|---|---|
 | One study per tenant | `api.gate`, `one(...)` | a tenant queueing studies against itself. Per tenant and never global: one institution's study is never refused because another is studying, and nothing is ever evicted from the map |
 | A deadline (`maxStudy`, 2 min) | `api.within(...)` | a legitimate space whose total is hours. Derived from the REQUEST's context, so a client that goes away cancels the work |
-| `topology.Budget` | wired in `cmd/amld` | every study together taking the machine. Tokens ARE trial workers, taken BEFORE the history is read, so CPU, the events held in memory, and the queue are one mechanism. Half the cores, so the other half is ingest's. The wait is the queue and it is cancellable |
+| `topology.Budget` | wired in `api.Wire` | every study, replay and fold together taking the machine. Tokens ARE trial workers, taken by the CALLER THAT READS before the history is read, so CPU, the events held in memory, and the queue are one mechanism. `Handler.history` refuses without a `*topology.Grant`. Half the cores, so the other half is ingest's. The wait is the queue and it is cancellable |
 | `MaxWorkers`, `MaxTrials`, `MaxEvents` | `pkg/topology` | one request naming the width of its own study |
 
 The budget is a bound on the PROCESS and is the one thing here that is not per
@@ -841,10 +1009,6 @@ Webhook events: `aml.flagged`, `aml.cleared`, `kyc.approved`, `trade.executed`.
 - Hanzo Tasks durable workflows (sanctions-refresh, case-automation, backtest)
 - Base realtime subscription for live transaction monitoring
 - Full OFAC/UN/EU/HMT list refresh automation
-- **Base collection persistence** (current: in-memory stores, the retention ledger
-  included). A retention ledger that does not survive a restart is a
-  record-keeping breach, so this is the first thing to close, and it is what makes
-  the five-year lookback and the disposal cron mean anything in production.
 - Per-org KMS key material. `token.Source` already takes the org, so this is a
   different Source and not a different design; today one root is derived per org
   by HKDF, which means no cross-org correlation but one blast radius.
@@ -856,6 +1020,13 @@ Webhook events: `aml.flagged`, `aml.cleared`, `kyc.approved`, `trade.executed`.
   writes `user_id`, `counterparty` and `ip_address` in the clear for its aggregate
   queries; the retention ledger holds pseudonyms and sealed bodies, so the two
   planes do not agree yet.
+- The field catalog's flush is one `SELECT` and up to one `SAVE` per field, per
+  tenant, inside one transaction, on the database ingest also writes to. Per-tenant
+  bounds make the worst case statable (`MaxCustom` names × `roster.Default`
+  tenants per five-minute window) and that is what closed the unbounded version,
+  but the aggregate on a one-replica pod is still the largest write this process
+  makes. A single upsert per field, or a flush that yields between tenants, would
+  remove it.
 - `cases.AutoClose` closes low-severity cases on inactivity without a retained
   assessment — the one path that closes a case without a recorded decision. Needs
   a compliance decision: escalate instead of closing, or record a system rationale.
@@ -958,6 +1129,7 @@ record-keeping rules make an exception for.
 | Plane | Collections | Wired by | Restart test |
 |-------|-------------|----------|--------------|
 | Retained records | `aml_retention`, `aml_retention_parties` | `retention.Ensure` + `retention.NewBase` | `TestRetainedRecordsSurviveARestart` |
+| Receipts | `aml_receipts` | `receipt.Ensure` + `receipt.NewBase` | `receipt.TestRestart` |
 | Cases + timelines | `aml_cases`, `aml_case_events` | `cases.Ensure` + `cases.NewBase` | `TestCasesSurviveARestart` |
 | Alerts | `aml_alerts` | `api.EnsureAlerts` + `api.NewAlertStoreBase` | `TestAlertsSurviveARestart` |
 | Lists | `aml_lists`, `aml_list_entries` | `lists.Ensure` + `lists.NewBase` | `lists.TestRestart` |
@@ -1013,7 +1185,10 @@ v0.3.x tag before v0.3.6 is a tag with nothing behind it for these reasons.
 
 ## Test Coverage
 
-Go tests across 24 packages, all green under `-race`, plus 12 browser tests.
+Go tests across 26 packages, all green under `-race`, plus 12 browser tests.
+`pkg/receipt` and `pkg/roster` are the two new ones; both carry the full plane
+suite (tenant isolation, bare org refused, restart over the first instance's
+bytes).
 
 - api: 76 · retention: 43 · cases: 40 · sanctions: 39 · engine: 38 · anomaly: 27
 - measure: 26 · watch: 22 · dictionary: 17 · topology: 16 · screen: 15 · token: 14

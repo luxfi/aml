@@ -14,12 +14,14 @@ import (
 	"strconv"
 	"sync"
 	"time"
+	"unsafe"
 
 	"github.com/hanzoai/base/core"
 	"github.com/hanzoai/dbx"
 
 	"github.com/luxfi/aml/pkg/anomaly"
 	"github.com/luxfi/aml/pkg/brand"
+	"github.com/luxfi/aml/pkg/roster"
 	"github.com/luxfi/aml/pkg/store"
 	"github.com/luxfi/aml/pkg/types"
 )
@@ -179,8 +181,12 @@ type Shelf struct {
 	// Now supplies the instant an observation is stamped with. Tests set it.
 	Now func() time.Time
 
-	mu      sync.Mutex
-	pending map[string]*census
+	mu sync.Mutex
+	// pending is one census per tenant, in a roster: it admits, never removes,
+	// and states how many institutions this process accumulates for. A plain map
+	// here would grow with the tenant count and nothing would cap it, so the
+	// per-tenant bound below would multiply by an unknown — see Ceiling.
+	pending *roster.Roster[*census]
 	// count is how many observations are accumulated and not yet written, across
 	// every tenant. It is published on every catalog so a reader can see how much
 	// of the answer a restart would lose.
@@ -202,7 +208,7 @@ func (s *Shelf) maxCustom() int {
 
 // NewBase returns the durable catalog. Ensure has to have run first.
 func NewBase(app core.App) *Shelf {
-	return &Shelf{app: app, pending: map[string]*census{}}
+	return &Shelf{app: app, pending: roster.New[*census](roster.Default)}
 }
 
 func (s *Shelf) now() time.Time {
@@ -236,10 +242,13 @@ func (s *Shelf) Observe(org string, tx types.Transaction) error {
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	c := s.pending[org]
-	if c == nil {
-		c = &census{fields: map[string]*stat{}}
-		s.pending[org] = c
+	c, ok := s.pending.Hold(org, func() *census { return &census{fields: map[string]*stat{}} })
+	if !ok {
+		// This process accumulates for as many institutions as it may and this one
+		// is not among them. Nothing is refused and nothing errors — the catalog is
+		// a diagnostic — and the roster counts the tenant it turned away, which is
+		// what GET /v1/aml/load reads.
+		return nil
 	}
 	c.payloads++
 	c.skipped += int64(skipped)
@@ -271,18 +280,22 @@ func (s *Shelf) Observe(org string, tx types.Transaction) error {
 
 // field is this census's accumulator for one name, created on first sight.
 //
-// A new CUSTOM name is refused once the tenant's vocabulary is full, and nil is
-// what a refusal looks like: the reading is counted as crowded and dropped. It is
-// a refusal of a NAME and never of a payload — the payload is still counted, every
-// name already in the vocabulary still measures it, and nothing anywhere returns
-// an error. See MaxCustom.
+// A new CUSTOM name is refused when it is longer than the catalog admits or when
+// the tenant's vocabulary is full, and nil is what a refusal looks like: the
+// reading is counted as crowded and dropped. It is a refusal of a NAME and never
+// of a payload — the payload is still counted, every name already in the
+// vocabulary still measures it, and nothing anywhere returns an error.
+//
+// Both refusals are here because they are one question — is there room for this
+// name — and the answer has to be the same wherever it is asked. See MaxCustom
+// and MaxName.
 func (c *census) field(name, origin, shape string, room int) *stat {
 	st := c.fields[name]
 	if st != nil {
 		return st
 	}
 	if origin == Custom {
-		if c.names >= room {
+		if len(name) > len(Prefix)+MaxName || c.names >= room {
 			c.crowded++
 			return nil
 		}
@@ -291,6 +304,77 @@ func (c *census) field(name, origin, shape string, room int) *stat {
 	st = &stat{origin: origin, shape: shape}
 	c.fields[name] = st
 	return st
+}
+
+// nameCost is what one custom name in the accumulator occupies, in bytes.
+//
+// Derived from the bounds rather than chosen, so a published ceiling cannot
+// disagree with the code that allocates: the key as the map holds it, the
+// accumulator behind it, and the map's own entry overhead.
+func nameCost() int64 {
+	return int64(len(Prefix)+MaxName) + int64(unsafe.Sizeof(stat{})) + entryCost
+}
+
+// entryCost is a hash-map entry's own overhead: the bucket slot for a string
+// header and a pointer, plus the load factor the runtime keeps.
+const entryCost = 64
+
+// Ceiling is the most one tenant's accumulator may hold between flushes, in
+// bytes.
+//
+// It is the figure an operator sizes a pod from, so it is an UPPER bound on a
+// real worst case — every name as long as MaxName admits, as many of them as
+// MaxCustom admits — and TestOneNamesCeilingIsInBytes weighs a full accumulator
+// against it. The declared fields are a fixed set and are counted too, because
+// they are held in the same census.
+func Ceiling() int64 { return int64(MaxCustom+len(declared)) * nameCost() }
+
+// Ceiling is the most this shelf may hold across every tenant it accumulates
+// for: the per-tenant ceiling times the roster's.
+//
+// One product, one number. A per-tenant bound with no tenant ceiling states
+// nothing about a process, and a tenant ceiling with no per-tenant bound states
+// nothing about memory.
+func (s *Shelf) Ceiling() int64 { return int64(s.pending.Ceiling()) * Ceiling() }
+
+// weigh is what one census actually holds, in bytes, on the same terms Ceiling
+// states. It exists for the test that holds the two against each other.
+func weigh(c *census) int64 {
+	var held int64
+	for name := range c.fields {
+		held += int64(len(name)) + int64(unsafe.Sizeof(stat{})) + entryCost
+	}
+	return held
+}
+
+// Pressure is what this process is accumulating for, and what it turned away.
+//
+// A tenant the roster refused has no catalog at all, and a catalog that is
+// absent reads exactly like a payload surface with nothing in it. That has to be
+// legible, so it is published rather than logged. See GET /v1/aml/load.
+type Pressure struct {
+	// Orgs and Room are how many institutions this shelf accumulates for and how
+	// many it may.
+	Orgs int `json:"orgs"`
+	Room int `json:"room"`
+	// Refused counts the institutions turned away for want of a place.
+	Refused int64 `json:"refused"`
+	// Held and Ceiling are what the accumulator holds and may hold, in bytes.
+	Held    int64 `json:"held"`
+	Ceiling int64 `json:"ceiling"`
+}
+
+// Pressure reads the accumulator's own state. It names no tenant.
+func (s *Shelf) Pressure() Pressure {
+	p := Pressure{
+		Orgs: s.pending.Held(), Room: s.pending.Ceiling(),
+		Refused: s.pending.Refused(), Ceiling: s.Ceiling(),
+	}
+	s.pending.Each(func(_ string, c *census) bool {
+		p.Held += weigh(c)
+		return true
+	})
+	return p
 }
 
 // Pending is how many observations are accumulated and not yet durable.
@@ -307,8 +391,19 @@ func (s *Shelf) Pending() int64 {
 // denominator is a number that reads as a finding.
 func (s *Shelf) Flush(ctx context.Context) error {
 	s.mu.Lock()
-	batch := s.pending
-	s.pending = map[string]*census{}
+	batch := map[string]*census{}
+	s.pending.Each(func(org string, c *census) bool {
+		if c.payloads > 0 {
+			batch[org] = c
+		}
+		return true
+	})
+	// Drained in place, because a tenant this process has admitted keeps its
+	// place: the roster admits and never removes, so a flush frees the memory of
+	// what was accumulated without ever giving a tenant's seat to another.
+	for org := range batch {
+		s.pending.Put(org, &census{fields: map[string]*stat{}})
+	}
 	s.count = 0
 	s.mu.Unlock()
 
@@ -331,9 +426,9 @@ func (s *Shelf) Flush(ctx context.Context) error {
 func (s *Shelf) restore(org string, c *census) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	held := s.pending[org]
-	if held == nil {
-		s.pending[org] = c
+	held, ok := s.pending.Get(org)
+	if !ok || held.payloads == 0 && len(held.fields) == 0 {
+		s.pending.Put(org, c)
 		s.count += c.payloads
 		return
 	}
@@ -550,7 +645,7 @@ func (s *Shelf) Catalog(ctx context.Context, org string, _ *CatalogIn) (*Catalog
 
 	s.mu.Lock()
 	pending := int64(0)
-	if c := s.pending[org]; c != nil {
+	if c, ok := s.pending.Get(org); ok {
 		pending = c.payloads
 		merge(held, copyCensus(c))
 	}

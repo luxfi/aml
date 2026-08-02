@@ -9,8 +9,6 @@ package engine
 
 import (
 	"context"
-	"errors"
-	"fmt"
 	"math"
 	"sync"
 	"sync/atomic"
@@ -24,8 +22,11 @@ import (
 type Engine struct {
 	eval *Evaluator
 
-	mu     sync.RWMutex
-	rules  []types.Rule
+	mu sync.RWMutex
+	// rules is the installed library, compiled. It is the ONE thing this process
+	// keeps compiled rules in, and what it holds is what the deployment
+	// installed — see Evaluator, which keeps none.
+	rules  *Ruleset
 	scorer Scorer
 
 	faults  atomic.Int64
@@ -45,34 +46,24 @@ func New(p Providers) *Engine {
 // operator believes the catalog is in force, and the difference is discoverable
 // only by reading startup logs.
 func (e *Engine) SetRules(rules []types.Rule) error {
-	var errs []error
-	for _, r := range rules {
-		if r.Weight < 0 {
-			errs = append(errs, fmt.Errorf("rule %q: weight %v is negative, which would subtract from the risk score", r.ID, r.Weight))
-			continue
-		}
-		if _, err := e.eval.Admit(r); err != nil {
-			errs = append(errs, err)
-		}
+	set, err := e.eval.Ready(rules)
+	if err != nil {
+		return err
 	}
-	if len(errs) > 0 {
-		return fmt.Errorf("rule set rejected, %d of %d rules cannot be evaluated: %w",
-			len(errs), len(rules), errors.Join(errs...))
-	}
-
 	e.mu.Lock()
-	e.rules = rules
+	e.rules = set
 	e.mu.Unlock()
 	return nil
 }
 
 // Rules returns a copy of the installed rule set.
-func (e *Engine) Rules() []types.Rule {
+func (e *Engine) Rules() []types.Rule { return e.ready().Rules() }
+
+// ready is the installed library as it stands, compiled.
+func (e *Engine) ready() *Ruleset {
 	e.mu.RLock()
 	defer e.mu.RUnlock()
-	out := make([]types.Rule, len(e.rules))
-	copy(out, e.rules)
-	return out
+	return e.rules
 }
 
 // Evaluator exposes the evaluator, for admitting a candidate rule before saving
@@ -147,11 +138,7 @@ func (e *Engine) assess(tx types.Transaction, ent types.Entity) (hit types.RuleH
 // Evaluate runs the rule set against a transaction and its customer, returning
 // the alerts raised, the aggregate risk score, and the action to take.
 func (e *Engine) Evaluate(ctx context.Context, tx types.Transaction, ent types.Entity) ([]types.Alert, float64, string) {
-	e.mu.RLock()
-	rules := e.rules
-	e.mu.RUnlock()
-
-	hits := e.eval.EvalAll(ctx, rules, tx, ent)
+	hits := e.ready().EvalAll(ctx, tx, ent)
 
 	// The Scorer contributes evidence the rule library cannot express. It is
 	// consulted after the rules so it can only add to what they found: it can

@@ -106,7 +106,12 @@ func Ensure(app core.App) error {
 // One method, and it takes the tenant, so this package cannot reach history any
 // other way — the same seam pkg/replay uses, for the same reason.
 type Source interface {
-	History(ctx context.Context, org string) (replay.History, error)
+	// History is this tenant's replayable events. held is what the CALLER took
+	// from the machine's budget before asking, and it is an argument rather than
+	// an assumption because reading a history is the expensive half: a token
+	// taken after the read bounds the arithmetic and nothing else. A source that
+	// materialises records refuses a nil grant.
+	History(ctx context.Context, org string, held *topology.Grant) (replay.History, error)
 }
 
 // Shelf is the durable model plane.
@@ -151,11 +156,31 @@ func (s *Shelf) Search(ctx context.Context, org string, in *SearchIn) (*Run, err
 	if s.History == nil {
 		return nil, ErrNoHistory
 	}
-	h, err := s.History.History(ctx, org)
+
+	// The machine, before the history.
+	//
+	// Reading a tenant's history is the expensive half: up to a hundred thousand
+	// retained records, each sealed body opened and unmarshalled. A token taken
+	// after that read bounds the arithmetic and nothing else, so every tenant
+	// waiting for a worker was holding a whole history while it waited. The hold
+	// is taken HERE, in the caller that reads, and handed to the callee that
+	// computes. topology.Width is pure, so the width — and the validity of the
+	// space — is known without loading anything.
+	width, err := topology.Width(in.Space, in.Options)
 	if err != nil {
 		return nil, err
 	}
-	report, err := topology.Search(ctx, org, h, in.Space, in.Options, s.Cores)
+	held, err := s.Cores.Admit(ctx, width)
+	if err != nil {
+		return nil, err
+	}
+	defer held.Release()
+
+	h, err := s.History.History(ctx, org, held)
+	if err != nil {
+		return nil, err
+	}
+	report, err := topology.Search(ctx, org, h, in.Space, in.Options, held)
 	if err != nil {
 		return nil, err
 	}
@@ -268,12 +293,21 @@ func (s *Shelf) Fit(ctx context.Context, org string, in *FitIn) (*Fit, error) {
 	if s.History == nil {
 		return nil, ErrNoHistory
 	}
-	h, err := s.History.History(ctx, org)
+
+	// One candidate, so one worker — held before the history is read, for the
+	// reason stated in Search.
+	held, err := s.Cores.Admit(ctx, 1)
+	if err != nil {
+		return nil, err
+	}
+	defer held.Release()
+
+	h, err := s.History.History(ctx, org, held)
 	if err != nil {
 		return nil, err
 	}
 	started := time.Now()
-	snap, trial, err := topology.Fit(ctx, org, h, in.Topology, in.Options, s.Cores)
+	snap, trial, err := topology.Fit(ctx, org, h, in.Topology, in.Options, held)
 	if err != nil {
 		return nil, err
 	}

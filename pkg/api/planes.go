@@ -21,10 +21,12 @@ import (
 	"github.com/hanzoai/base/core"
 
 	"github.com/luxfi/aml/pkg/dictionary"
+	"github.com/luxfi/aml/pkg/engine"
 	"github.com/luxfi/aml/pkg/lists"
 	"github.com/luxfi/aml/pkg/models"
 	"github.com/luxfi/aml/pkg/replay"
 	"github.com/luxfi/aml/pkg/suppress"
+	"github.com/luxfi/aml/pkg/topology"
 	"github.com/luxfi/aml/pkg/types"
 	"github.com/luxfi/aml/pkg/watch"
 )
@@ -62,7 +64,10 @@ func (h *Handler) registerPlanes(se *core.ServeEvent) {
 	if w := h.Planes.Watch; w != nil {
 		se.Router.GET("/v1/aml/activations", get(h, w.Feed))
 		se.Router.POST("/v1/aml/activations", post(h, w.Record, true))
-		se.Router.GET("/v1/aml/activations/rates", get(h, w.Rates))
+		// A fold over a window, not a page: it examines up to MaxExamined rows
+		// however many the caller asked for, so it is admitted one per tenant and
+		// takes the machine's budget while it runs. See costly in gate.go.
+		se.Router.GET("/v1/aml/activations/rates", get(h, one(&h.folds, costly(h.Cores, w.Rates))))
 		se.Router.GET("/v1/aml/rungs", get(h, w.Ladder))
 		se.Router.POST("/v1/aml/rungs", post(h, w.Declare, true))
 		se.Router.POST("/v1/aml/rungs/{id}/retire", post(h, w.Retire, false))
@@ -161,10 +166,22 @@ type Replayed struct{ H *Handler }
 // purpose. Testing a shape before activation is monitoring work and not a
 // commercial read (AMLD4 Art. 41(2)), which is what entitles this read to the
 // sealed bodies at all.
-func (r Replayed) History(ctx context.Context, org string) (replay.History, error) {
+func (r Replayed) History(ctx context.Context, org string, held *topology.Grant) (replay.History, error) {
 	vault, err := r.H.vault(org)
 	if err != nil {
 		return nil, err
 	}
-	return r.H.history(org, vault)
+	return r.H.history(held, org, vault)
 }
+
+// Compiled hands the engine's own compiler to a rule replay.
+//
+// The sandbox reaches the engine through a one-method interface, so it has
+// nothing it could write to and the candidate is judged by the code that judges
+// production. Go's interfaces are structural but not covariant in a return type,
+// so the join is one line — and it is here, at the composition root beside
+// Replayed, rather than in either package.
+type Compiled struct{ E *engine.Evaluator }
+
+// Ready compiles a candidate rule set for the length of one replay.
+func (c Compiled) Ready(rules []types.Rule) (replay.Ruleset, error) { return c.E.Ready(rules) }

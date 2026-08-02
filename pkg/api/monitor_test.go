@@ -9,8 +9,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/hanzoai/base/core"
-
 	"github.com/luxfi/aml/pkg/dictionary"
 	"github.com/luxfi/aml/pkg/engine"
 	"github.com/luxfi/aml/pkg/lists"
@@ -29,26 +27,12 @@ import (
 // that ingest is WIRED to them — the failure it exists to catch is five correct
 // planes that nothing calls.
 
-func monitored(t *testing.T) *Handler {
+// monitored is the deployment. It is an alias of plane, kept because the tests
+// that use it are about ingest meeting the planes rather than about ingest
+// alone — and there is one assembly, so there is nothing for it to add.
+func monitored(t *testing.T, rules ...types.Rule) *Handler {
 	t.Helper()
-	app := shelves(t)
-	for _, ensure := range []func(core.App) error{lists.Ensure, suppress.Ensure, watch.Ensure, dictionary.Ensure} {
-		if err := ensure(app); err != nil {
-			t.Fatalf("ensure: %v", err)
-		}
-	}
-	silence := suppress.NewBase(app)
-	monitor := watch.NewBase(app)
-	monitor.Cover = silence
-
-	h := planeOn(t, app)
-	h.Planes = Planes{
-		Lists:      lists.NewBase(app),
-		Suppress:   silence,
-		Watch:      monitor,
-		Dictionary: dictionary.NewBase(app),
-	}
-	return h
+	return plane(t, rules...)
 }
 
 // payment is the wire shape the ingest route takes: the transaction at the top

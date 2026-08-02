@@ -100,7 +100,22 @@ func (b *Base) Window(ctx context.Context, subj Subject, lookback time.Duration)
 // instead would let a rate movement change what a past window totalled, so an
 // aggregate that crossed a reporting threshold yesterday could fall below it
 // today and a filed report would no longer be reproducible from the data.
+// An event IS one transaction, so an id this tenant has already recorded is not
+// a second event and is not appended. That matters beyond a client retry: the
+// answer to an offer is kept AFTER the writes, so a process that dies between
+// them leaves the work done and no record of having answered, and the client —
+// never answered — offers again. Every plane the ingest path writes to has to
+// recognise the transaction by itself rather than rely on being sequenced behind
+// something that does, or the count every aggregate rule reads is wrong by the
+// number of times the process was interrupted.
 func (b *Base) Append(ctx context.Context, orgID string, e Event) error {
+	held, err := events.Find(b.app, orgID, fieldTxID+" = {:tx}", "", 1, dbx.Params{"tx": e.ID})
+	if err != nil {
+		return fmt.Errorf("history: %w", err)
+	}
+	if len(held) > 0 {
+		return nil
+	}
 	r, err := events.New(b.app, orgID)
 	if err != nil {
 		return fmt.Errorf("history: %w", err)

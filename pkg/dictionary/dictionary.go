@@ -109,9 +109,19 @@ var ErrStore = errors.New("dictionary: store")
 // A thousand distinct payload keys is already past the point where the answer is
 // "this institution has a schema"; the declared fields are a fixed set beside it
 // and are never turned away.
+//
+// MaxName is what makes those two COUNTS into a figure in bytes. A key is a
+// string the caller wrote, so "a thousand names" is a thousand times whatever
+// length a caller chose — a bound over a count of caller-sized things is not a
+// bound. With MaxName, one name has a greatest cost, MaxCustom multiplies it, and
+// [Ceiling] states the product; without it there is no honest number to state.
+// 128 bytes is longer than any field name in a payload format anybody maintains,
+// and a name past it is turned away exactly as a name past the vocabulary is:
+// counted, published, and never an error.
 const (
 	MaxKeys   = 256
 	MaxCustom = 1024
+	MaxName   = 128
 )
 
 // Field is one entry in the catalog.

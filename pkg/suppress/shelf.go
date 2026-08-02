@@ -52,7 +52,12 @@ var kind = store.Kind{
 		// The hot read: this tenant's suppressions that could cover an activation
 		// of this rule. The blanket ones carry an empty rule and are read by the
 		// same index.
-		{Name: "rule", Fields: []string{store.Org, fieldRule}},
+		// Lifted is in the index because the cover read asks for rows that are
+		// NOT lifted, and it asks on the ingest path: a ledger that keeps every
+		// decision forever (by design — a lifted suppression is a record of a
+		// decision) would otherwise make the hot read scan an institution's whole
+		// history of them.
+		{Name: "rule", Fields: []string{store.Org, fieldRule, fieldLifted}},
 		// The subject read, for the ledger view of one account or address.
 		{Name: "subject", Fields: []string{store.Org, fieldKind, fieldValue}},
 	},
@@ -188,16 +193,41 @@ func (s *Shelf) Suppress(ctx context.Context, org string, in *SuppressIn) (*Supp
 	return &sup, nil
 }
 
+// covering is the one definition of which rows could cover an activation of a
+// rule for this tenant: the ones naming it, plus the blanket ones, MINUS the
+// lifted.
+//
+// Excluding the lifted in the QUERY and not in the loop is the whole of it.
+// Lifting never deletes — a lifted suppression is the record of a decision, and
+// the ledger keeps it — so declare-and-lift churn grows the rows on a rule
+// without ever reaching the crowding bound, which counts only what is in force.
+// Read unordered and paged at MaxCandidates, those dead rows eventually fill the
+// page and the institution's live, declared suppression stops being found: the
+// MLRO's decision silently stops applying, and only a query for Unchecked would
+// ever reveal it. A row that cannot cover is not a candidate, so it is not read.
+//
+// It is one function because [Shelf.Cover] and [Shelf.inForce] must agree. Two
+// copies of this predicate is how a bound comes to count a different set than
+// the read it is bounding.
+func (s *Shelf) covering(org, rule string) ([]*core.Record, error) {
+	rows, err := kind.Find(s.app, org,
+		"("+fieldRule+" = {:rule} || "+fieldRule+" = '') && "+fieldLifted+" = ''",
+		"", s.maxCandidates()+1, dbx.Params{"rule": rule})
+	if err != nil {
+		return nil, fmt.Errorf("%w: %w", ErrStore, err)
+	}
+	return rows, nil
+}
+
 // inForce counts this tenant's suppressions that would be candidates for a cover
 // check of this rule — the ones naming it, plus the blanket ones — and that are
 // in force now. Lifted and expired rows are not candidates and are not counted:
 // the ledger keeps them forever and a bound over the ledger would eventually
 // refuse an institution for its own history.
 func (s *Shelf) inForce(org, rule string, at time.Time) (int, error) {
-	rows, err := kind.Find(s.app, org, fieldRule+" = {:rule} || "+fieldRule+" = ''", "", s.maxCandidates()+1,
-		dbx.Params{"rule": rule})
+	rows, err := s.covering(org, rule)
 	if err != nil {
-		return 0, fmt.Errorf("%w: %w", ErrStore, err)
+		return 0, err
 	}
 	n := 0
 	for _, row := range rows {
@@ -312,12 +342,9 @@ func (s *Shelf) Cover(ctx context.Context, org string, in *CoverIn) (*Cover, err
 	}
 	rule := strings.TrimSpace(in.Rule)
 
-	// The candidates are this tenant's suppressions naming this rule, plus the
-	// blanket ones. Both halves are bound parameters; neither is interpolated.
-	rows, err := kind.Find(s.app, org, fieldRule+" = {:rule} || "+fieldRule+" = ''", "", s.maxCandidates()+1,
-		dbx.Params{"rule": rule})
+	rows, err := s.covering(org, rule)
 	if err != nil {
-		return nil, fmt.Errorf("%w: %w", ErrStore, err)
+		return nil, err
 	}
 	out := &Cover{}
 	if len(rows) > s.maxCandidates() {
