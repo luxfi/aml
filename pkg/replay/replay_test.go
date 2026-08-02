@@ -20,13 +20,24 @@ type evaluator struct {
 	fire func(types.Rule, types.EvalContext) (bool, error)
 }
 
-func (e evaluator) EvalAll(_ context.Context, rules []types.Rule, tx types.Transaction, ent types.Entity) []types.RuleHit {
+// Ready compiles nothing, but it does what the engine's does: it hands back a
+// value that holds the rules, so the set has an owner and a lifetime.
+func (e evaluator) Ready(rules []types.Rule) (Ruleset, error) {
+	return compiled{fire: e.fire, rules: rules}, nil
+}
+
+type compiled struct {
+	fire  func(types.Rule, types.EvalContext) (bool, error)
+	rules []types.Rule
+}
+
+func (c compiled) EvalAll(_ context.Context, tx types.Transaction, ent types.Entity) []types.RuleHit {
 	var hits []types.RuleHit
-	for _, r := range rules {
+	for _, r := range c.rules {
 		if !r.Enabled {
 			continue
 		}
-		ok, err := e.fire(r, types.EvalContext{Tx: tx, Entity: ent})
+		ok, err := c.fire(r, types.EvalContext{Tx: tx, Entity: ent})
 		if err != nil {
 			hits = append(hits, types.RuleHit{Rule: r, Match: true, EvalErr: err.Error()})
 			continue

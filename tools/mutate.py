@@ -168,9 +168,82 @@ M = [
   "attribution survives into the alert an investigator opens"),
 
  ("scorer-ignored", "pkg/engine/engine.go",
-  "\tif hit, ok := e.assess(tx, entity); ok {\n\t\thits = append(hits, hit)\n\t}", "",
+  "\tif hit, ok := e.assess(tx, ent); ok {\n\t\thits = append(hits, hit)\n\t}", "",
   "./pkg/engine/", "TestScorerOnlyAdds",
   "the model's evidence reaches the score at all"),
+
+ # ---- The risk-planes hardening. One mutation per finding, so a fix that lost
+ # its test says so here rather than in the next review.
+
+ ("study-ungated", "pkg/api/gate.go",
+  "\tif g.in[tenant] {\n\t\treturn false\n\t}", "\tif false {\n\t\treturn false\n\t}",
+  "./pkg/api/", "TestOneRefusesTheSecondStudyAndFreesTheSlot|TestOnePerTenant",
+  "a tenant gets one model study at a time"),
+
+ ("workers-unclamped", "pkg/topology/search.go",
+  "\tif asked > MaxWorkers {\n\t\tasked = MaxWorkers\n\t}", "",
+  "./pkg/topology/", "TestWorkersAreClamped",
+  "a caller cannot name the width of its own study"),
+
+ ("decider-from-the-body", "pkg/api/typed.go",
+  "\t\t// And the decider is written after both, from the credential.\n\t\tdecide(&in, who.Subject)", "",
+  "./pkg/api/", "TestTheDeciderIsTheCredentialAndNotTheBody",
+  "a governed record names the verified subject, not the request body"),
+
+ ("case-decider-from-the-body", "pkg/api/routes.go",
+  "\t\t// The decider, from the credential and after the body, exactly as the typed\n\t\t// adapters do it for the record planes.\n\t\tdecide(&in, who.Subject)", "\t\t_ = who",
+  "./pkg/api/", "TestClosingACaseNamesTheCredential",
+  "the retained assessment is signed by the credential, not the request body"),
+
+ ("crowding-unbounded", "pkg/suppress/shelf.go",
+  "\tif inForce >= s.maxInForce() {", "\tif false {",
+  "./pkg/suppress/", "TestCrowdingIsRefusedWhereItCostsARequest",
+  "crowding is refused where a refusal costs a request, not a payment"),
+
+ ("cover-silently-partial", "pkg/suppress/shelf.go",
+  "\t\trows, out.Partial = rows[:s.maxCandidates()], true", "\t\trows = rows[:s.maxCandidates()]",
+  "./pkg/suppress/", "TestACrowdedCoverDegradesAndSaysSo",
+  "an incomplete cover check is marked rather than absorbed"),
+
+ ("firing-not-identified", "pkg/watch/shelf.go",
+  "\tif a.Tx != \"\" {\n\t\ta.ID = firing(org, a.Tx, rule, subj)", "\tif false {\n\t\ta.ID = firing(org, a.Tx, rule, subj)",
+  "./pkg/watch/", "TestARetriedFiringIsOneActivation|TestARetryDoesNotFoldAgainstItself",
+  "one firing is one activation however often it is offered"),
+
+ ("record-unnameable", "pkg/retention/record.go",
+  "\tif r.Fingerprint != \"\" {", "\tif false {",
+  "./pkg/api/", "TestARetriedTransactionIsCountedOnce",
+  "a retried transaction is the same retained fact, not a conflict"),
+
+ ("rung-unbounded", "pkg/watch/shelf.go",
+  "\tcase in.Count > MaxCount:", "\tcase false:",
+  "./pkg/watch/", "TestARungIsBounded",
+  "a rung may not declare a count that becomes an unbounded read"),
+
+ ("streak-unclamped", "pkg/watch/shelf.go",
+  "\tif deepest > MaxCount {\n\t\tdeepest = MaxCount\n\t}", "",
+  "./pkg/watch/", "TestTheStreakReadIsBoundedWhateverTheRowsSay",
+  "the ingest-path read is bounded whatever a stored rung says"),
+
+ ("custom-number-stored", "pkg/dictionary/shelf.go",
+  "\t\tif s.origin == Declared {", "\t\tif true {",
+  "./pkg/dictionary/", "TestACustomNumberIsNeverStored",
+  "no payload value is ever stored, numbers included"),
+
+ ("vocabulary-unbounded", "pkg/dictionary/shelf.go",
+  "\t\tif c.names >= room {", "\t\tif false {",
+  "./pkg/dictionary/", "TestAVocabularyIsBoundedPerTenant",
+  "a tenant's payload vocabulary is bounded per tenant"),
+
+ ("store-vocabulary-unbounded", "pkg/dictionary/shelf.go",
+  "\t\t\t\t\tif room <= 0 {", "\t\t\t\t\tif false {",
+  "./pkg/dictionary/", "TestAVocabularyIsBoundedPerTenant",
+  "the STORED vocabulary is bounded too, not only the accumulator"),
+
+ ("adoption-not-reloaded", "pkg/anomaly/anomaly.go",
+  "\tif adopted != nil {", "\tif false {",
+  "./pkg/models/", "TestAnAdoptedControlDoesNotGoQuietOnItsOwn",
+  "an adopted control comes back after a rollout or an eviction"),
 ]
 
 def run(cmd, timeout=420):

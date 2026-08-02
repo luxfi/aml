@@ -14,8 +14,6 @@ import (
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/hanzoai/base/core"
 
-	"github.com/luxfi/aml/pkg/cases"
-	"github.com/luxfi/aml/pkg/reference"
 	"github.com/luxfi/aml/pkg/retention"
 	"github.com/luxfi/aml/pkg/token"
 	"github.com/luxfi/aml/pkg/types"
@@ -34,20 +32,17 @@ import (
 
 // shared is one record plane, reachable on every brand's Host, authenticating
 // through real tokens.
+// shared is one deployment's stores, on the shelves cmd/amld wires.
+//
+// It is the durable shelf and not a memory stand-in because what these tests are
+// ABOUT is the store boundary: whether one brand's institution can reach
+// another's rows. A boundary proven over a map is a property of the map — the
+// index, the filter and the column are exactly where it can be lost.
 func shared(t *testing.T) *Handler {
 	t.Helper()
-	return &Handler{
-		Identity: identity(),
-		Engine: testEngine([]types.Rule{{
-			ID: "ctr", Name: "CTR Threshold", DSL: "Tx.Notional > 10000.0",
-			Severity: types.SeverityHigh, Weight: 0.3, Action: types.ActionReport, Enabled: true,
-		}}),
-		Rate:    reference.Rates{},
-		Cases:   cases.NewStore(),
-		Alerts:  NewAlertStore(),
-		Records: retention.New(),
-		Keys:    token.NewKeyring(func(string) ([]byte, error) { return root, nil }),
-	}
+	h := planeOn(t, shelves(t))
+	h.Identity = identity()
+	return h
 }
 
 // call drives a handler as a caller on one brand's Host holding that brand's token.
@@ -93,11 +88,13 @@ func TestOneOrgNameUnderTwoBrandsIsTwoTenants(t *testing.T) {
 	luxTok := rs256(t, jwt.MapClaims{"iss": "https://lux.id", "owner": "acme", "orgs": orgs("acme")})
 	zooTok := rs256(t, jwt.MapClaims{"iss": "https://zoolabs.id", "owner": "acme", "orgs": orgs("acme")})
 
-	lux, err := h.Identity(bearing("api.lux.network", luxTok))
+	luxWho, err := h.Identity(bearing("api.lux.network", luxTok))
+	lux := luxWho.Tenant
 	if err != nil {
 		t.Fatalf("lux: %v", err)
 	}
-	zoo, err := h.Identity(bearing("api.zoo.ngo", zooTok))
+	zooWho, err := h.Identity(bearing("api.zoo.ngo", zooTok))
+	zoo := zooWho.Tenant
 	if err != nil {
 		t.Fatalf("zoo: %v", err)
 	}
@@ -258,7 +255,7 @@ func TestOneOrgNameUnderTwoBrandsIsTwoTenants(t *testing.T) {
 // inconvenience.
 func TestBothIdentitiesAgreeOnTheTenantKey(t *testing.T) {
 	iam := identity()
-	proxy := TrustedProxyHeader("X-Org-Id")
+	proxy := TrustedProxyHeader("X-Org-Id", "X-User-Id")
 
 	for _, tc := range []struct{ host, issuer, org string }{
 		{"api.hanzo.ai", "https://hanzo.id", "acme"},

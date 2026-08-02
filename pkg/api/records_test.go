@@ -2,6 +2,7 @@ package api
 
 import (
 	"bytes"
+	"context"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -13,12 +14,13 @@ import (
 
 	"github.com/hanzoai/base/core"
 
-	"github.com/luxfi/aml/pkg/cases"
+	"github.com/luxfi/aml/internal/instance"
 	"github.com/luxfi/aml/pkg/engine"
 	"github.com/luxfi/aml/pkg/reference"
 	"github.com/luxfi/aml/pkg/replay"
 	"github.com/luxfi/aml/pkg/retention"
 	"github.com/luxfi/aml/pkg/token"
+	"github.com/luxfi/aml/pkg/topology"
 	"github.com/luxfi/aml/pkg/types"
 )
 
@@ -45,8 +47,24 @@ func send(method, target string, body any) (*core.RequestEvent, *httptest.Respon
 	return e, rec
 }
 
-// plane is a handler with a working record plane and one rule.
-func plane(t *testing.T, rules ...types.Rule) *Handler {
+// shelves opens an instance the deployment's way.
+//
+// There is one assembly (api.Wire) and these tests use it, deliberately. A green
+// suite over an arrangement production does not have proves nothing about
+// production: the record fingerprint was a struct field no column stored, so
+// every retry of one transaction conflicted permanently on the durable shelf
+// while every test passed on a hand-built handler over a memory one. See
+// wire_test.go.
+func shelves(t *testing.T) core.App {
+	t.Helper()
+	app := instance.New(t)
+	t.Cleanup(app.Cleanup)
+	return app
+}
+
+// planeOn is the deployment, over one app, with a rule set. It is separate from
+// plane so a restart test can open a second instance over the first one's bytes.
+func planeOn(t *testing.T, app core.App, rules ...types.Rule) *Handler {
 	t.Helper()
 	if len(rules) == 0 {
 		rules = []types.Rule{{
@@ -54,15 +72,19 @@ func plane(t *testing.T, rules ...types.Rule) *Handler {
 			Severity: types.SeverityHigh, Weight: 0.3, Action: types.ActionReport, Enabled: true,
 		}}
 	}
-	return &Handler{
-		Identity: func(*http.Request) (string, error) { return acme, nil },
-		Engine:   testEngine(rules),
-		Rate:     reference.Rates{},
-		Cases:    cases.NewStore(),
-		Alerts:   NewAlertStore(),
-		Records:  retention.New(),
-		Keys:     token.NewKeyring(func(string) ([]byte, error) { return root, nil }),
+	d := deployment()
+	d.Rules = rules
+	h, err := Wire(app, d)
+	if err != nil {
+		t.Fatalf("wire: %v", err)
 	}
+	return h
+}
+
+// plane is the deployment over a fresh app.
+func plane(t *testing.T, rules ...types.Rule) *Handler {
+	t.Helper()
+	return planeOn(t, shelves(t), rules...)
 }
 
 // keyless is a handler whose key material has not arrived.
@@ -434,7 +456,11 @@ func TestClosingARelationshipStartsTheClockOnWhatIsInsideIt(t *testing.T) {
 	}
 
 	inside = only(t, h, retention.ClassTransaction)
-	if want := ended.AddDate(retention.Period, 0, 0); !inside.Expiry().Equal(want) {
+	// To the millisecond the shelf keeps dates at. The ledger's own digest is
+	// computed in UnixMilli for the same reason: a clock read back is the clock
+	// that was stored, and comparing it against a nanosecond the caller happened
+	// to hold tests the test's precision rather than the record's.
+	if want := ended.AddDate(retention.Period, 0, 0).Truncate(time.Millisecond); !inside.Expiry().Equal(want) {
 		t.Errorf("expiry = %s, want five years from the end of the relationship (%s)", inside.Expiry(), want)
 	}
 
@@ -563,7 +589,7 @@ func TestSandboxRefusesAnEmptyHistory(t *testing.T) {
 // replay.Evaluator — if those two stop fitting, this file stops compiling.
 func TestSandboxReplaysTheEngineOverRetainedHistory(t *testing.T) {
 	h := plane(t)
-	var _ replay.Evaluator = h.Engine.Evaluator()
+	var _ replay.Evaluator = Compiled{E: h.Engine.Evaluator()}
 
 	for _, notional := range []float64{500, 15000, 9500} {
 		if rec := ingest(t, h, map[string]any{
@@ -756,7 +782,7 @@ func TestHistoryDoesNotSilentlySkipARecordItCannotOpen(t *testing.T) {
 		t.Fatalf("Retain: %v", err)
 	}
 
-	if _, err := h.history(acme, vault); !errors.Is(err, token.ErrSealed) {
+	if _, err := h.history(paid(), acme, vault); !errors.Is(err, token.ErrSealed) {
 		t.Fatalf("err = %v, want ErrSealed", err)
 	}
 
@@ -786,7 +812,7 @@ func TestHistoryStaysInsideTheOrg(t *testing.T) {
 		t.Fatalf("vault: %v", err)
 	}
 
-	got, err := h.history(acme, mine)
+	got, err := h.history(paid(), acme, mine)
 	if err != nil {
 		t.Fatalf("history: %v", err)
 	}
@@ -794,7 +820,7 @@ func TestHistoryStaysInsideTheOrg(t *testing.T) {
 		t.Fatalf("own history = %d events, want 1", len(got))
 	}
 
-	other, err := h.history("beta", theirs)
+	other, err := h.history(paid(), "beta", theirs)
 	if err != nil {
 		t.Fatalf("history: %v", err)
 	}
@@ -841,4 +867,15 @@ func testEngine(rules []types.Rule) *engine.Engine {
 		panic(err)
 	}
 	return eng
+}
+
+// paid is a hold on a budget wide enough for a test's read. The whole-history
+// read demands one, because it is the one read that is worth paying for — see
+// Handler.history and topology.Budget.
+func paid() *topology.Grant {
+	held, err := topology.NewBudget(1).Admit(context.Background(), 1)
+	if err != nil {
+		panic(err)
+	}
+	return held
 }

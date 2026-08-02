@@ -49,6 +49,22 @@ type Reference interface {
 	Jurisdiction(code string) (string, error)
 }
 
+// Lists answers whether a value is on one of the institution's own allow or deny
+// lists.
+//
+// The org is the tenant KEY the transaction under evaluation carries, so a rule
+// can only ever read its own institution's lists — the same value that indexes
+// every other record plane, passed through rather than resolved again here.
+//
+// It returns an error for a list nobody declared, and for an empty value, rather
+// than reporting "not listed". Both would be a rule that is present in the
+// catalog, visible in the interface, counted as coverage, and incapable of
+// firing — which is the failure ErrNoProvider exists to prevent, arrived at from
+// the data side instead of the configuration side.
+type Lists interface {
+	Listed(ctx context.Context, org, name, value string) (bool, error)
+}
+
 // Rate converts an amount into USD.
 //
 // It returns an error for a currency it does not know rather than passing the
@@ -71,6 +87,7 @@ type Providers struct {
 	Screen    Screen
 	Reference Reference
 	Rate      Rate
+	Lists     Lists
 
 	// Now supplies the evaluation instant. Tests set it; production leaves it nil
 	// and gets the wall clock.
@@ -89,6 +106,7 @@ const (
 	capScreen    capability = "screen"
 	capReference capability = "reference"
 	capRate      capability = "rate"
+	capLists     capability = "lists"
 )
 
 // vocabulary maps each term a rule expression may call to the provider that
@@ -114,6 +132,7 @@ var vocabulary = map[string]capability{
 	"Tier":       capReference,
 	"USD":        capRate,
 	"Near":       capRate,
+	"Listed":     capLists,
 }
 
 func (p Providers) has(c capability) bool {
@@ -126,6 +145,8 @@ func (p Providers) has(c capability) bool {
 		return p.Reference != nil
 	case capRate:
 		return p.Rate != nil
+	case capLists:
+		return p.Lists != nil
 	}
 	return false
 }
