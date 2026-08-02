@@ -1,10 +1,19 @@
 import { defineConfig, devices } from '@playwright/test'
+import { fileURLToPath } from 'node:url'
 
 // The bundle is built first, then served by e2e/serve.mjs with the deployed
 // CSP. Nothing here relaxes the policy — see e2e/serve.mjs for why the mock API
 // can live on the same origin without doing so.
 // A port of this harness's own, so a stray server cannot be mistaken for it.
 const PORT = 4319
+
+// The browser is given a machine with no Geist installed on it, because this
+// one has Geist installed and so will most others — and a locally resolvable
+// Geist makes e2e/font.spec.ts pass against a console that fetches no font at
+// all. Set here rather than in the `e2e` script so it holds however the suite
+// is started, including a bare `npx playwright test`. See e2e/fontconfig.xml,
+// and the negative control that proves it took effect.
+process.env.FONTCONFIG_FILE = fileURLToPath(new URL('e2e/fontconfig.xml', import.meta.url))
 
 export default defineConfig({
   testDir: './e2e',
