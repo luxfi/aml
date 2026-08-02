@@ -382,3 +382,44 @@ func TestReliabilityRefusesWhenTheMapDoes(t *testing.T) {
 		t.Fatalf("the bound reader drew %d bins, want 10", len(bins))
 	}
 }
+
+// TestACentroidCollisionPoolsRatherThanPicks pins the second half of the tie
+// defect, and it is a different failure from the first.
+//
+// Two blocks whose centroids are distinct floats but round to one place on the
+// map cannot both be a knot — the map has one value at one score. Keeping either
+// one states a probability the pooled evidence does not support: here the lower
+// block is 2-in-10 and the upper is 8-in-10, so a map that keeps the max says
+// 0.8 where the evidence says 0.5, at a score that is one place on the map and
+// carries both blocks' rows. Pooling is the only answer that is a mean of what
+// was actually observed there.
+//
+// The collision is engineered rather than waited for, because that is what makes
+// this a test: round6 collapses anything inside 5e-7, and a decision score is
+// round4'd before it ever gets here.
+func TestACentroidCollisionPoolsRatherThanPicks(t *testing.T) {
+	var s []Sample
+	// Two distinct scores 1e-9 apart: two blocks, one centroid after round6.
+	for i := range 10 {
+		s = append(s, Sample{Score: 0.5, Productive: i < 2}) // 0.2
+	}
+	for i := range 10 {
+		s = append(s, Sample{Score: 0.5 + 1e-9, Productive: i < 8}) // 0.8
+	}
+	m, err := Fit(s, Isotonic, shape)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(m.Knots) != 1 {
+		t.Fatalf("%d knots at one rounded score %v — a map has one value at one score", len(m.Knots), m.Knots)
+	}
+	r, err := m.Under(shape)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 10 of 20 productive across the two pooled blocks.
+	if got := r.P(0.5); math.Abs(got-0.5) > 1e-6 {
+		t.Errorf("P(0.5) = %.6f, want 0.500000 — the colliding blocks were picked between rather than pooled "+
+			"(0.8 is the upper block alone, 0.2 the lower)", got)
+	}
+}
