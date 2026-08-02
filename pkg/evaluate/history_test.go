@@ -42,7 +42,7 @@ func candidate(t *testing.T) policy.Policy {
 
 // history builds a recorded stream whose truth is a known function of the score,
 // with the live system's own action recorded beside it.
-func history(n int, seed int64) ([]Recorded, calibrate.Map, error) {
+func history(n int, seed int64) ([]Recorded, calibrate.Reader, error) {
 	rng := rand.New(rand.NewSource(seed))
 	var h []Recorded
 	var samples []calibrate.Sample
@@ -69,7 +69,11 @@ func history(n int, seed int64) ([]Recorded, calibrate.Map, error) {
 		})
 		samples = append(samples, calibrate.Sample{Score: s, Productive: productive})
 	}
-	cal, err := calibrate.Fit(samples, calibrate.Isotonic, shape)
+	m, err := calibrate.Fit(samples, calibrate.Isotonic, shape)
+	if err != nil {
+		return h, calibrate.Reader{}, err
+	}
+	cal, err := m.Under(shape)
 	return h, cal, err
 }
 
@@ -154,7 +158,7 @@ func TestTalliesAreOrdered(t *testing.T) {
 // An empty history and a candidate that changes nothing render identically. The
 // difference is the whole reason a sandbox exists, so it must be stated.
 func TestReplayRefusesAnEmptyHistory(t *testing.T) {
-	r := Replay(nil, calibrate.Map{}, candidate(t), rank)
+	r := Replay(nil, calibrate.Reader{}, candidate(t), rank)
 	if r.Refusal == "" {
 		t.Fatal("an empty replay reported as if it had run")
 	}
@@ -172,7 +176,7 @@ func TestReplayWithoutCalibrationSaysWhyNothingActs(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	r := Replay(h, calibrate.Map{}, candidate(t), rank)
+	r := Replay(h, calibrate.Reader{}, candidate(t), rank)
 	if r.Refusal == "" {
 		t.Fatal("every row took the floor and the report did not say why")
 	}

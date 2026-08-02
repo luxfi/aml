@@ -87,7 +87,7 @@ func TestMetricsAreOrderInvariant(t *testing.T) {
 // Absence is not zero. On a plane where most events are unjudged this is the
 // default state, and a rate reported as 0.0 reads as a perfect model.
 func TestUnjudgedReportsAbsenceNotZero(t *testing.T) {
-	m := Measure([]Observation{{Score: 0.9}, {Score: 0.1}}, 0.5, policy.Cost{}, calibrate.Map{})
+	m := Measure([]Observation{{Score: 0.9}, {Score: 0.1}}, 0.5, policy.Cost{}, calibrate.Reader{})
 	if m.Rows != 2 || m.Judged != 0 {
 		t.Fatalf("counted %d rows / %d judged", m.Rows, m.Judged)
 	}
@@ -100,7 +100,7 @@ func TestUnjudgedReportsAbsenceNotZero(t *testing.T) {
 
 	// One class only: prevalence is real, separation is not.
 	one := []Observation{obs(0.9, true), obs(0.8, true), obs(0.7, true)}
-	m = Measure(one, 0.5, policy.Cost{}, calibrate.Map{})
+	m = Measure(one, 0.5, policy.Cost{}, calibrate.Reader{})
 	if m.Prevalence == nil || *m.Prevalence != 1 {
 		t.Errorf("prevalence over one class is %v, want 1", m.Prevalence)
 	}
@@ -124,9 +124,9 @@ func TestCostWeightedOptimumMovesWithThePrices(t *testing.T) {
 
 	// A miss priced far above an alarm should push the threshold DOWN — flag
 	// more, catch more.
-	cheap := Measure(o, 0.5, policy.Cost{Miss: 1_000_000_000_000, Alarm: 1_000_000}, calibrate.Map{})
+	cheap := Measure(o, 0.5, policy.Cost{Miss: 1_000_000_000_000, Alarm: 1_000_000}, calibrate.Reader{})
 	// An alarm priced above a miss should push it UP — flag almost nothing.
-	dear := Measure(o, 0.5, policy.Cost{Miss: 1_000_000, Alarm: 1_000_000_000_000}, calibrate.Map{})
+	dear := Measure(o, 0.5, policy.Cost{Miss: 1_000_000, Alarm: 1_000_000_000_000}, calibrate.Reader{})
 
 	if cheap.BestThreshold == nil || dear.BestThreshold == nil {
 		t.Fatal("no cost-optimal threshold was found under stated prices")
@@ -149,7 +149,7 @@ func TestCostWeightedOptimumMovesWithThePrices(t *testing.T) {
 
 // An unstated price must produce no cost at all, not a cost of zero.
 func TestNoStatedPriceMeansNoCost(t *testing.T) {
-	m := Measure([]Observation{obs(0.9, true), obs(0.1, false)}, 0.5, policy.Cost{}, calibrate.Map{})
+	m := Measure([]Observation{obs(0.9, true), obs(0.1, false)}, 0.5, policy.Cost{}, calibrate.Reader{})
 	if m.CostNano != nil || m.BestNano != nil || m.BestThreshold != nil {
 		t.Errorf("priced a mistake nobody put a price on: %+v", m)
 	}
@@ -170,11 +170,15 @@ func TestCalibrationMovesBrierAndNotSeparation(t *testing.T) {
 		o = append(o, obs(s, productive))
 		samples = append(samples, calibrate.Sample{Score: s, Productive: productive})
 	}
-	cal, err := calibrate.Fit(samples, calibrate.Isotonic, shape)
+	m, err := calibrate.Fit(samples, calibrate.Isotonic, shape)
 	if err != nil {
 		t.Fatal(err)
 	}
-	raw := Measure(o, 0.5, policy.Cost{}, calibrate.Map{})
+	cal, err := m.Under(shape)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw := Measure(o, 0.5, policy.Cost{}, calibrate.Reader{})
 	fitted := Measure(o, 0.5, policy.Cost{}, cal)
 
 	if *raw.ROC != *fitted.ROC || *raw.PR != *fitted.PR {
@@ -230,7 +234,7 @@ func TestAnUnrepresentablePriceIsAbsentAndNotWrapped(t *testing.T) {
 		obsv = append(obsv, obs(float64(i)/200, i%3 == 0))
 	}
 	huge := policy.Cost{Miss: math.MaxInt64 / 4, Alarm: math.MaxInt64 / 4}
-	m := Measure(obsv, 0.5, huge, calibrate.Map{})
+	m := Measure(obsv, 0.5, huge, calibrate.Reader{})
 	if m.CostNano != nil {
 		t.Errorf("a cost of %d was reported from a product that does not fit in an int64", *m.CostNano)
 	}

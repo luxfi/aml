@@ -135,17 +135,29 @@ func Learning(history []Observation, method, shape string, steps int, cost polic
 			// so it is still measured and reported. A curve that went blank
 			// wherever the calibration refused would hide the model improving
 			// underneath it.
-			s.Train = Measure(train, 0, cost, calibrate.Map{})
-			s.Ahead = Measure(ahead, 0, cost, calibrate.Map{})
+			s.Train = Measure(train, 0, cost, calibrate.Reader{})
+			s.Ahead = Measure(ahead, 0, cost, calibrate.Reader{})
+			out = append(out, s)
+			continue
+		}
+		// The step's own fit is read under the shape it was just fitted under —
+		// the one place that identity is a fact rather than an assumption. A bind
+		// that refuses here is a fit that cannot describe its own sample, which is
+		// a refusal and not a step.
+		read, err := cal.Under(shape)
+		if err != nil {
+			s.Refusal = err.Error()
+			s.Train = Measure(train, 0, cost, calibrate.Reader{})
+			s.Ahead = Measure(ahead, 0, cost, calibrate.Reader{})
 			out = append(out, s)
 			continue
 		}
 		// The operating point is the score at the median fitted probability, so
 		// every step is measured at a comparable place on its own map rather than
 		// at a constant score that means something different at each step.
-		at := scoreAt(cal, 0.5)
-		s.Train = Measure(train, at, cost, cal)
-		s.Ahead = Measure(ahead, at, cost, cal)
+		at := scoreAt(read, 0.5)
+		s.Train = Measure(train, at, cost, read)
+		s.Ahead = Measure(ahead, at, cost, read)
 		out = append(out, s)
 	}
 	return out
