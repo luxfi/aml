@@ -163,3 +163,28 @@ func TestTheDegradationReportNamesEveryBoundedStore(t *testing.T) {
 		t.Error("a tenant that has been scored reports no model")
 	}
 }
+
+// TestTheBehaviouralModelIsShadowUntilSomebodyArmsIt.
+//
+// A default that fails towards "the statistical plane is now deciding" is the one
+// direction a default must not fail in: detection has to be testable before it is
+// activated, and a model that acts before anyone has read what it would have done
+// is a model nobody chose. So the field is stated from the LIVE side and the zero
+// value is shadow.
+func TestTheBehaviouralModelIsShadowUntilSomebodyArmsIt(t *testing.T) {
+	app := shelves(t)
+	d := deployment()
+	d.Live = false
+	h, err := Wire(app, d)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !h.Anomaly.Config().Shadow {
+		t.Error("a deployment that said nothing about the behavioural model got one that contributes to verdicts")
+	}
+	if armed, err := Wire(shelves(t), func() Deployment { d := deployment(); d.Live = true; return d }()); err != nil {
+		t.Fatal(err)
+	} else if armed.Anomaly.Config().Shadow {
+		t.Error("a deployment that armed the model still got shadow")
+	}
+}

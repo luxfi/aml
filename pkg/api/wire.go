@@ -81,11 +81,16 @@ type Deployment struct {
 	Rate reference.Rates
 	// Jurisdictions is the sanctioned-jurisdiction reference the rules read.
 	Jurisdictions reference.Jurisdictions
-	// Shadow keeps the behavioural model out of every verdict while it learns and
-	// reports what it would have done. It is the safe default and it is true for
-	// the zero value, because a detection that acts before anyone has read what it
-	// would have done is a detection nobody chose.
-	Shadow bool
+	// Live lets the behavioural model contribute to a verdict.
+	//
+	// It is stated from the LIVE side so that the zero value is shadow. A
+	// detection has to be testable before it is activated: a new deployment
+	// scores, learns and publishes at GET /v1/aml/anomaly what it WOULD have
+	// alerted on, and contributes nothing to any transaction's outcome until
+	// somebody has read that. Written as `Shadow bool` the same field would arm
+	// the model for anyone who did not think about it, which is the one direction
+	// a default must never fail in.
+	Live bool
 	// Limit is the reporting limit transactions are judged against. Zero takes
 	// the fallback.
 	Limit float64
@@ -126,7 +131,7 @@ func Wire(app core.App, d Deployment) (*Handler, error) {
 	// behavioural measure reads; the model reads them to score whether a
 	// transaction is unusual for the entity that made it.
 	windows := velocity.New(velocity.Config{})
-	model, err := anomaly.New(anomaly.Config{Shadow: d.Shadow}, windows)
+	model, err := anomaly.New(anomaly.Config{Shadow: !d.Live}, windows)
 	if err != nil {
 		return nil, fmt.Errorf("the behavioural plane cannot be built: %w", err)
 	}
