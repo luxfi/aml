@@ -11,7 +11,7 @@
     "e2e:browser": "playwright install --with-deps chromium"
   },
   "dependencies": {
-    "@hanzo/font": "^1.9.1",
+    "@hanzo/font": "^1.9.2",
     "@hanzo/gui": "8.0.0",
     "@hanzo/iam": "^0.21.5",
     "@hanzogui/button": "8.0.0",

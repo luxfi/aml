@@ -83,8 +83,9 @@ test.describe('the typeface', () => {
     // Once each. Both files are preloaded; a preload whose CORS mode disagrees
     // with the fetch that follows is not a saved request but a duplicated one,
     // and the only way to tell is to count.
+    const self = new URL(page.url()).origin
     for (const f of faces) {
-      const hits = seen.filter((r) => r.url === `${cdn}${dir}/${f.file}`)
+      const hits = seen.filter((r) => r.url === `${self}${dir}/${f.file}`)
       expect(hits.length, `${f.file} was fetched ${hits.length} times`).toBe(1)
       expect(hits[0].type).toBe('font')
     }
@@ -193,19 +194,20 @@ test.describe('the typeface', () => {
     const here = new URL(page.url()).origin
     const away = seen.filter((r) => new URL(r.url).origin !== here)
 
-    // Two kinds of cross-origin traffic, and the policy already draws the line
-    // between them: `connect-src` governs what the console ASKS (the identity
-    // it was already allowed to reach), `font-src` governs what it LOADS. This
-    // change adds to the second, so that is what is pinned: every subresource
-    // fetched from another origin is a font, and every one of them is ours.
+    // Two kinds of cross-origin traffic, and the policy draws the line between
+    // them: `connect-src` governs what the console ASKS (the identity it was
+    // already allowed to reach), `font-src` governs what it LOADS. The console
+    // carries its own faces now, so the second set is EMPTY — no subresource is
+    // loaded from anywhere but here. That is a stronger claim than the one this
+    // replaced, which allowed our CDN: an origin nothing fetches from cannot
+    // serve the wrong bytes, go down, or be asked for a beacon.
     const loads = away.filter((r) => r.type !== 'xhr' && r.type !== 'fetch')
-    expect([...new Set(loads.map((r) => new URL(r.url).origin))]).toEqual([cdn])
-    expect([...new Set(loads.map((r) => r.type))]).toEqual(['font'])
+    expect(loads.map((r) => r.url)).toEqual([])
 
-    // And the CDN is asked for the two files and for nothing else — no
-    // stylesheet, no script, no beacon riding along on the host we just let in.
-    const paths = [...new Set(away.filter((r) => new URL(r.url).origin === cdn).map((r) => new URL(r.url).pathname))]
-    expect(paths.sort()).toEqual(faces.map((f) => `${dir}/${f.file}`).sort())
+    // And the faces really are here, at the paths the bundle emits them to.
+    const fonts = seen.filter((r) => r.type === 'font')
+    expect([...new Set(fonts.map((r) => new URL(r.url).pathname))].sort())
+      .toEqual(faces.map((f) => `${dir}/${f.file}`).sort())
   })
 
   test('no face, and no preload, is refused by the policy', async ({ page }) => {
@@ -235,27 +237,27 @@ test.describe('the typeface', () => {
     // Written out in full, on purpose, and this is the one place in the suite
     // that does not derive them from src/font.ts.
     //
-    // These are not this console's to choose. They are the fleet's: the same
-    // two files, at the same two URLs, cached once for every Hanzo property,
-    // published to our CDN by the kit track. A console that quietly renames a
-    // file still passes every other test here — its own mock serves whatever it
-    // asks for — and then 404s in production against the real CDN. So the
-    // contract is stated where changing it means editing the agreement.
+    // Not fetched by a shipped build — the console self-hosts — but this is the
+    // agreement `FONT_ORIGIN=https://cdn.hanzo.ai` would be pointed at, and it
+    // is pinned here so a rename cannot go unnoticed. Nothing publishes Zen to
+    // that CDN today: every /fonts/zen/* path 404s while /fonts/geist/1.7.2/
+    // still answers, which is why the default moved off it.
     //
     // Immutable by version: nothing at these paths is ever rewritten, which is
     // what earns them `max-age=31536000, immutable`. A new Zen is a new
     // directory beside this one, never a new file inside it.
     expect(faces.map((f) => `${cdn}${dir}/${f.file}`)).toEqual([
-      'https://cdn.hanzo.ai/fonts/zen/1.9.1/ZenVariable.woff2',
-      'https://cdn.hanzo.ai/fonts/zen/1.9.1/ZenMonoVariable.woff2',
+      'https://cdn.hanzo.ai/fonts/zen/1.9.2/ZenVariable.woff2',
+      'https://cdn.hanzo.ai/fonts/zen/1.9.2/ZenMonoVariable.woff2',
     ])
   })
 
-  test('the CDN costs the policy exactly one host, in exactly one directive', () => {
+  test('the policy names no font host at all', () => {
     // The policy is the deployed one (e2e/serve.mjs sends this file verbatim),
-    // so this is a check on what ships. A font host is the cheapest possible
-    // widening of a CSP and also the easiest to widen by more than intended —
-    // one `*` or one extra directive and the fix has cost more than the bug.
+    // so this is a check on what ships. It used to widen `font-src` by one host
+    // for the CDN; the console carries its own faces, so the cheapest widening
+    // of a CSP is now no widening — and a host nothing fetches from cannot
+    // serve the wrong bytes or be asked for a beacon.
     const directives = new Map(
       csp
         .split(';')
@@ -267,7 +269,7 @@ test.describe('the typeface', () => {
         }),
     )
 
-    expect(directives.get('font-src')).toBe("'self' https://cdn.hanzo.ai")
+    expect(directives.get('font-src')).toBe("'self'")
     expect(directives.get('default-src')).toBe("'none'")
     expect(directives.get('style-src')).toBe("'self' 'sha256-47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU='")
     expect(directives.get('script-src')).toBe("'self'")
@@ -275,10 +277,10 @@ test.describe('the typeface', () => {
     expect(csp).not.toContain('unsafe-eval')
     expect(csp).not.toContain('*')
 
-    // The CDN is in font-src and nowhere else: it may serve this console faces
-    // and it may not serve it code, style, or a place to send data.
+    // And the CDN is in no directive at all — not font-src, not anywhere. The
+    // build fetches nothing from it, so naming it would be a permission granted
+    // to a host nobody asks.
     for (const [name, value] of directives) {
-      if (name === 'font-src') continue
       expect(value, `${name} names the CDN`).not.toContain('cdn.hanzo.ai')
     }
 

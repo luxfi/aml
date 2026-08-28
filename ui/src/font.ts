@@ -19,14 +19,15 @@
  */
 
 /**
- * Our own CDN, and the only origin this console will fetch a face from unless
- * it is told otherwise.
+ * Our own CDN — an ORIGIN this console can be pointed at, and no longer the one
+ * it uses by default.
  *
- * It is ours — the `cdn` app in front of our S3 — which is the whole difference
- * between this and a third-party font host: one copy, one version, one cache,
- * every property, and no request to anybody else's infrastructure. It already
- * answers with `access-control-allow-origin: *`, which a cross-origin face
- * requires and which is the reason a font host cannot simply be any static host.
+ * It is ours, the `cdn` app in front of our S3, and it answers with
+ * `access-control-allow-origin: *`, which a cross-origin face requires. What it
+ * does not do is carry Zen: every `/fonts/zen/*` path answers 404 today, while
+ * `/fonts/geist/1.7.2/` still answers 200, because the bytes there were put
+ * there by hand and nothing publishes ours. So the default is self-hosting from
+ * the package (see vite.config.ts) and this stays for `FONT_ORIGIN`.
  */
 export const cdn = 'https://cdn.hanzo.ai'
 
@@ -37,7 +38,7 @@ export const cdn = 'https://cdn.hanzo.ai'
  * at an old one. That is what lets the files be cached for a year: nothing at
  * a given path is ever rewritten, so nothing cached from it can go stale.
  */
-export const version = '1.9.1'
+export const version = '1.9.2'
 
 /** The immutable directory the two faces live in, on whichever origin serves them. */
 export const dir = `/fonts/zen/${version}`
