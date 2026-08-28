@@ -26,16 +26,15 @@
 
 import { getDefaultGuiConfig } from '@hanzogui/config-default'
 import { createGui } from '@hanzogui/core'
-import { createGeistMonoFont } from '@hanzogui/font-geist-mono'
-import { createGeistSansFont } from '@hanzogui/font-geist-sans'
+import { createZenMonoFont, createZenSansFont } from '@hanzogui/font-zen'
 
 import { origin, sheet } from './font'
 
 /**
  * The typeface, taken from the kit rather than spelled again here.
  *
- * Geist Sans is the UI face and Geist Mono the monospace one across every Hanzo
- * property, so the STACK — Geist first, then what to try when it has not
+ * Zen is the UI face and Zen Mono the monospace one across every Hanzo
+ * property, so the STACK — Zen first, then what to try when it has not
  * arrived — is @hanzo/gui's to state and this console's to read. A stack copied
  * into an app is a second source of truth: it does not fail when the kit's
  * changes, it just quietly stops matching the other hundred properties.
@@ -52,8 +51,8 @@ import { origin, sheet } from './font'
  * `$mono` on the one control whose content is machine text, and a font token
  * the config does not define resolves to nothing at all.
  */
-const sans = createGeistSansFont().family
-const mono = createGeistMonoFont().family
+const sans = createZenSansFont().family
+const mono = createZenMonoFont().family
 
 const base = getDefaultGuiConfig('web')
 

@@ -10,7 +10,7 @@ import { cdn, dir, faces, url } from './src/font.ts'
 /**
  * Where this build fetches its typeface from.
  *
- * Unset — every build we ship — is our own CDN: one copy of Geist, one version,
+ * Unset — every build we ship — is our own CDN: one copy of Zen, one version,
  * one cache, shared by every Hanzo property, and never a request to a font host
  * that is not ours.
  *
@@ -33,12 +33,12 @@ const origin = process.env.FONT_ORIGIN ?? cdn
  * are, which is why they read the paths from it rather than restating them.
  */
 function typeface(from: string): Plugin {
-  // The `geist` package publishes no subpath for its font files, so the package
-  // root is found through the one specifier it does export. The bytes served
-  // are that package's, at the version pinned in package.json — which is what
-  // makes the licence checkable: the OFL text below is the one shipped with the
-  // exact files that ship.
-  const root = dirname(dirname(createRequire(import.meta.url).resolve('geist/font')))
+  // `@hanzo/font` exports its font files by subpath, but not the licence beside
+  // them, so the package root is found through a specifier it does export and
+  // both are read from there. The bytes served are that package's, at the
+  // version pinned in package.json — which is what makes the licence checkable:
+  // the OFL text below is the one shipped with the exact files that ship.
+  const root = dirname(dirname(createRequire(import.meta.url).resolve('@hanzo/font/css')))
   const file = (rel: string) => readFileSync(join(root, rel))
 
   return {

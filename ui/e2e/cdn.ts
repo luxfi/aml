@@ -5,7 +5,7 @@
 // depends on which is a suite that reports on the network. So the request is
 // still MADE — it still has to pass `font-src`, it is still cross-origin, and
 // the tests that count cross-origin requests still see it — and it is answered
-// here from the `geist` package at the version the bundle pins.
+// here from the `@hanzo/font` package at the version the bundle pins.
 //
 // Same reasoning as the issuer in session.ts: keep the run offline without
 // relaxing anything.
@@ -18,7 +18,7 @@ import type { Page } from '@playwright/test'
 
 import { cdn, dir, faces } from '../src/font'
 
-const root = dirname(dirname(createRequire(import.meta.url).resolve('geist/font')))
+const root = dirname(dirname(createRequire(import.meta.url).resolve('@hanzo/font/css')))
 
 /** The bytes the CDN is expected to be serving, keyed by the path they live at. */
 const bytes = new Map(

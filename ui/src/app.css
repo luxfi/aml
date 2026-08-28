@@ -24,7 +24,7 @@
 
 /* The typeface floor, and only the floor.
  *
- * The typeface itself is @hanzo/gui's: Geist Sans and Geist Mono, whose stacks
+ * The typeface itself is @hanzo/gui's: Zen and Zen Mono, whose stacks
  * come from the kit's font packages and are declared at :root, with the
  * @font-face rules that install them, by src/gui.ts. These two are what is left
  * if that never happens — a browser with no constructable stylesheets — and

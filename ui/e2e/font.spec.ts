@@ -13,11 +13,11 @@
 // cannot be talked into agreeing:
 //
 //   - `CSS.getPlatformFontsForNode`, which reports the face the renderer
-//     actually rasterised those glyphs with. If Geist did not arrive, this says
+//     actually rasterised those glyphs with. If Zen did not arrive, this says
 //     Times New Roman, whatever the stylesheet says.
 //   - the request log, which says where the bytes came from and how often.
 //
-// The faces are served by e2e/cdn.ts, from the `geist` package at the version
+// The faces are served by e2e/cdn.ts, from the `@hanzo/font` package at the version
 // the bundle pins, so the run is offline and the cross-origin request is still
 // genuinely made and still has to pass `font-src`.
 
@@ -90,20 +90,20 @@ test.describe('the typeface', () => {
     }
   })
 
-  test('the console is set in Geist, and its machine text in Geist Mono', async ({ page }) => {
+  test('the console is set in Zen, and its machine text in Zen Mono', async ({ page }) => {
     await signIn(page)
     await page.goto('/cases')
     await expect(page.locator('nav.rail')).toBeVisible()
     await page.evaluate(() => document.fonts.ready)
 
-    // What the stylesheet asks for. Geist Sans is the UI face and Geist Mono
-    // the monospace one across the fleet, so the two stacks are pinned by name
+    // What the stylesheet asks for. Zen is the UI face and Zen Mono the
+    // monospace one across the fleet, so the two stacks are pinned by name
     // and not merely to each other — and the tail is pinned too, because the
-    // whole point of the fallback is what happens when Geist does not arrive
+    // whole point of the fallback is what happens when Zen does not arrive
     // and the one answer that is never acceptable is the browser's default.
     const { sans, mono, sansFace, monoFace } = await stacks(page)
-    expect(sansFace, 'the UI face is not Geist').toMatch(/^Geist( Sans)?$/)
-    expect(monoFace, 'the monospace face is not Geist Mono').toBe('Geist Mono')
+    expect(sansFace, 'the UI face is not Zen').toBe('Zen')
+    expect(monoFace, 'the monospace face is not Zen Mono').toBe('Zen Mono')
     expect(sans, 'the sans stack can fall back to a serif').toMatch(/(^|,\s*)(ui-sans-serif|system-ui)\b/)
     expect(sans.trimEnd()).toMatch(/sans-serif$/)
     expect(mono.trimEnd(), 'the mono stack can fall back to a serif').toMatch(/monospace$/)
@@ -118,17 +118,17 @@ test.describe('the typeface', () => {
     //
     // What it reports is the family name INSIDE the woff2, which is not the
     // name the @font-face registered it under: a CSS family name is an alias,
-    // and Vercel ships the UI face with `Geist` in it whatever a stack chooses
-    // to call it. So these two pin the FILE, the assertions above pin the
-    // ALIAS, and together they say the stack asked for a face and was given
-    // this one. They are also what separates "Geist arrived" from "something
-    // arrived": a fallback here reads DejaVu Sans, or Times New Roman.
+    // and the UI face ships with `Zen` in it whatever a stack chooses to call
+    // it. So these two pin the FILE, the assertions above pin the ALIAS, and
+    // together they say the stack asked for a face and was given this one.
+    // They are also what separates "Zen arrived" from "something arrived": a
+    // fallback here reads DejaVu Sans, or Times New Roman.
     //
     // The heading takes its family from nothing but the document, so what it is
     // set in is what body resolved to; it is measured instead of body because
     // an element whose text is all in its children rasterises no glyphs itself.
-    expect(await rendered(page, '.bar h1'), 'the UI is not set in Geist').toBe('Geist')
-    expect(await rendered(page, '.grid .id'), 'an id is not set in Geist Mono').toBe('Geist Mono')
+    expect(await rendered(page, '.bar h1'), 'the UI is not set in Zen').toBe('Zen')
+    expect(await rendered(page, '.grid .id'), 'an id is not set in Zen Mono').toBe('Zen Mono')
 
     // The seam. `ui.tsx` exports a Mono that is a KIT component carrying the
     // same class, and the kit dresses its own components with single-class
@@ -243,11 +243,11 @@ test.describe('the typeface', () => {
     // contract is stated where changing it means editing the agreement.
     //
     // Immutable by version: nothing at these paths is ever rewritten, which is
-    // what earns them `max-age=31536000, immutable`. A new Geist is a new
+    // what earns them `max-age=31536000, immutable`. A new Zen is a new
     // directory beside this one, never a new file inside it.
     expect(faces.map((f) => `${cdn}${dir}/${f.file}`)).toEqual([
-      'https://cdn.hanzo.ai/fonts/geist/1.7.2/GeistVariable.woff2',
-      'https://cdn.hanzo.ai/fonts/geist/1.7.2/GeistMonoVariable.woff2',
+      'https://cdn.hanzo.ai/fonts/zen/1.9.1/ZenVariable.woff2',
+      'https://cdn.hanzo.ai/fonts/zen/1.9.1/ZenMonoVariable.woff2',
     ])
   })
 

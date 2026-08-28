@@ -7,11 +7,11 @@
  * What is decided here is DELIVERY: which release, which files, which origin,
  * and the @font-face rules that install them.
  *
- * Geist is Vercel's, published under the SIL Open Font License 1.1. The bytes
- * served are the ones in the `geist` package at the version below, pinned — so
- * the licence that was read is the licence of the files that ship — and the OFL
- * text travels with them: beside the woff2 on the CDN, and emitted beside them
- * into the bundle when this console self-hosts (see vite.config.ts).
+ * Zen is Hanzo's, published under the SIL Open Font License 1.1. The bytes
+ * served are the ones in the `@hanzo/font` package at the version below, pinned
+ * — so the licence that was read is the licence of the files that ship — and the
+ * OFL text travels with them: beside the woff2 on the CDN, and emitted beside
+ * them into the bundle when this console self-hosts (see vite.config.ts).
  *
  * One variable file per family carries every weight from 100 to 900, which is
  * why there are two requests here and not the eighteen a static-weight cut of
@@ -31,16 +31,16 @@
 export const cdn = 'https://cdn.hanzo.ai'
 
 /**
- * The Geist release these files are cut from.
+ * The Zen release these files are cut from.
  *
  * It is part of the path, so a new release is a NEW path and never a new copy
  * at an old one. That is what lets the files be cached for a year: nothing at
  * a given path is ever rewritten, so nothing cached from it can go stale.
  */
-export const version = '1.7.2'
+export const version = '1.9.1'
 
 /** The immutable directory the two faces live in, on whichever origin serves them. */
-export const dir = `/fonts/geist/${version}`
+export const dir = `/fonts/zen/${version}`
 
 /**
  * The two files, in the order first paint needs them: the UI face, then the one
@@ -48,13 +48,13 @@ export const dir = `/fonts/geist/${version}`
  *
  * `file` is the name the fleet serves and every property fetches — one URL, so
  * one cache entry shared across all of them. It is the fleet's name and not the
- * upstream one, which is what `cut` and `from` record: where in the `geist`
+ * upstream one, which is what `cut` and `from` record: where in the `@hanzo/font`
  * package these exact bytes come from, for the self-hosted build and for the
  * suite, so both serve what the CDN serves rather than something like it.
  */
 export const faces = [
-  { file: 'GeistVariable.woff2', cut: 'geist-sans', from: 'Geist-Variable.woff2' },
-  { file: 'GeistMonoVariable.woff2', cut: 'geist-mono', from: 'GeistMono-Variable.woff2' },
+  { file: 'ZenVariable.woff2', cut: 'zen-sans', from: 'Zen-Variable.woff2' },
+  { file: 'ZenMonoVariable.woff2', cut: 'zen-mono', from: 'ZenMono-Variable.woff2' },
 ] as const
 
 export type Face = (typeof faces)[number]
@@ -96,7 +96,7 @@ export const origin = (): string => __FONT_ORIGIN__
  * painted immediately in the fallback and re-set when the face arrives. With
  * both files preloaded that window is short, and a swap that never happens
  * because the network is gone still leaves a readable screen — which is why the
- * stack behind Geist ends in a system face and never in a serif.
+ * stack behind Zen ends in a system face and never in a serif.
  *
  * These go on through the CSSOM with the kit's own stylesheet (src/gui.ts), so
  * `style-src` never sees a stylesheet parsed from markup and the served policy
