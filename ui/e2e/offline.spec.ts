@@ -87,14 +87,17 @@ test.describe('the air-gapped build', () => {
   })
 
   test('the licence travels with the files', async () => {
-    // Geist is Vercel's, under the SIL Open Font License 1.1, which permits
-    // redistribution and requires the notice to go with it. Hosting the bytes
-    // without the licence beside them is the one way this ships wrong, and it
-    // is invisible until somebody asks.
+    // Zen is under the SIL Open Font License 1.1, which permits redistribution
+    // and requires the notice to go with it. Zen is drawn from Geist, so the
+    // notice carries both holders and both are checked: dropping the upstream
+    // line is the same defect as dropping the licence. Hosting the bytes
+    // without it beside them is the one way this ships wrong, and it is
+    // invisible until somebody asks.
     const ofl = await fetch(`${at}${dir}/OFL.txt`)
     expect(ofl.status).toBe(200)
     const text = await ofl.text()
     expect(text).toContain('SIL OPEN FONT LICENSE Version 1.1')
     expect(text).toContain('Copyright (c) 2023 Vercel')
+    expect(text).toContain('Copyright (c) 2026 Hanzo AI, Inc.')
   })
 })
