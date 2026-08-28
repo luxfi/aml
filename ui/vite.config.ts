@@ -5,26 +5,33 @@ import { dirname, join } from 'node:path'
 import react from '@vitejs/plugin-react'
 import { defineConfig, type Plugin } from 'vite'
 
-import { cdn, dir, faces, url } from './src/font.ts'
+import { dir, faces, url } from './src/font.ts'
 
 /**
  * Where this build fetches its typeface from.
  *
- * Unset — every build we ship — is our own CDN: one copy of Zen, one version,
- * one cache, shared by every Hanzo property, and never a request to a font host
- * that is not ours.
+ * SELF-HOSTED by default: vite emits the two faces out of `@hanzo/font` into
+ * this bundle and serves them same-origin, which `font-src 'self'` already
+ * covers. That is what every other Hanzo surface does — the package IS the one
+ * copy of Zen, and a build that carries its own faces cannot be broken by
+ * anything outside it.
  *
- * `FONT_ORIGIN=` (set, empty) is the escape hatch, and it is a build argument
- * rather than a fork: an on-prem install that cannot reach us serves the same
- * two files, at the same paths, from its own origin. Same family names, same
- * token names, same @font-face rules, same stylesheet — only the origin moves,
- * and `font-src 'self'` already covers it.
+ * The default USED to be `cdn`, on the reasoning that one shared copy beats one
+ * per property. The reasoning is sound and the path does not exist: nothing
+ * publishes Zen to it, and every `/fonts/zen/*` URL answers 404 today while
+ * `/fonts/geist/1.7.2/` still answers 200. So the shipped default fetched two
+ * faces that are not there and every first paint fell to the system stack. The
+ * kit reached the same conclusion and removed its own CDN rules for it.
+ *
+ * `FONT_ORIGIN=https://cdn.hanzo.ai` opts back in, unchanged, for the day the
+ * fleet publishes that path — a build argument rather than a fork, same family
+ * names, same token names, same @font-face rules, only the origin moves.
  *
  * It is fixed at build because a face is needed for the first paint, and
  * anything the console would have to ask for first arrives too late to set the
  * first frame in.
  */
-const origin = process.env.FONT_ORIGIN ?? cdn
+const origin = process.env.FONT_ORIGIN ?? ''
 
 /**
  * The typeface, delivered.
