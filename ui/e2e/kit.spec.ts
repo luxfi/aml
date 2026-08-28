@@ -159,7 +159,7 @@ test.describe('the kit reaches the screens', () => {
     //
     // The stacks are read from the document rather than written out here: they
     // are @hanzo/gui's, and a copy of them in a test is one more place to drift
-    // from the kit. That the console is set in GEIST, and that the faces
+    // from the kit. That the console is set in ZEN, and that the faces
     // actually arrive and are what the renderer used, is e2e/font.spec.ts.
     const { families, sans, mono } = await page
       .locator('body, nav.rail, h1, h2, button, input, select, td, .grid .id, code')
