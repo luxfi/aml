@@ -8,7 +8,7 @@
     "preview": "vite preview"
   },
   "dependencies": {
-    "@hanzo/gui": "^4.8.0",
+    "@hanzo/gui": "8.3.0",
     "@hanzogui/config-default": "^4.4.0",
     "@hanzogui/core": "^4.4.0",
     "@hanzogui/theme": "^4.4.0",
