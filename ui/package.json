@@ -8,7 +8,7 @@
     "preview": "vite preview"
   },
   "dependencies": {
-    "@hanzo/gui": "8.3.0",
+    "@hanzo/gui": "8.3.1",
     "@hanzogui/config-default": "8.3.1",
     "@hanzogui/core": "8.3.1",
     "@hanzogui/theme": "8.3.1",
@@ -19,7 +19,7 @@
   "devDependencies": {
     "@types/react": "19.2.18",
     "@types/react-dom": "19.2.5",
-    "@vitejs/plugin-react": "^6.1.1",
+    "@vitejs/plugin-react": "^6.0.2",
     "typescript": "7.0.2",
     "vite": "^8.2.2"
   }
