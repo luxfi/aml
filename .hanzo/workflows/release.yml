@@ -11,6 +11,13 @@ name: Release
 # version that claims an artifact it does not have is worse than no version,
 # because a deploy pin will believe it.
 #
+# The daemon is built once per architecture, each on its own native pool, and
+# the two are joined into one manifest list under the release names. The lab
+# runs both architectures, so an amd64-only tag deploys on half the fleet and
+# the other half never starts. Each arch is compiled AND smoked on the machine
+# it ships to; nothing is emulated, so the smoke answers "does this run there"
+# rather than "does QEMU agree".
+#
 # Registry is ghcr.io/luxfi/aml. The container-registry rule is not mixed: a Lux
 # product publishes under ghcr.io/luxfi/*, exactly as luxfi/kms does. This is
 # also the only path with credentials provisioned on the forge, so it is the one
@@ -36,36 +43,32 @@ concurrency:
 
 jobs:
   build:
-    runs-on: [lux-build-linux-amd64]
+    # One job per architecture on its own native pool. The daemon is pure Go on
+    # alpine, so both arches build from the same Dockerfile with nothing
+    # cross-compiled and nothing translated.
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [amd64, arm64]
+    runs-on: ['lux-build-linux-${{ matrix.arch }}']
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      - name: Compute tags
+      - name: Name this arch's image
         id: meta
+        # A per-arch name, never a release name: the release names are a manifest
+        # list and only the merge job may write them. A tag that resolves to one
+        # architecture is worse than a tag that does not exist yet, because it
+        # pulls on that architecture and fails everywhere else.
         run: |
           set -euo pipefail
-          SHA_TAG="ghcr.io/luxfi/aml:sha-${GITHUB_SHA:0:7}"
+          echo "image=ghcr.io/luxfi/aml:sha-${GITHUB_SHA:0:7}-${{ matrix.arch }}" >> "$GITHUB_OUTPUT"
           if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
-            VERSION="${GITHUB_REF#refs/tags/v}"
-            {
-              echo "tags<<EOF"
-              echo "ghcr.io/luxfi/aml:v${VERSION}"
-              echo "ghcr.io/luxfi/aml:${VERSION}"
-              echo "$SHA_TAG"
-              echo "EOF"
-            } >> "$GITHUB_OUTPUT"
-            echo "probe=ghcr.io/luxfi/aml:v${VERSION}" >> "$GITHUB_OUTPUT"
-            echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+            echo "version=${GITHUB_REF#refs/tags/v}" >> "$GITHUB_OUTPUT"
           else
-            {
-              echo "tags<<EOF"
-              echo "$SHA_TAG"
-              echo "EOF"
-            } >> "$GITHUB_OUTPUT"
-            echo "probe=$SHA_TAG" >> "$GITHUB_OUTPUT"
             echo "version=sha-${GITHUB_SHA:0:7}" >> "$GITHUB_OUTPUT"
           fi
 
@@ -80,22 +83,22 @@ jobs:
         # setup-buildx-action with the docker-container driver. The container
         # driver nests a buildkit container inside the runner's DinD, which fails
         # at setup here (the pure-Go test job on the same runner passes; only the
-        # buildx-container build failed, producing no step log). The daemon builds
-        # a single linux/amd64 image, which is all this publishes, so the extra
-        # nesting bought nothing but a failure mode.
+        # buildx-container build failed, producing no step log). This job builds
+        # its own architecture and no other, which is exactly what the daemon
+        # serves and what `docker run` below needs loaded, so the extra nesting
+        # would buy nothing but a failure mode.
         run: |
           set -euo pipefail
-          first=$(printf '%s\n' "${{ steps.meta.outputs.tags }}" | head -1)
-          args=""
-          while IFS= read -r t; do [ -n "$t" ] && args="$args -t $t"; done <<< "${{ steps.meta.outputs.tags }}"
-          docker build --build-arg VERSION=${{ steps.meta.outputs.version }} $args -f Dockerfile .
-          echo "built $first"
+          img="${{ steps.meta.outputs.image }}"
+          docker build --build-arg VERSION=${{ steps.meta.outputs.version }} -t "$img" -f Dockerfile .
+          echo "built $img"
 
       - name: Smoke — it serves and it refuses
         # An image that builds but cannot answer deploys and half-works. Beyond
         # liveness this checks the behaviour that has actually regressed in this
         # engine: an unauthenticated read must be refused, not served somebody's
-        # tenant data.
+        # tenant data. It runs on the arch that built it, so a binary that starts
+        # only under emulation cannot pass here.
         #
         # AML_CLIENT_ID is required — the daemon refuses to start without the
         # audience it pins every token to. Ingesting a transaction now needs a
@@ -119,7 +122,7 @@ jobs:
         # production.
         run: |
           set -euo pipefail
-          img="${{ steps.meta.outputs.probe }}"
+          img="${{ steps.meta.outputs.image }}"
           docker run --rm --entrypoint sh "$img" -c 'command -v amld'
 
           self="$(hostname)"
@@ -148,19 +151,15 @@ jobs:
 
           echo "serves, and refuses an unauthenticated read"
 
-      - name: Push
-        run: |
-          set -euo pipefail
-          while IFS= read -r t; do
-            [ -n "$t" ] && docker push "$t"
-          done <<< "${{ steps.meta.outputs.tags }}"
+      - name: Push this arch
+        run: docker push "${{ steps.meta.outputs.image }}"
 
-      - name: Verify the pushed manifest resolves
+      - name: Verify this arch's pushed image resolves
         # The tag is a receipt for an image that exists. Proving it resolves
         # after the push is what makes it one.
         run: |
           set -euo pipefail
-          img="${{ steps.meta.outputs.probe }}"
+          img="${{ steps.meta.outputs.image }}"
           for i in 1 2 3 4 5 6; do
             if docker manifest inspect "$img" >/dev/null 2>&1; then
               echo "$img is resolvable"; exit 0
@@ -169,12 +168,83 @@ jobs:
           done
           echo "::error::$img not pullable after push"; exit 1
 
+  merge:
+    needs: build
+    # Registry-side only: imagetools reads the two per-arch manifests and writes
+    # a list that points at both. No builder and no platform of its own, so which
+    # pool runs this does not matter.
+    runs-on: [lux-build-linux-amd64]
+    timeout-minutes: 15
+    steps:
+      - name: Compute the release names
+        id: meta
+        run: |
+          set -euo pipefail
+          SHA_TAG="ghcr.io/luxfi/aml:sha-${GITHUB_SHA:0:7}"
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            VERSION="${GITHUB_REF#refs/tags/v}"
+            {
+              echo "tags<<EOF"
+              echo "ghcr.io/luxfi/aml:v${VERSION}"
+              echo "ghcr.io/luxfi/aml:${VERSION}"
+              echo "$SHA_TAG"
+              echo "EOF"
+            } >> "$GITHUB_OUTPUT"
+          else
+            {
+              echo "tags<<EOF"
+              echo "$SHA_TAG"
+              echo "EOF"
+            } >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ secrets.GHCR_USER }}
+          password: ${{ secrets.GHCR_TOKEN }}
+
+      - name: Join both architectures under every release name
+        run: |
+          set -euo pipefail
+          base="ghcr.io/luxfi/aml:sha-${GITHUB_SHA:0:7}"
+          args=''
+          while IFS= read -r t; do
+            [ -n "$t" ] && args="$args -t $t"
+          done <<< "${{ steps.meta.outputs.tags }}"
+          # shellcheck disable=SC2086
+          docker buildx imagetools create $args "${base}-amd64" "${base}-arm64"
+
+      - name: Prove every release name carries BOTH architectures
+        # A manifest list with one entry pulls fine on the arch that built it and
+        # fails everywhere else, which is exactly the state this replaces.
+        # Counting the platforms is what makes "multi-arch" a fact rather than an
+        # intention.
+        run: |
+          set -euo pipefail
+          while IFS= read -r t; do
+            [ -z "$t" ] && continue
+            got=$(docker buildx imagetools inspect "$t" --format '{{range .Manifest.Manifests}}{{.Platform.OS}}/{{.Platform.Architecture}} {{end}}')
+            echo "$t -> ${got}"
+            for want in linux/amd64 linux/arm64; do
+              case " $got " in
+                *" $want "*) ;;
+                *) echo "::error::$t does not carry $want"; exit 1 ;;
+              esac
+            done
+          done <<< "${{ steps.meta.outputs.tags }}"
+
       - name: Mirror to oci.hanzo.ai (the sovereign copy)
         # ghcr.io/luxfi is canonical; oci.hanzo.ai holds our own copy so a deploy
         # never depends on a third party staying reachable — the same reason the
         # rest of this stack self-hosts. It authenticates against Hanzo IAM
         # (realm iam.hanzo.ai/v1/iam/registry/token), a different credential from
         # ghcr, so it is provisioned separately as OCI_USER / OCI_TOKEN.
+        #
+        # imagetools copies the manifest LIST across registries. `docker tag` +
+        # `docker push` cannot: it only knows the single image the daemon holds
+        # locally, and this job holds none, so the sovereign copy would carry one
+        # architecture while ghcr carried two.
         #
         # This is best-effort and LOUD, never silent: if the IAM credential is
         # not yet provisioned the step warns and the release still succeeds with
@@ -188,9 +258,7 @@ jobs:
             -u "${{ secrets.OCI_USER }}" --password-stdin
           while IFS= read -r t; do
             [ -z "$t" ] && continue
-            dst="oci.hanzo.ai/${t#*/}"
-            docker tag "$t" "$dst"
-            docker push "$dst"
+            docker buildx imagetools create -t "oci.hanzo.ai/${t#*/}" "$t"
           done <<< "${{ steps.meta.outputs.tags }}"
           echo "sovereign copy mirrored to oci.hanzo.ai/luxfi/aml"
 
@@ -202,6 +270,13 @@ jobs:
     # The console: the same bundle every brand is served, with its deployment's
     # API and clientId templated into /config.json at container start. It holds
     # no secret and cannot — it is a static file anyone may read.
+    #
+    # amd64 only, and not by choice: ui/Dockerfile serves the bundle from
+    # ghcr.io/hanzoai/static:v0.5.1, and that tag is a single amd64 manifest —
+    # `--platform=linux/arm64` cannot resolve it and the build dies there. The
+    # bundle itself is architecture-free. hanzoai/static publishes both
+    # architectures from 0.5.15 on, so this becomes the same matrix the daemon
+    # uses the moment ui/Dockerfile moves to a tag that has an arm64 manifest.
     runs-on: [lux-build-linux-amd64]
     timeout-minutes: 20
     steps:
