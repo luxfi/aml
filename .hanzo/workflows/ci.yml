@@ -1,6 +1,6 @@
 name: CI
 # Runs on the native runners at git.hanzo.ai (git-runner, label
-# lux-build-linux-amd64). There are no GitHub-hosted runners in this
+# linux-amd64). There are no GitHub-hosted runners in this
 # organisation and none is a permitted fallback: a workflow that names one
 # queues forever, which reads from the outside as a test suite that never fails.
 #
@@ -21,7 +21,7 @@ concurrency:
 
 jobs:
   test:
-    runs-on: [lux-build-linux-amd64]
+    runs-on: [linux-amd64]
     timeout-minutes: 30
     # A runner may carry a machine-level go env that routes some module paths
     # around the proxy and the checksum database. GOENV=off ignores it, so every
@@ -109,7 +109,7 @@ jobs:
           echo "serves, and refuses an unauthenticated read"
 
   console:
-    runs-on: [lux-build-linux-amd64]
+    runs-on: [linux-amd64]
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4

@@ -36,7 +36,7 @@ concurrency:
 
 jobs:
   build:
-    runs-on: [lux-build-linux-amd64]
+    runs-on: [linux-amd64]
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
@@ -182,7 +182,7 @@ jobs:
     # The console: the same bundle every brand is served, with its deployment's
     # API and clientId templated into /config.json at container start. It holds
     # no secret and cannot — it is a static file anyone may read.
-    runs-on: [lux-build-linux-amd64]
+    runs-on: [linux-amd64]
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
