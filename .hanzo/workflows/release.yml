@@ -173,7 +173,7 @@ jobs:
     # Registry-side only: imagetools reads the two per-arch manifests and writes
     # a list that points at both. No builder and no platform of its own, so which
     # pool runs this does not matter.
-    runs-on: [lux-build-linux-amd64]
+    runs-on: [linux-amd64]
     timeout-minutes: 15
     steps:
       - name: Compute the release names
@@ -277,7 +277,7 @@ jobs:
     # bundle itself is architecture-free. hanzoai/static publishes both
     # architectures from 0.5.15 on, so this becomes the same matrix the daemon
     # uses the moment ui/Dockerfile moves to a tag that has an arm64 manifest.
-    runs-on: [lux-build-linux-amd64]
+    runs-on: [linux-amd64]
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
